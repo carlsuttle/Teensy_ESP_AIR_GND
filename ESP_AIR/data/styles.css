@@ -1,0 +1,43 @@
+:root {
+  color-scheme: dark;
+}
+body {
+  margin: 0;
+  background: #0b0f14;
+  color: #eef2f7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 16px;
+}
+h1 { margin: 0 0 12px; }
+.pill {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  margin-bottom: 12px;
+}
+.pill.on { background: #155724; color: #d4edda; }
+.pill.off { background: #5a1b1b; color: #ffd4d4; }
+.grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+label { opacity: 0.8; font-size: 12px; }
+#log {
+  margin-top: 12px;
+  background: #121821;
+  border: 1px solid #263142;
+  border-radius: 8px;
+  min-height: 120px;
+  padding: 8px;
+  overflow: auto;
+}
+button {
+  margin-top: 10px;
+  min-height: 40px;
+  padding: 8px 12px;
+}
