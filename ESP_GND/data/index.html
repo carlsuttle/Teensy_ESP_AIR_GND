@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Telemetry GND Unit</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="title">Telemetry GND Unit</div>
+    <div id="status">Disconnected</div>
+    <div id="stats">rx_fps: 0 | state_fps: 0 | ws: 0 | ping: -- ms</div>
+    <div id="rec" class="rec">REC OFF</div>
+  </header>
+
+  <nav class="tabs">
+    <button data-tab="gps" class="active">GPS</button>
+    <button data-tab="att">Attitude</button>
+    <button data-tab="baro">BaroLink</button>
+    <button data-tab="link">Link</button>
+  </nav>
+
+  <main>
+    <section id="tab-gps" class="tab active"><pre id="gps"></pre></section>
+    <section id="tab-att" class="tab">
+      <pre id="att"></pre>
+      <h3>Fusion Settings</h3>
+      <pre id="fusionStatus"></pre>
+      <div class="fusion-control">
+        <div class="fusion-head"><span>gain</span><span id="gainValue">-</span></div>
+        <div class="fusion-row">
+          <input id="gainSlider" type="range" min="0.02" max="0.20" step="0.01" value="0.06" />
+        </div>
+      </div>
+      <div class="fusion-control">
+        <div class="fusion-head"><span>accelerationRejection (deg)</span><span id="accelRejValue">-</span></div>
+        <div class="fusion-row">
+          <input id="accelRejSlider" type="range" min="10" max="45" step="1" value="20" />
+        </div>
+      </div>
+      <div class="fusion-control">
+        <div class="fusion-head"><span>magneticRejection (deg)</span><span id="magRejValue">-</span></div>
+        <div class="fusion-row">
+          <input id="magRejSlider" type="range" min="20" max="120" step="5" value="60" />
+        </div>
+      </div>
+      <div class="fusion-control">
+        <div class="fusion-head"><span>recoveryTriggerPeriod (s / samples)</span><span id="recoveryValue">-</span></div>
+        <div class="fusion-row">
+          <input id="recoverySlider" type="range" min="1.0" max="8.0" step="0.1" value="3.0" />
+        </div>
+      </div>
+    </section>
+    <section id="tab-baro" class="tab"><pre id="baro"></pre></section>
+    <section id="tab-link" class="tab">
+      <pre id="link"></pre>
+      <h3>Stream/Logging</h3>
+      <div class="row"><label>Source Hz</label><input id="sourceHz" type="number" min="1" max="50" step="1" value="50" /></div>
+      <div class="row"><label>UI Hz</label><input id="uiHz" type="number" min="5" max="20" step="1" value="20" /></div>
+      <div class="row"><label>Log Hz</label><input id="logHz" type="number" min="1" max="50" step="1" value="50" /></div>
+      <div class="row"><label>Log Mode</label><select id="logMode"><option value="0">OFF</option><option value="1">ON</option></select></div>
+      <button id="applyRate">Apply Rates/Logging</button>
+      <button id="downloadDiag">Download Diag CSV</button>
+      <button id="downloadWsEvents">Download WS Event CSV</button>
+      <button id="downloadClientEvents">Download Client Event CSV</button>
+      <button id="resetCounters">Reset Counters</button>
+      <h3>Files</h3>
+      <button id="refreshFiles">Refresh</button>
+      <ul id="files"></ul>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
