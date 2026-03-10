@@ -1,7 +1,6 @@
 #include "log_store.h"
 
 #include <Arduino.h>
-#include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -37,16 +36,6 @@ struct BinaryLogRecordV1 {
 };
 #pragma pack(pop)
 
-struct CsvDownloadState {
-  File file;
-  String full_name;
-  size_t header_off = 0;
-  size_t line_off = 0;
-  size_t line_len = 0;
-  bool done = false;
-  char line[kCsvLineMaxBytes] = {};
-};
-
 AppConfig g_cfg = {};
 File g_file;
 String g_current_name;
@@ -59,8 +48,6 @@ uint32_t g_last_seq = 0;
 uint32_t g_last_write_ms = 0;
 uint8_t g_write_buffer[kWriteBufferBytes];
 size_t g_write_used = 0;
-static constexpr size_t kDownloadSlots = 8;
-CsvDownloadState* g_active_downloads[kDownloadSlots] = {};
 BinaryLogRecordV1 g_record_ring[kQueueDepth] = {};
 volatile uint16_t g_ring_head = 0;
 volatile uint16_t g_ring_tail = 0;
@@ -112,36 +99,6 @@ struct FsLockGuard {
     }
   }
 };
-
-void registerActiveDownload(CsvDownloadState* state) {
-  if (!state) return;
-  for (size_t i = 0; i < kDownloadSlots; ++i) {
-    if (!g_active_downloads[i]) {
-      g_active_downloads[i] = state;
-      return;
-    }
-  }
-}
-
-void unregisterActiveDownload(CsvDownloadState* state) {
-  if (!state) return;
-  for (size_t i = 0; i < kDownloadSlots; ++i) {
-    if (g_active_downloads[i] == state) {
-      g_active_downloads[i] = nullptr;
-      return;
-    }
-  }
-}
-
-void closeActiveDownloadsFor(const String& full) {
-  for (size_t i = 0; i < kDownloadSlots; ++i) {
-    CsvDownloadState* state = g_active_downloads[i];
-    if (!state || state->full_name != full) continue;
-    state->done = true;
-    if (state->file) state->file.close();
-    g_active_downloads[i] = nullptr;
-  }
-}
 
 void recordDuration(uint32_t elapsedMs, uint32_t& lastMs, uint32_t& maxMs) {
   lastMs = elapsedMs;
@@ -258,16 +215,6 @@ size_t formatCsvLine(const BinaryLogRecordV1& rec, char* out, size_t outSize) {
       (unsigned)rec.state.flags);
   if (n <= 0 || (size_t)n >= outSize) return 0;
   return (size_t)n;
-}
-
-bool readNextRecord(File& file, BinaryLogRecordV1& rec) {
-  if (!file || !file.available()) return false;
-  const size_t n = file.read(reinterpret_cast<uint8_t*>(&rec), sizeof(rec));
-  if (n != sizeof(rec)) return false;
-  if (rec.magic != kLogMagic) return false;
-  if (rec.version != kLogVersion) return false;
-  if (rec.record_size != sizeof(rec)) return false;
-  return true;
 }
 
 void writerTask(void* param) {
@@ -436,111 +383,10 @@ bool deleteFileByName(const String& name) {
   if (g_current_name == full) {
     closeCurrentLog();
   }
-  closeActiveDownloadsFor(full);
   const uint32_t t0 = millis();
   const bool ok = LittleFS.remove(full);
   recordDuration(millis() - t0, g_stats.fs_delete_last_ms, g_stats.fs_delete_max_ms);
   return ok;
-}
-
-void sendDownload(AsyncWebServerRequest* req, const String& name) {
-  if (!isSafeName(name)) {
-    req->send(400, "text/plain", "invalid name");
-    return;
-  }
-
-  const String full = String(LOG_DIR) + "/" + name;
-  if (!LittleFS.exists(full)) {
-    req->send(404, "text/plain", "not found");
-    return;
-  }
-
-  if (!name.endsWith(kBinaryExt)) {
-    const char* contentType = name.endsWith(".csv") ? "text/csv" : "application/x-ndjson";
-    req->send(LittleFS, full, contentType, true);
-    return;
-  }
-
-  auto* state = new CsvDownloadState();
-  state->full_name = full;
-  {
-    FsLockGuard lock;
-    state->file = LittleFS.open(full, FILE_READ);
-    if (!state->file) {
-      delete state;
-      req->send(500, "text/plain", "open failed");
-      return;
-    }
-    registerActiveDownload(state);
-  }
-
-  String downloadName = name;
-  downloadName.remove(downloadName.length() - strlen(kBinaryExt));
-  downloadName += ".csv";
-
-  AsyncWebServerResponse* response = req->beginChunkedResponse(
-      "text/csv",
-      [state](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
-        (void)index;
-        if (!state || maxLen == 0) return 0;
-        if (state->done) {
-          state->file.close();
-          delete state;
-          return 0;
-        }
-
-        size_t used = 0;
-        const size_t headerLen = strlen(kCsvHeader);
-        while (used < maxLen) {
-          if (state->header_off < headerLen) {
-            const size_t remain = headerLen - state->header_off;
-            const size_t chunk = remain < (maxLen - used) ? remain : (maxLen - used);
-            memcpy(buffer + used, kCsvHeader + state->header_off, chunk);
-            state->header_off += chunk;
-            used += chunk;
-            if (used == maxLen) return used;
-            continue;
-          }
-
-          if (state->line_off < state->line_len) {
-            const size_t remain = state->line_len - state->line_off;
-            const size_t chunk = remain < (maxLen - used) ? remain : (maxLen - used);
-            memcpy(buffer + used, state->line + state->line_off, chunk);
-            state->line_off += chunk;
-            used += chunk;
-            if (used == maxLen) return used;
-            continue;
-          }
-
-          BinaryLogRecordV1 rec = {};
-          {
-            FsLockGuard lock;
-            const uint32_t t0 = millis();
-            if (!readNextRecord(state->file, rec)) {
-              recordDuration(millis() - t0, g_stats.fs_download_last_ms, g_stats.fs_download_max_ms);
-              state->done = true;
-              unregisterActiveDownload(state);
-              if (used == 0) {
-                if (state->file) state->file.close();
-                delete state;
-                return 0;
-              }
-              return used;
-            }
-            recordDuration(millis() - t0, g_stats.fs_download_last_ms, g_stats.fs_download_max_ms);
-          }
-
-          state->line_len = formatCsvLine(rec, state->line, sizeof(state->line));
-          state->line_off = 0;
-          if (state->line_len == 0) {
-            continue;
-          }
-        }
-
-        return used;
-      });
-  response->addHeader("Content-Disposition", String("attachment; filename=\"") + downloadName + "\"");
-  req->send(response);
 }
 
 }  // namespace log_store

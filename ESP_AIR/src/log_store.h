@@ -5,8 +5,6 @@
 #include "config_store.h"
 #include "types_shared.h"
 
-class AsyncWebServerRequest;
-
 namespace log_store {
 
 struct Stats {
@@ -38,6 +36,5 @@ void resetStats();
 String filesJson();
 bool deleteFileByName(const String& name);
 bool isSafeName(const String& name);
-void sendDownload(AsyncWebServerRequest* req, const String& name);
 
 }  // namespace log_store

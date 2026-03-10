@@ -9,6 +9,8 @@ WiFiUDP g_udp;
 Snapshot g_snapshot;
 IPAddress g_last_sender_ip;
 uint16_t g_last_sender_port = 0;
+IPAddress g_default_sender_ip(192, 168, 4, 2);
+uint16_t g_default_sender_port = 9000;
 uint16_t g_listen_port = 0;
 uint32_t g_tx_seq = 0;
 
@@ -18,9 +20,25 @@ bool restartListener(uint16_t port) {
   return g_udp.begin(port) == 1;
 }
 
+bool learnedSenderValid() {
+  return g_last_sender_port != 0U && g_last_sender_ip != INADDR_NONE;
+}
+
+IPAddress currentTargetIp() {
+  if (learnedSenderValid()) return g_last_sender_ip;
+  return g_default_sender_ip;
+}
+
+uint16_t currentTargetPort() {
+  if (learnedSenderValid()) return g_last_sender_port;
+  return g_default_sender_port;
+}
+
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
-  if (g_last_sender_port == 0 || g_last_sender_ip == INADDR_NONE) return false;
   if (payload_len > 1024U) return false;
+  const IPAddress target_ip = currentTargetIp();
+  const uint16_t target_port = currentTargetPort();
+  if (target_ip == INADDR_NONE || target_port == 0U) return false;
 
   uint8_t buf[sizeof(telem::FrameHeader) + 1024U] = {};
   telem::FrameHeader hdr = {};
@@ -35,7 +53,7 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
     memcpy(buf + sizeof(hdr), payload, payload_len);
   }
 
-  if (!g_udp.beginPacket(g_last_sender_ip, g_last_sender_port)) return false;
+  if (!g_udp.beginPacket(target_ip, target_port)) return false;
   const size_t wrote = g_udp.write(buf, sizeof(hdr) + payload_len);
   if (!g_udp.endPacket()) return false;
   return wrote == (sizeof(hdr) + payload_len);
@@ -94,6 +112,8 @@ void begin(const AppConfig& cfg) {
   memset(&g_snapshot, 0, sizeof(g_snapshot));
   g_last_sender_ip = IPAddress();
   g_last_sender_port = 0;
+  g_default_sender_ip = IPAddress(192, 168, 4, 2);
+  g_default_sender_port = cfg.udp_listen_port;
   g_tx_seq = 0;
   restartListener(cfg.udp_listen_port);
 }
@@ -160,6 +180,12 @@ bool sendGetFusionSettings() { return sendFrame(telem::CMD_GET_FUSION_SETTINGS, 
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd) {
   return sendFrame(telem::CMD_SET_STREAM_RATE, &cmd, sizeof(cmd));
 }
+
+bool hasLearnedSender() { return learnedSenderValid(); }
+
+IPAddress targetSenderIp() { return currentTargetIp(); }
+
+uint16_t targetSenderPort() { return currentTargetPort(); }
 
 IPAddress lastSenderIp() { return g_last_sender_ip; }
 

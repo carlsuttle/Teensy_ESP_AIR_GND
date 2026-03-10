@@ -15,6 +15,8 @@ uint8_t g_last_station_count = 0xFFU;
 uint32_t g_last_stat_ms = 0;
 bool g_stats_streaming = false;
 bool g_udp_streaming = false;
+bool g_air_ready = false;
+bool g_air_wait_announced = false;
 
 void logApState() {
   const uint8_t station_count = WiFi.softAPgetStationNum();
@@ -91,6 +93,33 @@ void configureDhcpLeaseRange() {
     return;
   }
   Serial.println("DHCP lease range 192.168.4.50-192.168.4.100");
+}
+
+void updateAirReadiness() {
+  const auto snap = udp_telem::snapshot();
+  const uint32_t now = millis();
+  const bool fresh = snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U;
+
+  if (fresh) {
+    if (!g_air_ready) {
+      Serial.printf("GND READY air_link sender=%s:%u seq=%lu t_us=%lu\n",
+                    udp_telem::lastSenderIp().toString().c_str(),
+                    (unsigned)udp_telem::lastSenderPort(),
+                    (unsigned long)snap.seq,
+                    (unsigned long)snap.t_us);
+      g_air_ready = true;
+      g_air_wait_announced = false;
+    }
+    return;
+  }
+
+  if (!g_air_wait_announced) {
+    Serial.printf("GND WAIT air_packets target=%s:%u\n",
+                  udp_telem::targetSenderIp().toString().c_str(),
+                  (unsigned)udp_telem::targetSenderPort());
+    g_air_wait_announced = true;
+  }
+  g_air_ready = false;
 }
 
 void printStats() {
@@ -176,6 +205,13 @@ void setup() {
 
   udp_telem::begin(cfg);
   Serial.printf("UDP listen port=%u\n", (unsigned)cfg.udp_listen_port);
+  Serial.printf("GND READY ap ip=%s udp=%u dhcp=192.168.4.50-192.168.4.100\n",
+                WiFi.softAPIP().toString().c_str(),
+                (unsigned)cfg.udp_listen_port);
+  Serial.printf("GND WAIT air_packets target=%s:%u\n",
+                udp_telem::targetSenderIp().toString().c_str(),
+                (unsigned)udp_telem::targetSenderPort());
+  g_air_wait_announced = true;
 
   ws_server::begin();
   printConsoleHelp();
@@ -185,6 +221,7 @@ void loop() {
   handleConsoleCommands();
   logApState();
   udp_telem::poll();
+  updateAirReadiness();
   ws_server::loop();
 
   const uint32_t now = millis();

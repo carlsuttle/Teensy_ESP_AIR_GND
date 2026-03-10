@@ -43,6 +43,9 @@ Snapshot snapshot();
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd);
 bool sendGetFusionSettings();
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd);
+bool hasLearnedSender();
+IPAddress targetSenderIp();
+uint16_t targetSenderPort();
 IPAddress lastSenderIp();
 uint16_t lastSenderPort();
 
