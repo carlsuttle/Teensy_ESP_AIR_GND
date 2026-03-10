@@ -22,7 +22,7 @@ struct RxDebugStats {
 
 void begin();
 void pollRx();
-bool sendFastState(const State& s, uint32_t seq);
+bool sendFastState(const State& s, uint32_t seq, uint32_t t_us);
 uint16_t crc16Ccitt(const uint8_t* data, uint16_t len);
 RxDebugStats getRxDebugStats();
 uint16_t streamRateHz();

@@ -5,6 +5,9 @@
 struct AppConfig {
   char ap_ssid[33];
   char ap_pass[65];
+  char gnd_ip[16];
+  uint16_t udp_local_port;
+  uint16_t udp_gnd_port;
   uint8_t uart_port;
   uint8_t uart_rx_pin;
   uint8_t uart_tx_pin;

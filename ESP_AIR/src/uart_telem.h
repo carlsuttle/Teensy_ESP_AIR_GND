@@ -33,6 +33,12 @@ struct Snapshot {
   uint32_t ack_code;
 };
 
+struct PendingState {
+  telem::TelemetryFullStateV1 state;
+  uint32_t seq;
+  uint32_t t_us;
+};
+
 struct LoopbackResult {
   bool pass;
   uint32_t sent;
@@ -48,6 +54,7 @@ void begin(const AppConfig& cfg);
 void reconfigure(const AppConfig& cfg);
 void poll();
 Snapshot snapshot();
+bool popPendingState(PendingState& out);
 LoopbackResult runLoopbackTest(uint32_t timeout_ms = 120U);
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd);
 bool sendGetFusionSettings();

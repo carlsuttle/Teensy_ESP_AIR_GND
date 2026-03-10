@@ -22,6 +22,8 @@ Adafruit_BMP280 g_bmp;
 bool g_baro_ok = false;
 bool g_imu_ok = false;
 uint32_t g_mirror_seq = 0;
+uint32_t g_last_mirror_seq = 0;
+uint32_t g_last_mirror_t_us = 0;
 
 elapsedMicros g_summary_timer_us;
 elapsedMicros g_mirror_timer_us;
@@ -922,7 +924,13 @@ void baroPollAndFilter() {
 void mirrorSendFastState() {
 #if ENABLE_MIRROR
   if (g_mode == CommandMode::EspComTest) return;
-  const bool ok = mirror::sendFastState(g_state, g_mirror_seq++);
+  const uint32_t seq = g_mirror_seq++;
+  const uint32_t t_us = micros();
+  const bool ok = mirror::sendFastState(g_state, seq, t_us);
+  if (ok) {
+    g_last_mirror_seq = seq;
+    g_last_mirror_t_us = t_us;
+  }
   if (ok) g_state.mirror_tx_ok++;
   else g_state.mirror_drop_count++;
 #endif
@@ -1352,53 +1360,21 @@ void serviceCommandMode() {
 }
 
 void printSummary2Hz() {
-  const uint32_t now = millis();
-  const uint32_t gps_age_ms = (g_state.last_gps_ms == 0) ? 0xFFFFFFFFUL : (uint32_t)(now - g_state.last_gps_ms);
-  const uint32_t baro_age_ms = (g_state.last_baro_ms == 0) ? 0xFFFFFFFFUL : (uint32_t)(now - g_state.last_baro_ms);
   const mirror::RxDebugStats mdbg = mirror::getRxDebugStats();
 
   Serial.printf(
-      "FAST 2Hz ms=%lu imu_ms=%lu roll=%.2f pitch=%.2f yaw=%.2f "
-      "gps{iTOW=%lu fix=%u sv=%u lat=%ld lon=%ld hMSL=%ld gs=%ld hdg=%ld hAcc=%lu sAcc=%lu age=%lu err=%lu} "
-      "baro{ok=%u alt=%.2f vsi=%.2f p=%.2f t=%.2f age=%lu} "
-      "mirror{ok=%lu drop=%lu} "
-      "mirrorrx{bytes=%lu ok=%lu cobs=%lu len=%lu crc=%lu unk=%lu set=%lu get=%lu ack=%lu nack=%lu last=%u}\r\n",
-      (unsigned long)now,
-      (unsigned long)g_state.last_imu_ms,
-      (double)g_state.roll,
-      (double)g_state.pitch,
-      (double)g_state.yaw,
-      (unsigned long)g_state.iTOW,
-      (unsigned)g_state.fixType,
-      (unsigned)g_state.numSV,
-      (long)g_state.lat,
-      (long)g_state.lon,
-      (long)g_state.hMSL,
-      (long)g_state.gSpeed,
-      (long)g_state.headMot,
-      (unsigned long)g_state.hAcc,
-      (unsigned long)g_state.sAcc,
-      (unsigned long)gps_age_ms,
-      (unsigned long)g_state.gps_parse_errors,
-      (unsigned)(g_baro_ok ? 1U : 0U),
-      (double)g_state.baro_alt_m,
-      (double)g_state.baro_vsi_mps,
-      (double)g_state.baro_press_hpa,
-      (double)g_state.baro_temp_c,
-      (unsigned long)baro_age_ms,
-      (unsigned long)g_state.mirror_tx_ok,
-      (unsigned long)g_state.mirror_drop_count,
+      "STAT unit=TEENSY seq=%lu t_us=%lu has=1 ack=0 cmd=0 ack_ok=0 code=0 "
+      "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu "
+      "udp_tx=0 udp_rx=0 udp_drop=0\r\n",
+      (unsigned long)g_last_mirror_seq,
+      (unsigned long)g_last_mirror_t_us,
       (unsigned long)mdbg.rxBytes,
       (unsigned long)mdbg.framesOk,
+      (unsigned long)mdbg.crcErr,
       (unsigned long)mdbg.cobsErr,
       (unsigned long)mdbg.lenErr,
-      (unsigned long)mdbg.crcErr,
       (unsigned long)mdbg.unknownMsg,
-      (unsigned long)mdbg.cmdSetFusion,
-      (unsigned long)mdbg.cmdGetFusion,
-      (unsigned long)mdbg.ackSent,
-      (unsigned long)mdbg.nackSent,
-      (unsigned)mdbg.lastMsgType);
+      (unsigned long)0U);
 }
 }  // namespace
 

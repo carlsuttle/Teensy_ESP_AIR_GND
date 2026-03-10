@@ -36,6 +36,10 @@ uint32_t g_ack_rx_seq = 0;
 uint16_t g_ack_command = 0;
 bool g_ack_ok = false;
 uint32_t g_ack_code = 0;
+constexpr uint16_t kPendingStateDepth = 256U;
+PendingState g_pending_states[kPendingStateDepth] = {};
+uint16_t g_pending_head = 0U;
+uint16_t g_pending_tail = 0U;
 
 uint32_t crc32_calc(const uint8_t* data, size_t len) {
   uint32_t crc = 0xFFFFFFFFUL;
@@ -237,6 +241,15 @@ void handlePacket(const uint8_t* pkt, size_t len) {
     g_t_us = h.t_us;
     g_stats.frames_ok++;
     g_stats.last_rx_ms = millis();
+    const uint16_t next_head = (uint16_t)((g_pending_head + 1U) % kPendingStateDepth);
+    if (next_head != g_pending_tail) {
+      g_pending_states[g_pending_head].state = tmp;
+      g_pending_states[g_pending_head].seq = h.seq;
+      g_pending_states[g_pending_head].t_us = h.t_us;
+      g_pending_head = next_head;
+    } else {
+      g_stats.drop++;
+    }
     portEXIT_CRITICAL(&g_mux);
     log_store::enqueueState(h.seq, h.t_us, tmp);
     return;
@@ -352,6 +365,18 @@ Snapshot snapshot() {
   s.ack_code = g_ack_code;
   portEXIT_CRITICAL(&g_mux);
   return s;
+}
+
+bool popPendingState(PendingState& out) {
+  bool ok = false;
+  portENTER_CRITICAL(&g_mux);
+  if (g_pending_tail != g_pending_head) {
+    out = g_pending_states[g_pending_tail];
+    g_pending_tail = (uint16_t)((g_pending_tail + 1U) % kPendingStateDepth);
+    ok = true;
+  }
+  portEXIT_CRITICAL(&g_mux);
+  return ok;
 }
 
 LoopbackResult runLoopbackTest(uint32_t timeout_ms) {

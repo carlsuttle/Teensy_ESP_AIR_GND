@@ -9,6 +9,7 @@
 #include "config_store.h"
 #include "log_store.h"
 #include "types_shared.h"
+#include "udp_link.h"
 #include "uart_telem.h"
 
 namespace ws_server {
@@ -327,6 +328,9 @@ void sendConfig(AsyncWebSocketClient* client) {
   d["type"] = "config";
   d["ap_ssid"] = c.ap_ssid;
   d["uart_baud"] = c.uart_baud;
+  d["gnd_ip"] = c.gnd_ip;
+  d["udp_local_port"] = c.udp_local_port;
+  d["udp_gnd_port"] = c.udp_gnd_port;
   d["source_rate_hz"] = c.source_rate_hz;
   d["ui_rate_hz"] = c.ui_rate_hz;
   d["log_mode"] = c.log_mode;
@@ -515,6 +519,9 @@ void apiConfigGet(AsyncWebServerRequest* req) {
   StaticJsonDocument<384> d;
   d["ap_ssid"] = c.ap_ssid;
   d["ap_pass"] = c.ap_pass;
+  d["gnd_ip"] = c.gnd_ip;
+  d["udp_local_port"] = c.udp_local_port;
+  d["udp_gnd_port"] = c.udp_gnd_port;
   d["uart_rx_pin"] = c.uart_rx_pin;
   d["uart_tx_pin"] = c.uart_tx_pin;
   d["uart_baud"] = c.uart_baud;
@@ -539,6 +546,9 @@ void apiConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t
   AppConfig cfg = config_store::get();
   if (in["ap_ssid"].is<const char*>()) strlcpy(cfg.ap_ssid, in["ap_ssid"], sizeof(cfg.ap_ssid));
   if (in["ap_pass"].is<const char*>()) strlcpy(cfg.ap_pass, in["ap_pass"], sizeof(cfg.ap_pass));
+  if (in["gnd_ip"].is<const char*>()) strlcpy(cfg.gnd_ip, in["gnd_ip"], sizeof(cfg.gnd_ip));
+  cfg.udp_local_port = in["udp_local_port"] | cfg.udp_local_port;
+  cfg.udp_gnd_port = in["udp_gnd_port"] | cfg.udp_gnd_port;
   cfg.uart_baud = in["uart_baud"] | cfg.uart_baud;
   cfg.source_rate_hz = in["source_rate_hz"] | cfg.source_rate_hz;
   cfg.ui_rate_hz = in["ui_rate_hz"] | cfg.ui_rate_hz;
@@ -548,6 +558,7 @@ void apiConfigPost(AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t
   config_store::update(cfg);
   log_store::setConfig(cfg);
   uart_telem::reconfigure(cfg);
+  udp_link::reconfigure(cfg);
   telem::CmdSetStreamRateV1 cmd = {};
   cmd.ws_rate_hz = cfg.source_rate_hz;
   cmd.log_rate_hz = cfg.log_rate_hz;

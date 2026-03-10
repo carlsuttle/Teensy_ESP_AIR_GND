@@ -16,8 +16,8 @@ constexpr uint16_t kMsgTypeAck = 200U;
 constexpr uint16_t kMsgTypeNack = 201U;
 constexpr size_t kPacketMax = 512U;
 constexpr size_t kRxMax = 768U;
-constexpr uint16_t kDefaultStreamRateHz = 20U;
-constexpr uint16_t kDefaultLogRateHz = 10U;
+constexpr uint16_t kDefaultStreamRateHz = 50U;
+constexpr uint16_t kDefaultLogRateHz = 50U;
 constexpr uint16_t kMinStreamRateHz = 1U;
 constexpr uint16_t kMaxStreamRateHz = 100U;
 
@@ -310,10 +310,11 @@ uint16_t crc16Ccitt(const uint8_t* data, uint16_t len) {
   return crc;
 }
 
-bool sendFastState(const State& s, uint32_t seq) {
+bool sendFastState(const State& s, uint32_t seq, uint32_t t_us) {
 #if !ENABLE_MIRROR
   (void)s;
   (void)seq;
+  (void)t_us;
   return false;
 #else
   TelemetryFullStateV1 payload{};
@@ -352,7 +353,7 @@ bool sendFastState(const State& s, uint32_t seq) {
   hdr.payload_len = (uint16_t)sizeof(payload);
   hdr.reserved = 0;
   hdr.seq = seq;
-  hdr.t_us = micros();
+  hdr.t_us = t_us;
 
   uint8_t packet[kPacketMax];
   const size_t headerLen = sizeof(hdr);
