@@ -53,7 +53,7 @@ void sendCtrlJson(AsyncWebSocketClient* client, const JsonDocument& doc) {
 
 void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
   const AppConfig& cfg = config_store::get();
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["type"] = "config";
   doc["source_rate_hz"] = cfg.source_rate_hz;
   doc["ui_rate_hz"] = cfg.ui_rate_hz;
@@ -75,13 +75,13 @@ void sendAck(AsyncWebSocketClient* client,
              bool ok,
              uint32_t code = 0,
              const telem::FusionSettingsV1* fusion = nullptr) {
-  StaticJsonDocument<384> doc;
+  JsonDocument doc;
   doc["type"] = "ack";
-  doc["cmd"] = cmd;
-  doc["ok"] = ok ? 1 : 0;
+  doc["cmd"] = cmd ? cmd : "";
+  doc["ok"] = ok;
   doc["code"] = code;
   if (fusion) {
-    JsonObject f = doc.createNestedObject("fusion");
+    JsonObject f = doc["fusion"].to<JsonObject>();
     f["gain"] = fusion->gain;
     f["accelerationRejection"] = fusion->accelerationRejection;
     f["magneticRejection"] = fusion->magneticRejection;
@@ -91,12 +91,12 @@ void sendAck(AsyncWebSocketClient* client,
 }
 
 void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t len) {
-  StaticJsonDocument<512> doc;
+  JsonDocument doc;
   if (deserializeJson(doc, text, len)) return;
   const char* type = doc["type"] | "";
 
   if (strcmp(type, "ping") == 0) {
-    StaticJsonDocument<96> pong;
+    JsonDocument pong;
     pong["type"] = "pong";
     sendCtrlJson(client, pong);
     return;
@@ -296,7 +296,7 @@ void begin() {
     const auto snap = radio_link::snapshot();
     const bool air_link_fresh =
         snap.stats.last_rx_ms != 0U && (uint32_t)(millis() - snap.stats.last_rx_ms) <= 3000U;
-    StaticJsonDocument<768> doc;
+    JsonDocument doc;
     doc["transport"] = "ESP-NOW";
     doc["air_link_fresh"] = air_link_fresh;
     doc["ap_clients"] = WiFi.softAPgetStationNum();
@@ -325,7 +325,7 @@ void begin() {
 
   g_server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest* request) {
     const AppConfig& cfg = config_store::get();
-    StaticJsonDocument<256> doc;
+    JsonDocument doc;
     doc["source_rate_hz"] = cfg.source_rate_hz;
     doc["ui_rate_hz"] = cfg.ui_rate_hz;
     doc["log_rate_hz"] = cfg.source_rate_hz;
@@ -346,15 +346,15 @@ void begin() {
         body.concat(reinterpret_cast<const char*>(data), len);
         if ((index + len) != total) return;
 
-        StaticJsonDocument<256> doc;
+        JsonDocument doc;
         if (deserializeJson(doc, body)) {
           request->send(400, "application/json", "{\"ok\":0}");
           return;
         }
 
         AppConfig cfg = config_store::get();
-        if (doc.containsKey("source_rate_hz")) cfg.source_rate_hz = doc["source_rate_hz"].as<uint8_t>();
-        if (doc.containsKey("ui_rate_hz")) cfg.ui_rate_hz = doc["ui_rate_hz"].as<uint8_t>();
+        if (!doc["source_rate_hz"].isNull()) cfg.source_rate_hz = doc["source_rate_hz"].as<uint8_t>();
+        if (!doc["ui_rate_hz"].isNull()) cfg.ui_rate_hz = doc["ui_rate_hz"].as<uint8_t>();
         cfg.log_rate_hz = cfg.source_rate_hz;
         cfg.log_mode = 1U;
         config_store::update(cfg);

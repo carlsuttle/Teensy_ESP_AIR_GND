@@ -3,7 +3,6 @@
 #include <WiFi.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
-#include <tcpip_adapter.h>
 
 #include "config_store.h"
 #include "radio_link.h"
