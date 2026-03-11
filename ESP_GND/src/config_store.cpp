@@ -24,7 +24,7 @@ void setDefaults(AppConfig& c) {
   c.source_rate_hz = 50;
   c.ui_rate_hz = 20;
   c.log_rate_hz = 50;
-  c.log_mode = 0;
+  c.log_mode = 1;
   c.max_log_bytes = 4UL * 1024UL * 1024UL;
 }
 
@@ -32,8 +32,8 @@ void sanitize(AppConfig& c) {
   c.udp_listen_port = clampv<uint16_t>(c.udp_listen_port, 1U, 65535U);
   c.source_rate_hz = clampv<uint8_t>(c.source_rate_hz, 1, 50);
   c.ui_rate_hz = clampv<uint8_t>(c.ui_rate_hz, 1, 20);
-  c.log_rate_hz = clampv<uint8_t>(c.log_rate_hz, 1, 50);
-  c.log_mode = c.log_mode ? 1 : 0;
+  c.log_rate_hz = c.source_rate_hz;
+  c.log_mode = 1;
   if (c.max_log_bytes < 512UL * 1024UL) c.max_log_bytes = 512UL * 1024UL;
   if (c.ap_ssid[0] == '\0') strncpy(c.ap_ssid, "Telemetry", sizeof(c.ap_ssid) - 1);
   if (c.ap_pass[0] == '\0') strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
@@ -57,7 +57,8 @@ void begin() {
   }
   const AppConfig beforeSanitize = g_cfg;
   if (g_cfg.source_rate_hz != 50U) g_cfg.source_rate_hz = 50U;
-  if (g_cfg.log_rate_hz != 50U) g_cfg.log_rate_hz = 50U;
+  if (g_cfg.log_rate_hz != g_cfg.source_rate_hz) g_cfg.log_rate_hz = g_cfg.source_rate_hz;
+  if (g_cfg.log_mode != 1U) g_cfg.log_mode = 1U;
   sanitize(g_cfg);
   if (memcmp(&beforeSanitize, &g_cfg, sizeof(g_cfg)) != 0) saveInternal();
 }

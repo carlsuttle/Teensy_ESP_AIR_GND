@@ -181,6 +181,8 @@ bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd) {
   return sendFrame(telem::CMD_SET_STREAM_RATE, &cmd, sizeof(cmd));
 }
 
+bool sendResetNetwork() { return sendFrame(telem::CMD_RESET_NETWORK, nullptr, 0U); }
+
 bool hasLearnedSender() { return learnedSenderValid(); }
 
 IPAddress targetSenderIp() { return currentTargetIp(); }

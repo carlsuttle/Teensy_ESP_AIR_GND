@@ -6,7 +6,6 @@ const attEl = document.getElementById("att");
 const fusionStatusEl = document.getElementById("fusionStatus");
 const baroEl = document.getElementById("baro");
 const linkEl = document.getElementById("link");
-const filesEl = document.getElementById("files");
 
 let wsCtrl = null;
 let wsState = null;
@@ -18,7 +17,6 @@ let wsLoss = 0;
 let wsSeen = 0;
 let lastWsSeq = 0;
 let lastStateAt = 0;
-let lastSideAt = 0;
 let lastPongAt = 0;
 let lastCtrlRxAt = 0;
 let binaryRxCount = 0;
@@ -26,13 +24,11 @@ let binaryParseFailCount = 0;
 let clientStateFps = 0;
 let binaryRxCountLast = 0;
 let binaryRxFpsLastMs = 0;
-let sideRxCount = 0;
 let lastBinarySeq = 0;
 let lastSourceSeq = 0;
 let lastSourceTus = 0;
 let lastEspRxMs = 0;
 const STATE_STALE_MS = 1500;
-const SIDE_STALE_MS = 3000;
 const PONG_FRESH_MS = 3000;
 const LOSS_WINDOW_MS = 10000;
 let lossWinStart = 0;
@@ -46,9 +42,6 @@ let fusionLast = null;
 let fusionUiHoldUntilMs = 0;
 let fusionDraft = null;
 let fusionDirty = false;
-let sideStats = {};
-let sideLink = {};
-let sideCmdAck = null;
 let ctrlCloseCode = "-";
 let ctrlCloseReason = "-";
 let ctrlCloseClean = "-";
@@ -292,7 +285,6 @@ function resetLocalCounters() {
   clientStateFps = 0;
   binaryRxCountLast = 0;
   binaryRxFpsLastMs = 0;
-  sideRxCount = 0;
   lastBinarySeq = 0;
   lastSourceSeq = 0;
   lastSourceTus = 0;
@@ -352,24 +344,29 @@ function isFresh(ts, maxAgeMs) {
   return ts && ((Date.now() - ts) <= maxAgeMs);
 }
 
-function isSideFresh() {
-  return isFresh(lastSideAt, SIDE_STALE_MS);
-}
-
 function isPongFresh() {
   return isFresh(lastPongAt, PONG_FRESH_MS);
+}
+
+function waitingForTelemetry() {
+  if (!isCtrlOpen() || !isStateOpen()) return false;
+  return !lastStateAt;
 }
 
 function telemetryLooksStale() {
   if (Date.now() < suppressStaleUntilMs) return false;
   if (!isStateOpen()) return true;
-  if (lastStateAt) return (Date.now() - lastStateAt) > STATE_STALE_MS;
-  return (Date.now() - lastStateSocketOpenAt) > STATE_STARTUP_GRACE_MS;
+  if (!lastStateAt) return false;
+  return (Date.now() - lastStateAt) > STATE_STALE_MS;
 }
 
 function updateStatus() {
   if (!isCtrlOpen()) {
     setStatus("Disconnected");
+    return;
+  }
+  if (waitingForTelemetry()) {
+    setStatus("Connected / waiting for AIR");
     return;
   }
   setStatus(telemetryLooksStale() ? "Connected / stale telemetry" : "Connected");
@@ -410,28 +407,19 @@ temp: - C`;
 
 function renderLinkStale() {
 linkEl.textContent =
-`wifi_rssi: - dBm
-ctrl_clients: -
-state_clients: -
-uart_crc_err: -
-uart_cobs_err: -
-uart_len_err: -
-uart_drop: -
-uart_state_age_ms: -
-pub_state_age_ms: -
-log_queue_cur: -
-log_queue_max: -
-log_records_enqueued: -
-log_dropped: -
-log_records_written: -
-log_bytes_written: -
-log_flushes: -
-ws_backpressure: -
-ws_queue_cur: -
-ws_queue_max: -
-ws_drop: -
-state_disconnects: -
-ctrl_disconnects: -
+`ctrl_socket: -
+state_socket: -
+state_fps: -
+state_age_ms: -
+source_seq: -
+source_t_us: -
+esp_rx_ms: -
+ws_loss: -
+binary_parse_fail: -
+ctrl_reconnects: -
+state_reconnects: -
+ctrl_last_close: -
+state_last_close: -
 ping: - ms
 ping_avg: - ms`;
 }
@@ -441,24 +429,17 @@ function renderStale() {
   renderAttStale();
   renderBaroStale();
   renderLinkStale();
-  statsEl.textContent = `rx_fps: - | state_fps: - | ws: - | ping: - ms | avg: - ms`;
-}
-
-function cmdAckText() {
-  if (!sideCmdAck) return "-";
-  return `cmd=${sideCmdAck.c} ok=${sideCmdAck.o ? 1 : 0} code=${sideCmdAck.cd} seq=${sideCmdAck.r}`;
+  statsEl.textContent = `state_fps: - | seq: - | ctrl: - | state: - | ping: - ms | avg: - ms`;
 }
 
 function renderHeader() {
   const pingTxt = isPongFresh() ? String(pingMs ?? "-") : "-";
   const pingAvgTxt = isPongFresh() ? String(pingAvgMs ?? "-") : "-";
-  const rxFpsTxt = isSideFresh() ? fmt(sideStats.rf, 1) : "-";
-  const stateFpsTxt = isFresh(lastStateAt, SIDE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
-  const wsTxt = isSideFresh() ? dash(sideStats.wc ?? 0) : "-";
-  if (sideStats.lm !== undefined) {
-    recEl.textContent = Number(sideStats.lm) ? "REC ON" : "REC OFF";
-  }
-  statsEl.textContent = `rx_fps: ${rxFpsTxt} | state_fps: ${stateFpsTxt} | ws: ${wsTxt} | ping: ${pingTxt} ms | avg: ${pingAvgTxt} ms`;
+  const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
+  const seqTxt = lastSourceSeq > 0 ? String(lastSourceSeq) : "-";
+  const ctrlTxt = isCtrlOpen() ? "open" : "closed";
+  const stateTxt = isStateOpen() ? "open" : "closed";
+  statsEl.textContent = `state_fps: ${stateFpsTxt} | seq: ${seqTxt} | ctrl: ${ctrlTxt} | state: ${stateTxt} | ping: ${pingTxt} ms | avg: ${pingAvgTxt} ms`;
 }
 
 function renderGpsPanel() {
@@ -483,8 +464,7 @@ yaw: ${fmt(att.y, 2)} deg
 fusion.gain: ${fmt(fusion.gain, 3)}
 fusion.accelRej: ${fmt(fusion.accelerationRejection, 1)} deg
 fusion.magRej: ${fmt(fusion.magneticRejection, 1)} deg
-fusion.recovery: ${fusionRecoveryText(fusion.recoveryTriggerPeriod)}
-cmd_ack: ${cmdAckText()}`;
+fusion.recovery: ${fusionRecoveryText(fusion.recoveryTriggerPeriod)}`;
   fusionStatusEl.textContent =
 `applied gain: ${fmt(fusion.gain, 3)}
 applied accel reject: ${fmt(fusion.accelerationRejection, 1)} deg
@@ -504,71 +484,35 @@ temp: ${fmt(baro.t, 2)} C`;
 function renderLinkPanel() {
   const pingTxt = isPongFresh() ? String(pingMs ?? "-") : "-";
   const pingAvgTxt = isPongFresh() ? String(pingAvgMs ?? "-") : "-";
-  const rssiTxt = isSideFresh() ? dash(sideLink.wr) : "-";
-  const ctrlClientsTxt = isSideFresh() ? dash(sideStats.cc ?? 0) : "-";
-  const stateClientsTxt = isSideFresh() ? dash(sideStats.sc ?? 0) : "-";
-  const crcTxt = isSideFresh() ? dash(sideStats.ce ?? 0) : "-";
-  const cobsTxt = isSideFresh() ? dash(sideStats.co ?? 0) : "-";
-  const lenErrTxt = isSideFresh() ? dash(sideStats.le ?? 0) : "-";
-  const dropTxt = isSideFresh() ? dash(sideStats.dr ?? 0) : "-";
-  const uartStateAgeTxt = isSideFresh() ? dash(sideStats.sra ?? 0) : "-";
-  const pubStateAgeTxt = isSideFresh() ? dash(sideStats.spa ?? 0) : "-";
-  const snapHasStateTxt = isSideFresh() ? dash(sideStats.shs ?? 0) : "-";
-  const snapSeqTxt = isSideFresh() ? dash(sideStats.ssq ?? 0) : "-";
-  const pubSeqTxt = isSideFresh() ? dash(sideStats.psq ?? 0) : "-";
-  const wsBackpressureTxt = isSideFresh() ? dash(sideStats.wb ?? 0) : "-";
-  const wsQueueCurTxt = isSideFresh() ? dash(sideStats.wqc ?? 0) : "-";
-  const wsQueueMaxTxt = isSideFresh() ? dash(sideStats.wq ?? 0) : "-";
-  const wsDropTxt = isSideFresh() ? dash(sideStats.wd ?? 0) : "-";
-  const logQueueCurTxt = isSideFresh() ? dash(sideStats.lqc ?? 0) : "-";
-  const logQueueMaxTxt = isSideFresh() ? dash(sideStats.lqm ?? 0) : "-";
-  const logEnqueuedTxt = isSideFresh() ? dash(sideStats.lqe ?? 0) : "-";
-  const logDroppedTxt = isSideFresh() ? dash(sideStats.lqd ?? 0) : "-";
-  const logRecordsWrittenTxt = isSideFresh() ? dash(sideStats.lrw ?? 0) : "-";
-  const logBytesWrittenTxt = isSideFresh() ? dash(sideStats.lbw ?? 0) : "-";
-  const logFlushesTxt = isSideFresh() ? dash(sideStats.lqf ?? 0) : "-";
-  const fsOpenTxt = isSideFresh() ? `${dash(sideStats.fol ?? 0)} / ${dash(sideStats.fom ?? 0)}` : "-";
-  const fsWriteTxt = isSideFresh() ? `${dash(sideStats.fwl ?? 0)} / ${dash(sideStats.fwm ?? 0)}` : "-";
-  const fsCloseTxt = isSideFresh() ? `${dash(sideStats.fcl ?? 0)} / ${dash(sideStats.fcm ?? 0)}` : "-";
-  const fsDeleteTxt = isSideFresh() ? `${dash(sideStats.fdl ?? 0)} / ${dash(sideStats.fdm ?? 0)}` : "-";
-  const fsReadTxt = isSideFresh() ? `${dash(sideStats.frl ?? 0)} / ${dash(sideStats.frm ?? 0)}` : "-";
-  const stateDisconnectTxt = isSideFresh() ? dash(sideStats.wdc ?? 0) : "-";
-  const ctrlDisconnectTxt = isSideFresh() ? dash(sideStats.cdc ?? 0) : "-";
-  const stateFpsTxt = isFresh(lastStateAt, SIDE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
+  const ctrlSocketTxt = isCtrlOpen() ? "open" : "closed";
+  const stateSocketTxt = isStateOpen() ? "open" : "closed";
+  const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
+  const stateAgeTxt = lastStateAt ? String(Date.now() - lastStateAt) : (waitingForTelemetry() ? "waiting" : "-");
+  const sourceSeqTxt = lastSourceSeq > 0 ? String(lastSourceSeq) : "-";
+  const sourceTusTxt = lastSourceTus > 0 ? String(lastSourceTus) : "-";
+  const espRxMsTxt = lastEspRxMs > 0 ? String(lastEspRxMs) : "-";
+  const wsLossTxt = String(wsLoss);
+  const parseFailTxt = String(binaryParseFailCount);
+  const ctrlReconnectTxt = String(ctrlReconnects);
+  const stateReconnectTxt = String(stateReconnects);
+  const ctrlLastCloseTxt = `${ctrlCloseCode}/${ctrlCloseClean}`;
+  const stateLastCloseTxt = `${stateCloseCode}/${stateCloseClean}`;
   linkEl.textContent =
-`wifi_rssi: ${rssiTxt} dBm
-ctrl_clients: ${ctrlClientsTxt}
-state_clients: ${stateClientsTxt}
+`ctrl_socket: ${ctrlSocketTxt}
+state_socket: ${stateSocketTxt}
 state_fps: ${stateFpsTxt}
-uart_crc_err: ${crcTxt}
-uart_cobs_err: ${cobsTxt}
-uart_len_err: ${lenErrTxt}
-uart_drop: ${dropTxt}
-uart_state_age_ms: ${uartStateAgeTxt}
-pub_state_age_ms: ${pubStateAgeTxt}
-snap_seq: ${snapSeqTxt}
-pub_seq: ${pubSeqTxt}
-log_queue_cur: ${logQueueCurTxt}
-log_queue_max: ${logQueueMaxTxt}
-log_records_enqueued: ${logEnqueuedTxt}
-log_dropped: ${logDroppedTxt}
-log_records_written: ${logRecordsWrittenTxt}
-log_bytes_written: ${logBytesWrittenTxt}
-log_flushes: ${logFlushesTxt}
-fs_open_ms last/max: ${fsOpenTxt}
-fs_write_ms last/max: ${fsWriteTxt}
-fs_close_ms last/max: ${fsCloseTxt}
-fs_delete_ms last/max: ${fsDeleteTxt}
-fs_read_ms last/max: ${fsReadTxt}
-ws_backpressure: ${wsBackpressureTxt}
-ws_queue_cur: ${wsQueueCurTxt}
-ws_queue_max: ${wsQueueMaxTxt}
-ws_drop: ${wsDropTxt}
-state_disconnects: ${stateDisconnectTxt}
-ctrl_disconnects: ${ctrlDisconnectTxt}
+state_age_ms: ${stateAgeTxt}
+source_seq: ${sourceSeqTxt}
+source_t_us: ${sourceTusTxt}
+esp_rx_ms: ${espRxMsTxt}
+ws_loss: ${wsLossTxt}
+binary_parse_fail: ${parseFailTxt}
+ctrl_reconnects: ${ctrlReconnectTxt}
+state_reconnects: ${stateReconnectTxt}
+ctrl_last_close: ${ctrlLastCloseTxt}
+state_last_close: ${stateLastCloseTxt}
 ping: ${pingTxt} ms
-ping_avg: ${pingAvgTxt} ms
-cmd_ack: ${cmdAckText()}`;
+ping_avg: ${pingAvgTxt} ms`;
 }
 
 function renderActiveTab() {
@@ -772,21 +716,10 @@ function handleCtrlMessage(text) {
   if (m.type === "config") {
     document.getElementById("sourceHz").value = m.source_rate_hz ?? 50;
     document.getElementById("uiHz").value = m.ui_rate_hz ?? 20;
-    document.getElementById("logHz").value = m.log_rate_hz ?? 50;
-    document.getElementById("logMode").value = String(m.log_mode ?? 0);
-    recEl.textContent = (m.log_mode ? "REC ON" : "REC OFF");
+    recEl.textContent = "REC ON";
     uiDirty = true;
     linkDirty = true;
     return;
-  }
-  if (m.type === "side") {
-    sideStats = m.st || {};
-    sideLink = m.l || {};
-    sideCmdAck = m.ca || null;
-    lastSideAt = Date.now();
-    sideRxCount++;
-    uiDirty = true;
-    linkDirty = true;
   }
 }
 
@@ -977,12 +910,6 @@ setInterval(() => {
 }, 1000);
 
 setInterval(() => {
-  if (isCtrlOpen() && isStateOpen() && !lastStateAt && (Date.now() - lastStateSocketOpenAt) > STATE_STARTUP_GRACE_MS) {
-    try {
-      wsState.close();
-    } catch (_err) {
-    }
-  }
   if (isCtrlOpen() && isStateOpen() && lastStateAt) {
     const now = Date.now();
     const hardStale = (now - lastStateAt) > STATE_HARD_STALE_MS;
@@ -1066,9 +993,7 @@ document.getElementById("recoverySlider").addEventListener("change", () => {
 document.getElementById("applyRate").addEventListener("click", async () => {
   const body = {
     source_rate_hz: parseInt(document.getElementById("sourceHz").value, 10),
-    ui_rate_hz: Math.min(20, parseInt(document.getElementById("uiHz").value, 10)),
-    log_rate_hz: parseInt(document.getElementById("logHz").value, 10),
-    log_mode: parseInt(document.getElementById("logMode").value, 10)
+    ui_rate_hz: Math.min(20, parseInt(document.getElementById("uiHz").value, 10))
   };
   await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   try {
@@ -1077,59 +1002,24 @@ document.getElementById("applyRate").addEventListener("click", async () => {
       const cfg = await resp.json();
       document.getElementById("sourceHz").value = cfg.source_rate_hz ?? 50;
       document.getElementById("uiHz").value = cfg.ui_rate_hz ?? 20;
-      document.getElementById("logHz").value = cfg.log_rate_hz ?? 50;
-      document.getElementById("logMode").value = String(cfg.log_mode ?? 0);
     }
   } catch (_err) {
   }
-  recEl.textContent = body.log_mode ? "REC ON" : "REC OFF";
+  recEl.textContent = "REC ON";
 });
 
-async function loadFiles() {
-  holdTelemetryFresh();
-  let files = [];
+document.getElementById("resetAirNetwork").addEventListener("click", async () => {
+  holdTelemetryFresh(10000);
   try {
-    const r = await fetch("/api/files", { cache: "no-store" });
-    if (!r.ok) return;
-    files = await r.json();
+    const resp = await fetch("/api/reset_air_network", { method: "POST", cache: "no-store" });
+    if (!resp.ok) {
+      throw new Error(`reset failed: ${resp.status}`);
+    }
+    setStatus("Connected / resetting AIR network");
   } catch (_err) {
-    return;
+    setStatus("Connected / AIR reset failed");
   }
-  filesEl.innerHTML = "";
-  files.forEach((f) => {
-    const li = document.createElement("li");
-    li.textContent = `${f.name} (${f.size} bytes) `;
-    const dl = document.createElement("a");
-    dl.href = "#";
-    dl.textContent = "download";
-    const downloadName = f.name.endsWith(".tlog") ? f.name.replace(/\.tlog$/i, ".csv") : f.name;
-    dl.onclick = async (ev) => {
-      ev.preventDefault();
-      holdTelemetryFresh();
-      await downloadUrlToFile(`/api/download?name=${encodeURIComponent(f.name)}`, downloadName);
-    };
-    const del = document.createElement("button");
-    del.textContent = "delete";
-    del.onclick = async () => {
-      del.disabled = true;
-      holdTelemetryFresh();
-      try {
-        const resp = await fetch(`/api/delete?name=${encodeURIComponent(f.name)}`, { cache: "no-store" });
-        if (!resp.ok) {
-          del.disabled = false;
-          return;
-        }
-        li.remove();
-        await loadFiles();
-      } catch (_err) {
-        del.disabled = false;
-      }
-    };
-    li.appendChild(dl);
-    li.appendChild(del);
-    filesEl.appendChild(li);
-  });
-}
+});
 
 async function downloadUrlToFile(url, filename) {
   holdTelemetryFresh();
@@ -1148,8 +1038,6 @@ async function downloadUrlToFile(url, filename) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
 }
-
-document.getElementById("refreshFiles").addEventListener("click", loadFiles);
 document.getElementById("downloadDiag").addEventListener("click", async () => {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   await downloadUrlToFile("/api/diag", `diag-${stamp}.csv`);
@@ -1193,5 +1081,5 @@ setFusionUiValues(
 );
 connectCtrl();
 connectState();
-loadFiles();
+recEl.textContent = "REC ON";
 renderStale();

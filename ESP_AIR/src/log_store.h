@@ -27,7 +27,7 @@ struct Stats {
   uint32_t fs_download_max_ms;
 };
 
-void begin(const AppConfig& cfg);
+void begin(const AppConfig& cfg, bool fs_ready = true);
 void setConfig(const AppConfig& cfg);
 void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state);
 Stats stats();

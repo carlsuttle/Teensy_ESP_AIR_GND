@@ -27,5 +27,7 @@ void publish(const uart_telem::Snapshot& snap);
 bool publishState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us);
 bool publishStressState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us);
 Stats stats();
+bool takeNetworkResetRequest();
+void resetNetworkState();
 
 }  // namespace udp_link

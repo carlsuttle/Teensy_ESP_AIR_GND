@@ -11,6 +11,7 @@ HardwareSerial* g_ser = nullptr;
 HardwareSerial g_serial1(1);
 HardwareSerial g_serial2(2);
 uint32_t g_tx_seq = 1;
+static constexpr size_t kRxBufferBytes = 4096U;
 
 static constexpr size_t RAW_MAX = 768;
 static constexpr size_t DECODED_MAX = 768;
@@ -135,6 +136,19 @@ void resetProbeCapture() {
   g_probe_capture = false;
   g_probe_tail_len = 0;
   g_probe_tail[0] = '\0';
+}
+
+void resetParserState() {
+  g_raw_len = 0;
+  g_probe_match = 0;
+  resetProbeCapture();
+}
+
+void drainInput() {
+  if (!g_ser) return;
+  while (g_ser->available() > 0) {
+    (void)g_ser->read();
+  }
 }
 
 void sendProbeAck(const char* tail) {
@@ -304,10 +318,10 @@ void handlePacket(const uint8_t* pkt, size_t len) {
 
 void begin(const AppConfig& cfg) {
   g_ser = (cfg.uart_port == 1) ? &g_serial1 : &g_serial2;
+  g_ser->setRxBufferSize(kRxBufferBytes);
   g_ser->begin(cfg.uart_baud, SERIAL_8N1, cfg.uart_rx_pin, cfg.uart_tx_pin);
-  g_raw_len = 0;
-  g_probe_match = 0;
-  resetProbeCapture();
+  resetParserState();
+  drainInput();
   g_stats = {};
 }
 
@@ -344,6 +358,13 @@ void poll() {
       continue;
     }
     g_raw[g_raw_len++] = b;
+  }
+}
+
+void resync(bool drain_input) {
+  resetParserState();
+  if (drain_input) {
+    drainInput();
   }
 }
 

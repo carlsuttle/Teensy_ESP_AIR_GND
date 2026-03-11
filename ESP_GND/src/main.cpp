@@ -13,14 +13,24 @@ namespace {
 
 uint8_t g_last_station_count = 0xFFU;
 uint32_t g_last_stat_ms = 0;
+uint32_t g_last_air_probe_ms = 0;
 bool g_stats_streaming = false;
 bool g_udp_streaming = false;
 bool g_air_ready = false;
 bool g_air_wait_announced = false;
+bool g_air_bootstrap_active = true;
+uint8_t g_air_probe_attempts = 0;
+constexpr uint32_t kAirProbeRetryMs = 1000U;
+constexpr uint8_t kAirProbeMaxAttempts = 12U;
 
 void logApState() {
   const uint8_t station_count = WiFi.softAPgetStationNum();
   if (station_count == g_last_station_count) return;
+  if (station_count > 0U) {
+    g_air_bootstrap_active = true;
+    g_air_probe_attempts = 0;
+    g_last_air_probe_ms = 0;
+  }
   g_last_station_count = station_count;
   Serial.printf("AP ssid=%s ip=%s clients=%u\n",
                 config_store::get().ap_ssid,
@@ -31,9 +41,20 @@ void logApState() {
 void printConsoleHelp() {
   Serial.println("GND COMMANDS:");
   Serial.println("  help / h  - show command list");
+  Serial.println("  kickair   - resend current stream-rate command to AIR");
+  Serial.println("  resetair  - send AIR network reset command");
+  Serial.println("  reudp     - restart GND UDP listener");
   Serial.println("  seeudp    - start 1Hz UDP metadata stream");
   Serial.println("  stats     - start 1Hz status stream");
   Serial.println("  x         - stop status stream");
+}
+
+bool sendConfiguredStreamRateToAir() {
+  const AppConfig& cfg = config_store::get();
+  telem::CmdSetStreamRateV1 cmd = {};
+  cmd.ws_rate_hz = cfg.source_rate_hz;
+  cmd.log_rate_hz = cfg.source_rate_hz;
+  return udp_telem::sendSetStreamRate(cmd);
 }
 
 void handleConsoleCommands() {
@@ -44,6 +65,28 @@ void handleConsoleCommands() {
       line.trim();
       if (line.equalsIgnoreCase("help") || line.equalsIgnoreCase("h")) {
         printConsoleHelp();
+      } else if (line.equalsIgnoreCase("kickair")) {
+        const AppConfig& cfg = config_store::get();
+        const bool ok = sendConfiguredStreamRateToAir();
+        Serial.printf("KICKAIR tx_ok=%u target=%s:%u ws_hz=%u log_hz=%u\n",
+                      ok ? 1U : 0U,
+                      udp_telem::targetSenderIp().toString().c_str(),
+                      (unsigned)udp_telem::targetSenderPort(),
+                      (unsigned)cfg.source_rate_hz,
+                      (unsigned)cfg.source_rate_hz);
+      } else if (line.equalsIgnoreCase("resetair")) {
+        const bool ok = udp_telem::sendResetNetwork();
+        Serial.printf("RESETAIR tx_ok=%u target=%s:%u\n",
+                      ok ? 1U : 0U,
+                      udp_telem::targetSenderIp().toString().c_str(),
+                      (unsigned)udp_telem::targetSenderPort());
+      } else if (line.equalsIgnoreCase("reudp") || line.equalsIgnoreCase("restartudp")) {
+        const AppConfig& cfg = config_store::get();
+        udp_telem::restart(cfg);
+        Serial.printf("REUDP listen=%u target=%s:%u\n",
+                      (unsigned)cfg.udp_listen_port,
+                      udp_telem::targetSenderIp().toString().c_str(),
+                      (unsigned)udp_telem::targetSenderPort());
       } else if (line.equalsIgnoreCase("stats")) {
         g_stats_streaming = true;
         g_udp_streaming = false;
@@ -110,6 +153,7 @@ void updateAirReadiness() {
       g_air_ready = true;
       g_air_wait_announced = false;
     }
+    g_air_bootstrap_active = false;
     return;
   }
 
@@ -119,6 +163,20 @@ void updateAirReadiness() {
                   (unsigned)udp_telem::targetSenderPort());
     g_air_wait_announced = true;
   }
+
+  const uint8_t station_count = WiFi.softAPgetStationNum();
+  if (g_air_bootstrap_active && station_count > 0U && g_air_probe_attempts < kAirProbeMaxAttempts &&
+      (g_last_air_probe_ms == 0U || (uint32_t)(now - g_last_air_probe_ms) >= kAirProbeRetryMs)) {
+    const AppConfig& cfg = config_store::get();
+    telem::CmdSetStreamRateV1 cmd = {};
+    cmd.ws_rate_hz = cfg.source_rate_hz;
+    cmd.log_rate_hz = cfg.source_rate_hz;
+    if (udp_telem::sendSetStreamRate(cmd)) {
+      g_air_probe_attempts++;
+      g_last_air_probe_ms = now;
+    }
+  }
+
   g_air_ready = false;
 }
 
@@ -170,7 +228,6 @@ void printUdpMeta() {
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
   Serial.println("ESP_GND boot");
 
   config_store::begin();

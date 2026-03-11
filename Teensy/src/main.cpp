@@ -1380,9 +1380,6 @@ void printSummary2Hz() {
 
 void setup() {
   Serial.begin(CONSOLE_BAUD);
-  delay(3000);
-  const uint32_t start_ms = millis();
-  while (!Serial && (millis() - start_ms) < 3000U) {}
 
   Serial.println("FAST Teensy Avionics");
   Serial.println("board=teensy40 fw=standalone");

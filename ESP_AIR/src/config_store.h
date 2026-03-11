@@ -14,8 +14,8 @@ struct AppConfig {
   uint32_t uart_baud;
   uint8_t source_rate_hz;
   uint8_t ui_rate_hz;
-  uint8_t log_rate_hz;
-  uint8_t log_mode;  // 0=off, 1=on
+  uint8_t log_rate_hz;  // Mirrors source_rate_hz for protocol compatibility.
+  uint8_t log_mode;     // Always on.
   uint32_t max_log_bytes;
 };
 

@@ -42,6 +42,7 @@ String g_current_name;
 TaskHandle_t g_writer_task = nullptr;
 SemaphoreHandle_t g_fs_mutex = nullptr;
 Stats g_stats = {};
+bool g_fs_ready = false;
 uint32_t g_last_log_ms = 0;
 uint32_t g_last_log_t_us = 0;
 uint32_t g_last_seq = 0;
@@ -225,31 +226,18 @@ void writerTask(void* param) {
     uint32_t q_now = 0;
     bool gotRecord = ringPop(record, q_now);
     while (gotRecord) {
-      if (g_cfg.log_mode) {
-        const uint32_t rate_hz = g_cfg.log_rate_hz ? g_cfg.log_rate_hz : 1U;
-        const uint32_t source_hz = g_cfg.source_rate_hz ? g_cfg.source_rate_hz : 1U;
-        const bool writeEveryFrame = rate_hz >= source_hz;
-        bool shouldWrite = writeEveryFrame;
-        if (!writeEveryFrame) {
-          const uint32_t period_us = 1000000UL / rate_hz;
-          const uint32_t dt_us = (g_last_log_t_us == 0U) ? period_us : (uint32_t)(record.t_us - g_last_log_t_us);
-          shouldWrite = dt_us >= period_us;
-        }
-        if (shouldWrite) {
-          g_last_log_ms = millis();
-          g_last_log_t_us = record.t_us;
-          FsLockGuard lock;
-          if (appendBufferedBytes(reinterpret_cast<const uint8_t*>(&record), sizeof(record))) {
-            g_stats.records_written++;
-          }
-        }
+      g_last_log_ms = millis();
+      g_last_log_t_us = record.t_us;
+      FsLockGuard lock;
+      if (appendBufferedBytes(reinterpret_cast<const uint8_t*>(&record), sizeof(record))) {
+        g_stats.records_written++;
       }
       gotRecord = ringPop(record, q_now);
     }
     g_stats.queue_cur = q_now;
 
     const uint32_t now = millis();
-    if (g_cfg.log_mode) {
+    {
       FsLockGuard lock;
       const bool batchDue = g_write_used && ((uint32_t)(now - g_last_write_ms) >= kBatchWriteMs);
       const bool bufferNearlyFull = g_write_used >= (sizeof(g_write_buffer) * 3U / 4U);
@@ -258,18 +246,14 @@ void writerTask(void* param) {
         g_last_write_ms = now;
       }
     }
-
-    if (!g_cfg.log_mode && g_stats.queue_cur == 0 && (g_file || g_write_used)) {
-      FsLockGuard lock;
-      closeCurrentLog();
-    }
   }
 }
 
 }  // namespace
 
-void begin(const AppConfig& cfg) {
+void begin(const AppConfig& cfg, bool fs_ready) {
   g_cfg = cfg;
+  g_fs_ready = fs_ready;
   g_stats = {};
   g_last_log_ms = 0;
   g_last_log_t_us = 0;
@@ -287,30 +271,20 @@ void begin(const AppConfig& cfg) {
   g_ring_head = 0;
   g_ring_tail = 0;
   portEXIT_CRITICAL(&g_log_mux);
+  if (!g_fs_ready) {
+    return;
+  }
   if (!g_writer_task) {
     xTaskCreatePinnedToCore(writerTask, "log_writer", 4096, nullptr, 1, &g_writer_task, 1);
   }
 }
 
 void setConfig(const AppConfig& cfg) {
-  const bool stopLogging = g_cfg.log_mode && !cfg.log_mode;
   g_cfg = cfg;
-  if (stopLogging) {
-    FsLockGuard lock;
-    closeCurrentLog();
-  }
-  if (!g_cfg.log_mode) {
-    g_last_log_ms = 0;
-    g_last_log_t_us = 0;
-    g_last_seq = 0;
-    g_last_write_ms = 0;
-    g_write_used = 0;
-    g_stats.queue_cur = 0;
-  }
 }
 
 void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state) {
-  if (!g_cfg.log_mode) return;
+  if (!g_fs_ready) return;
   if (seq == g_last_seq) return;
   g_last_seq = seq;
 
@@ -344,6 +318,7 @@ void resetStats() {
 }
 
 String filesJson() {
+  if (!g_fs_ready) return "[]";
   String out = "[";
   bool first = true;
   FsLockGuard lock;
@@ -377,6 +352,7 @@ bool isSafeName(const String& name) {
 }
 
 bool deleteFileByName(const String& name) {
+  if (!g_fs_ready) return false;
   if (!isSafeName(name)) return false;
   const String full = String(LOG_DIR) + "/" + name;
   FsLockGuard lock;

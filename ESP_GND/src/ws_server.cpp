@@ -57,8 +57,8 @@ void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
   doc["type"] = "config";
   doc["source_rate_hz"] = cfg.source_rate_hz;
   doc["ui_rate_hz"] = cfg.ui_rate_hz;
-  doc["log_rate_hz"] = cfg.log_rate_hz;
-  doc["log_mode"] = cfg.log_mode;
+  doc["log_rate_hz"] = cfg.source_rate_hz;
+  doc["log_mode"] = 1;
 
   if (client) {
     sendCtrlJson(client, doc);
@@ -263,8 +263,8 @@ void begin() {
     StaticJsonDocument<256> doc;
     doc["source_rate_hz"] = cfg.source_rate_hz;
     doc["ui_rate_hz"] = cfg.ui_rate_hz;
-    doc["log_rate_hz"] = cfg.log_rate_hz;
-    doc["log_mode"] = cfg.log_mode;
+    doc["log_rate_hz"] = cfg.source_rate_hz;
+    doc["log_mode"] = 1;
     doc["udp_listen_port"] = cfg.udp_listen_port;
     String text;
     serializeJson(doc, text);
@@ -291,14 +291,14 @@ void begin() {
         AppConfig cfg = config_store::get();
         if (doc.containsKey("source_rate_hz")) cfg.source_rate_hz = doc["source_rate_hz"].as<uint8_t>();
         if (doc.containsKey("ui_rate_hz")) cfg.ui_rate_hz = doc["ui_rate_hz"].as<uint8_t>();
-        if (doc.containsKey("log_rate_hz")) cfg.log_rate_hz = doc["log_rate_hz"].as<uint8_t>();
-        if (doc.containsKey("log_mode")) cfg.log_mode = doc["log_mode"].as<uint8_t>();
+        cfg.log_rate_hz = cfg.source_rate_hz;
+        cfg.log_mode = 1U;
         config_store::update(cfg);
         udp_telem::reconfigure(cfg);
 
         telem::CmdSetStreamRateV1 cmd = {};
         cmd.ws_rate_hz = cfg.source_rate_hz;
-        cmd.log_rate_hz = cfg.log_rate_hz;
+        cmd.log_rate_hz = cfg.source_rate_hz;
         (void)udp_telem::sendSetStreamRate(cmd);
 
         broadcastConfig();
@@ -313,6 +313,10 @@ void begin() {
   g_server.on("/api/delete", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(200, "application/json", "{\"ok\":1}");
   });
+  g_server.on("/api/reset_air_network", HTTP_POST, [](AsyncWebServerRequest* request) {
+    const bool ok = udp_telem::sendResetNetwork();
+    request->send(ok ? 200 : 503, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0}");
+  });
   g_server.on("/api/diag", HTTP_GET, serveDiagCsv);
   g_server.on("/api/ws_events", HTTP_GET, serveWsEventsCsv);
   g_server.on("/api/reset_counters", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -320,7 +324,9 @@ void begin() {
     request->send(200, "application/json", "{\"ok\":1}");
   });
 
-  g_server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+  g_server.serveStatic("/", LittleFS, "/")
+      .setDefaultFile("index.html")
+      .setCacheControl("no-cache, no-store, must-revalidate");
   g_server.begin();
 }
 

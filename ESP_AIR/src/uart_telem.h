@@ -53,6 +53,7 @@ struct LoopbackResult {
 void begin(const AppConfig& cfg);
 void reconfigure(const AppConfig& cfg);
 void poll();
+void resync(bool drain_input = true);
 Snapshot snapshot();
 bool popPendingState(PendingState& out);
 LoopbackResult runLoopbackTest(uint32_t timeout_ms = 120U);

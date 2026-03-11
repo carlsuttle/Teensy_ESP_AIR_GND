@@ -23,10 +23,22 @@ uint32_t g_last_stream_rate_tx_ms = 0;
 uint8_t g_last_stream_rate_ui_hz = 0;
 uint8_t g_last_stream_rate_log_hz = 0;
 wl_status_t g_last_wifi_status = (wl_status_t)255;
-uint32_t g_last_wifi_retry_ms = 0;
 bool g_wifi_ready = false;
 bool g_teensy_ready = false;
 bool g_teensy_wait_printed = false;
+bool g_last_wifi_link_ok = false;
+bool g_wifi_drop_pending = false;
+bool g_wifi_drop_once_used = false;
+uint32_t g_wifi_drop_due_ms = 0;
+bool g_wifi_offon_pending = false;
+bool g_wifi_offon_once_used = false;
+uint32_t g_wifi_offon_due_ms = 0;
+constexpr uint32_t kWifiDropDelayMs = 3000U;
+constexpr uint32_t kWifiOffOnDelayMs = 9000U;
+constexpr bool kEnableAirFileLogging = false;
+
+void beginWifiStation();
+void restartWifiStation();
 
 const char* wifiStatusName(wl_status_t status) {
   switch (status) {
@@ -51,33 +63,75 @@ const char* wifiStatusName(wl_status_t status) {
   }
 }
 
-bool wifiConnected() { return WiFi.status() == WL_CONNECTED; }
+bool wifiLinkHealthy() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  wifi_ap_record_t ap_info = {};
+  return esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+}
+
+bool wifiConnected() { return wifiLinkHealthy(); }
+
+void resetWifiStatusFlags() {
+  g_wifi_ready = false;
+  g_last_wifi_link_ok = false;
+  g_last_wifi_status = (wl_status_t)255;
+  g_wifi_drop_pending = false;
+  g_wifi_drop_once_used = false;
+  g_wifi_drop_due_ms = 0;
+  g_wifi_offon_pending = false;
+  g_wifi_offon_once_used = false;
+  g_wifi_offon_due_ms = 0;
+}
 
 void ensureConfiguredStreamRate() {
   const AppConfig& cfg = config_store::get();
+  const uint8_t target_stream_hz = cfg.source_rate_hz;
+  const uint8_t target_log_hz = cfg.source_rate_hz;
   const bool targetChanged =
-      (cfg.source_rate_hz != g_last_stream_rate_ui_hz) || (cfg.log_rate_hz != g_last_stream_rate_log_hz);
+      (target_stream_hz != g_last_stream_rate_ui_hz) || (target_log_hz != g_last_stream_rate_log_hz);
   const uint32_t now = millis();
   if (!targetChanged && !g_wait_stream_rate_ack) return;
   if (!targetChanged && (uint32_t)(now - g_last_stream_rate_tx_ms) < 1000U) return;
 
   telem::CmdSetStreamRateV1 cmd = {};
-  cmd.ws_rate_hz = cfg.source_rate_hz;
-  cmd.log_rate_hz = cfg.log_rate_hz;
+  cmd.ws_rate_hz = target_stream_hz;
+  cmd.log_rate_hz = target_log_hz;
   if (!uart_telem::sendSetStreamRate(cmd)) return;
 
-  g_last_stream_rate_ui_hz = cfg.source_rate_hz;
-  g_last_stream_rate_log_hz = cfg.log_rate_hz;
+  g_last_stream_rate_ui_hz = target_stream_hz;
+  g_last_stream_rate_log_hz = target_log_hz;
   g_last_stream_rate_tx_ms = now;
   g_wait_stream_rate_ack = true;
+}
+
+bool sendConfiguredStreamRateNow() {
+  const AppConfig& cfg = config_store::get();
+  telem::CmdSetStreamRateV1 cmd = {};
+  cmd.ws_rate_hz = cfg.source_rate_hz;
+  cmd.log_rate_hz = cfg.source_rate_hz;
+  const bool ok = uart_telem::sendSetStreamRate(cmd);
+  if (ok) {
+    g_last_stream_rate_ui_hz = cmd.ws_rate_hz;
+    g_last_stream_rate_log_hz = cmd.log_rate_hz;
+    g_last_stream_rate_tx_ms = millis();
+    g_wait_stream_rate_ack = true;
+  }
+  return ok;
 }
 
 void printConsoleHelp() {
   Serial.println("AIR COMMANDS:");
   Serial.println("  help / h      - show command list");
-  Serial.println("  esp32loopback - run active UART TX/RX loopback test");
-  Serial.println("  rxscan        - scan candidate RX pins for UART bytes");
   Serial.println("  getfusion     - send CMD_GET_FUSION_SETTINGS to Teensy");
+  Serial.println("  kickteensy    - resend current stream-rate command to Teensy");
+  Serial.println("  resendrate    - same as kickteensy");
+  Serial.println("  tx1           - send current state once to GND");
+  Serial.println("  udpclear      - clear AIR UDP state and stop UDP socket");
+  Serial.println("  udpreopen     - reopen AIR UDP socket only");
+  Serial.println("  wifidrop      - disconnect/reconnect Wi-Fi without radio off");
+  Serial.println("  wifioffon     - power-cycle Wi-Fi only");
+  Serial.println("  reudp         - restart AIR UDP socket");
+  Serial.println("  resetnet      - restart AIR Wi-Fi/UDP network side");
   Serial.println("  setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
   Serial.println("  stats         - start 1Hz STAT stream");
   Serial.println("  x             - stop active stream/mode");
@@ -122,55 +176,61 @@ void handleConsoleCommands() {
 
       if (strcmp(g_console_line, "help") == 0 || strcmp(g_console_line, "h") == 0) {
         printConsoleHelp();
-      } else if (strcmp(g_console_line, "esp32loopback") == 0) {
-        Serial.println("ESP32LOOPBACK START timeout_ms=120");
-        const auto r = uart_telem::runLoopbackTest(120U);
-        if (r.pass) {
-          Serial.printf("ESP32LOOPBACK PASS sent=%lu recv=%lu mismatches=%lu elapsed_ms=%lu\n",
-                        (unsigned long)r.sent,
-                        (unsigned long)r.received,
-                        (unsigned long)r.mismatches,
-                        (unsigned long)r.elapsed_ms);
-        } else {
-          Serial.printf("ESP32LOOPBACK FAIL sent=%lu recv=%lu mismatches=%lu elapsed_ms=%lu\n",
-                        (unsigned long)r.sent,
-                        (unsigned long)r.received,
-                        (unsigned long)r.mismatches,
-                        (unsigned long)r.elapsed_ms);
-          if (r.first_mismatch_index != 0xFFU) {
-            Serial.printf("ESP32LOOPBACK first_mismatch idx=%u exp=0x%02X got=0x%02X\n",
-                          (unsigned)r.first_mismatch_index,
-                          (unsigned)r.expected,
-                          (unsigned)r.actual);
-          }
-        }
-      } else if (strcmp(g_console_line, "rxscan") == 0) {
-        static const uint8_t kCandidates[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 43, 44};
-        Serial.println("RXSCAN START baud=921600 dwell_ms=300");
-        uint8_t bestPin = 0xFFU;
-        uint32_t bestBytes = 0;
-        for (size_t i = 0; i < sizeof(kCandidates); ++i) {
-          uint32_t bytes = 0;
-          const uint8_t pin = kCandidates[i];
-          if (!uart_telem::probeRxPin(pin, 921600U, 300U, bytes)) {
-            Serial.printf("RXSCAN pin=%u probe_error\n", (unsigned)pin);
-            continue;
-          }
-          Serial.printf("RXSCAN pin=%u bytes=%lu\n", (unsigned)pin, (unsigned long)bytes);
-          if (bytes > bestBytes) {
-            bestBytes = bytes;
-            bestPin = pin;
-          }
-        }
-        if (bestPin != 0xFFU && bestBytes > 0U) {
-          Serial.printf("RXSCAN BEST pin=%u bytes=%lu\n", (unsigned)bestPin, (unsigned long)bestBytes);
-        } else {
-          Serial.println("RXSCAN RESULT no_activity");
-        }
       } else if (strcmp(g_console_line, "getfusion") == 0 || strcmp(g_console_line, "get fusion") == 0) {
         const bool ok = uart_telem::sendGetFusionSettings();
         Serial.printf("GETFUSION tx_ok=%u\n", ok ? 1U : 0U);
         g_wait_getfusion_ack = ok;
+      } else if (strcmp(g_console_line, "kickteensy") == 0 || strcmp(g_console_line, "kickstream") == 0 ||
+                 strcmp(g_console_line, "resendrate") == 0) {
+        const AppConfig& cfg = config_store::get();
+        const bool ok = sendConfiguredStreamRateNow();
+        Serial.printf("KICKTEENSY tx_ok=%u ws_hz=%u log_hz=%u\n",
+                      ok ? 1U : 0U,
+                      (unsigned)cfg.source_rate_hz,
+                      (unsigned)cfg.source_rate_hz);
+      } else if (strcmp(g_console_line, "tx1") == 0 || strcmp(g_console_line, "sendstate") == 0) {
+        const auto snap = uart_telem::snapshot();
+        if (!snap.has_state) {
+          Serial.println("TX1 tx_ok=0 reason=no_state");
+        } else {
+          const bool ok = udp_link::publishStressState(snap.state, snap.seq, snap.t_us);
+          Serial.printf("TX1 tx_ok=%u seq=%lu t_us=%lu\n",
+                        ok ? 1U : 0U,
+                        (unsigned long)snap.seq,
+                        (unsigned long)snap.t_us);
+        }
+      } else if (strcmp(g_console_line, "udpclear") == 0) {
+        udp_link::resetNetworkState();
+        Serial.println("UDPCLEAR done state=cleared socket=stopped");
+      } else if (strcmp(g_console_line, "udpreopen") == 0) {
+        const AppConfig& cfg = config_store::get();
+        udp_link::reconfigure(cfg);
+        Serial.printf("UDPREOPEN local=%u peer=%s:%u\n",
+                      (unsigned)cfg.udp_local_port,
+                      cfg.gnd_ip,
+                      (unsigned)cfg.udp_gnd_port);
+      } else if (strcmp(g_console_line, "wifidrop") == 0) {
+        resetWifiStatusFlags();
+        WiFi.disconnect(false, false);
+        delay(10);
+        WiFi.reconnect();
+        Serial.println("WIFIDROP disconnect+reconnect");
+      } else if (strcmp(g_console_line, "wifioffon") == 0) {
+        resetWifiStatusFlags();
+        WiFi.disconnect(false, false);
+        WiFi.mode(WIFI_OFF);
+        delay(50);
+        beginWifiStation();
+        Serial.println("WIFIOFFON radio_power_cycle");
+      } else if (strcmp(g_console_line, "reudp") == 0 || strcmp(g_console_line, "restartudp") == 0) {
+        const AppConfig& cfg = config_store::get();
+        udp_link::reconfigure(cfg);
+        Serial.printf("REUDP local=%u peer=%s:%u\n",
+                      (unsigned)cfg.udp_local_port,
+                      cfg.gnd_ip,
+                      (unsigned)cfg.udp_gnd_port);
+      } else if (strcmp(g_console_line, "resetnet") == 0 || strcmp(g_console_line, "netreset") == 0) {
+        restartWifiStation();
       } else if (strncmp(g_console_line, "setfusion ", 10) == 0) {
         float g = 0.0f, a = 0.0f, m = 0.0f;
         unsigned r = 0U;
@@ -231,18 +291,48 @@ void beginWifiStation() {
                 (unsigned)cfg.udp_gnd_port);
   Serial.printf("Joining Wi-Fi ssid=%s\n", cfg.ap_ssid);
   WiFi.begin(cfg.ap_ssid, cfg.ap_pass);
-  g_last_wifi_retry_ms = millis();
+}
+
+void restartWifiStation() {
+  const AppConfig& cfg = config_store::get();
+  Serial.println("AIR CMD reset_network");
+  udp_link::resetNetworkState();
+  resetWifiStatusFlags();
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  beginWifiStation();
+  g_wait_stream_rate_ack = true;
+  g_last_stream_rate_tx_ms = 0;
+  g_last_stream_rate_ui_hz = 0;
+  g_last_stream_rate_log_hz = 0;
+  udp_link::reconfigure(cfg);
 }
 
 void updateWifiReadiness() {
   const AppConfig& cfg = config_store::get();
+  const uint32_t now = millis();
   const wl_status_t status = WiFi.status();
+  const bool link_ok = wifiLinkHealthy();
+  const bool was_link_ok = g_last_wifi_link_ok;
   if (status != g_last_wifi_status) {
     g_last_wifi_status = status;
     Serial.printf("Wi-Fi status=%s(%d)\n", wifiStatusName(status), (int)status);
   }
+  if (link_ok != g_last_wifi_link_ok) {
+    g_last_wifi_link_ok = link_ok;
+    if (!link_ok && status == WL_CONNECTED) {
+      Serial.println("AIR WARN wifi_link_unhealthy ap_info=missing");
+    }
+  }
 
-  if (status == WL_CONNECTED) {
+  if (link_ok) {
+    g_wifi_drop_pending = false;
+    g_wifi_drop_once_used = false;
+    g_wifi_drop_due_ms = 0;
+    g_wifi_offon_pending = false;
+    g_wifi_offon_once_used = false;
+    g_wifi_offon_due_ms = 0;
     if (!g_wifi_ready) {
       udp_link::reconfigure(cfg);
       Serial.printf("AIR READY wifi ip=%s gateway=%s gnd=%s:%u\n",
@@ -263,10 +353,41 @@ void updateWifiReadiness() {
     g_wifi_ready = false;
   }
 
-  const uint32_t now = millis();
-  if ((uint32_t)(now - g_last_wifi_retry_ms) >= 5000U) {
+  if (was_link_ok && !g_wifi_drop_pending && !g_wifi_drop_once_used && !g_wifi_offon_pending &&
+      !g_wifi_offon_once_used) {
+    g_wifi_drop_pending = true;
+    g_wifi_drop_due_ms = now + kWifiDropDelayMs;
+    g_wifi_offon_pending = true;
+    g_wifi_offon_due_ms = now + kWifiOffOnDelayMs;
+    Serial.printf("AIR INFO wifi_recovery_scheduled drop_ms=%lu offon_ms=%lu\n",
+                  (unsigned long)kWifiDropDelayMs,
+                  (unsigned long)kWifiOffOnDelayMs);
+  }
+
+  if (g_wifi_drop_pending && !g_wifi_drop_once_used &&
+      (int32_t)(now - g_wifi_drop_due_ms) >= 0) {
+    WiFi.disconnect(false, false);
+    delay(10);
     WiFi.reconnect();
-    g_last_wifi_retry_ms = now;
+    g_wifi_drop_pending = false;
+    g_wifi_drop_once_used = true;
+    Serial.println("AIR INFO wifi_disconnect_reconnect_delayed");
+  }
+
+  if (g_wifi_offon_pending && !g_wifi_offon_once_used &&
+      (int32_t)(now - g_wifi_offon_due_ms) >= 0) {
+    g_wifi_ready = false;
+    g_last_wifi_link_ok = false;
+    g_last_wifi_status = (wl_status_t)255;
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+    beginWifiStation();
+    g_wifi_drop_pending = false;
+    g_wifi_drop_once_used = true;
+    g_wifi_offon_pending = false;
+    g_wifi_offon_once_used = true;
+    Serial.println("AIR INFO wifi_power_cycle_delayed");
   }
 }
 
@@ -288,7 +409,16 @@ void updateTeensyReadiness(const uart_telem::Snapshot& snap) {
   if (g_teensy_ready) {
     Serial.printf("AIR WAIT teensy telemetry timeout_ms=%lu\n",
                   (unsigned long)(snap.stats.last_rx_ms ? (now - snap.stats.last_rx_ms) : 0U));
+    uart_telem::resync();
+    Serial.printf("AIR WARN teensy_uart_resync rx_bytes=%lu ok=%lu cobs=%lu len=%lu unk=%lu\n",
+                  (unsigned long)snap.stats.rx_bytes,
+                  (unsigned long)snap.stats.frames_ok,
+                  (unsigned long)snap.stats.cobs_err,
+                  (unsigned long)snap.stats.len_err,
+                  (unsigned long)snap.stats.unknown_msg);
     g_teensy_ready = false;
+    g_wait_stream_rate_ack = true;
+    g_last_stream_rate_tx_ms = 0;
     return;
   }
 
@@ -311,7 +441,6 @@ void publishPendingTelemetry() {
 
 void setup() {
   Serial.begin(115200);
-  delay(2000);
   Serial.println("ESP_AIR boot");
 
   config_store::begin();
@@ -324,13 +453,17 @@ void setup() {
 
   beginWifiStation();
 
-  if (!LittleFS.begin(true)) {
+  const bool fs_ready = LittleFS.begin(true);
+  if (!fs_ready) {
     Serial.println("LittleFS mount failed");
   }
 
   uart_telem::begin(cfg);
   udp_link::begin(cfg);
-  log_store::begin(cfg);
+  log_store::begin(cfg, fs_ready && kEnableAirFileLogging);
+  if (!kEnableAirFileLogging) {
+    Serial.println("AIR INFO file_logging_disabled");
+  }
   g_last_stream_rate_ui_hz = 0;
   g_last_stream_rate_log_hz = 0;
   g_last_stream_rate_tx_ms = 0;
@@ -340,6 +473,9 @@ void setup() {
 
 void loop() {
   handleConsoleCommands();
+  if (udp_link::takeNetworkResetRequest()) {
+    restartWifiStation();
+  }
   updateWifiReadiness();
   uart_telem::poll();
   udp_link::poll();
