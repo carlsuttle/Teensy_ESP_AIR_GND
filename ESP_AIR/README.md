@@ -1,41 +1,105 @@
 # ESP_AIR
 
-Air-side ESP32 project for the new `Teensy_ESP_AIR_GND` structure.
+Aircraft-side ESP32 project for the `Teensy_ESP_AIR_GND` split architecture.
 
-This folder was seeded from the current working `esp32_air_unit_ws_bridge` project and is the starting point for the aircraft-side ESP role.
+## Role
 
-## Intended Role
+`ESP_AIR` is the flight-side bridge between the Teensy avionics processor and the ground unit.
 
-`ESP_AIR` is intended to own:
-- Teensy UART telemetry ingest
-- authoritative onboard logging
-- air-to-ground telemetry transmission
-- command relay between ground ESP and Teensy
+Current responsibilities:
+- ingest Teensy telemetry and ACK/NACK traffic over UART
+- forward latest telemetry, fusion settings, and command ACK/NACK to `ESP_GND` over bidirectional `ESP-NOW`
+- receive commands from `ESP_GND` and relay them to the Teensy
+- publish AIR link metadata such as recorder state and approximate GND AP RSSI
 
-It is not intended to remain the long-term iPhone web server.
+`ESP_AIR` is no longer the phone-facing web server.
 
-## Current State
+## Current Behavior
 
-Right now this folder is still a copied working bridge baseline, so it still contains:
-- the current UART ingest path
-- the current logger pipeline
-- the current websocket/web UI code
+Implemented transport behavior:
+- `WiFi` runs in `WIFI_STA` mode on channel `6`
+- peer discovery uses `LINK_HELLO`
+- telemetry/control transport is `ESP-NOW`
+- command flow is bidirectional
+- command ACK/NACK is preserved end to end
 
-That browser-serving code is present only because this is the fastest safe starting point.
+Implemented UART/bridge behavior:
+- UART bridge uses `UART1`
+- RX pin `3`, TX pin `4`
+- baud `921600`
+- Teensy telemetry is treated as the source of truth for state and fusion settings
 
-## Immediate Next Refactor
+Implemented metadata behavior:
+- AIR reports whether radio is ready
+- AIR reports whether a GND peer is known
+- AIR reports recorder enabled/disabled
+- AIR samples approximate GND AP RSSI by scanning for the configured AP SSID on channel `6`
 
-The expected next steps in this folder are:
-- keep UART ingest and logging
-- remove browser-serving responsibilities over time
-- replace direct phone-facing websocket behavior with air-to-ground transport behavior
+Current defaults:
+- AP SSID hint: `Telemetry`
+- AP password hint: `telemetry`
+- source rate: `50 Hz`
+- UI rate compatibility field: `20 Hz`
+- log rate compatibility field mirrors source rate
 
-## Source of the Seed
+## Logging
 
-Copied from:
-- [esp32_air_unit_ws_bridge](c:/Users/dell/Platformio/esp32_crsf_telemetry/esp32_air_unit_ws_bridge)
+The AIR logging pipeline still exists, but file logging is currently disabled in firmware.
 
-## Related Folders
+Current state:
+- `log_store` code remains in place
+- recorder state is exposed to GND/web UI
+- `kEnableAirFileLogging` is currently `false`
 
-- [Teensy](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/Teensy)
-- [ESP_GND](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_GND)
+Reason:
+- there is still no finished quota/rotation/download workflow for onboard log files
+
+## Serial Console
+
+USB serial provides bench commands.
+
+Current AIR commands:
+- `help`
+- `getfusion`
+- `kickteensy`
+- `resendrate`
+- `tx1`
+- `linkclear`
+- `linkopen`
+- `wifidrop`
+- `wifioffon`
+- `relink`
+- `resetnet`
+- `setfusion <gain> <accelRej> <magRej> <recovery>`
+- `stats`
+- `x`
+
+Useful boot/status lines:
+- `AIR READY radio channel=6`
+- `AIR READY teensy_link ...`
+- `AIR READY gnd_link peer=...`
+
+## Build And Upload
+
+From this folder:
+
+```powershell
+pio run
+pio run -t upload
+pio device monitor -b 115200
+```
+
+`ESP_AIR/data/` currently contains no active web assets, so there is normally no reason to run `uploadfs` here.
+
+## Bench Notes
+
+Observed on the current bench setup:
+- cold starts recover without manual intervention
+- AIR power cycles relink cleanly to GND
+- GND power cycles relink cleanly once the AP returns
+- repeated reflashes/resets have not shown bad transport behavior
+
+## Related Projects
+
+- [../Teensy](../Teensy)
+- [../ESP_GND](../ESP_GND)
