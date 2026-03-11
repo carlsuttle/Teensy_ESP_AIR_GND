@@ -45,6 +45,8 @@ bool sendGetFusionSettings();
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd);
 bool sendResetNetwork();
 bool hasLearnedSender();
+String targetSenderMac();
+String lastSenderMac();
 IPAddress targetSenderIp();
 uint16_t targetSenderPort();
 IPAddress lastSenderIp();

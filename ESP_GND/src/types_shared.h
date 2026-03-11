@@ -8,6 +8,8 @@ static constexpr uint32_t kMagic = 0x54454C4DUL;  // "TELM"
 static constexpr uint16_t kVersion = 1;
 static constexpr uint32_t kWsStateMagic = 0x57535445UL;  // "WSTE"
 static constexpr uint16_t kWsStateVersion = 2;
+static constexpr uint8_t kRadioChannel = 6;
+static constexpr uint16_t kEspNowMaxDataLen = 250;
 
 enum MsgType : uint16_t {
   TELEM_FULL_STATE = 1,
@@ -18,6 +20,7 @@ enum MsgType : uint16_t {
   CMD_GET_FUSION_SETTINGS = 101,
   CMD_SET_STREAM_RATE = 102,
   CMD_RESET_NETWORK = 103,
+  LINK_HELLO = 150,
   ACK = 200,
   NACK = 201
 };
@@ -94,6 +97,13 @@ struct AckPayloadV1 {
   uint16_t command;
   uint16_t ok;
   uint32_t code;
+};
+
+struct LinkHelloPayloadV1 {
+  uint8_t unit_id;
+  uint8_t flags;
+  uint16_t reserved;
+  uint32_t session_id;
 };
 
 struct WsStateHeaderV1 {

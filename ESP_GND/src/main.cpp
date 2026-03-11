@@ -26,11 +26,6 @@ constexpr uint8_t kAirProbeMaxAttempts = 12U;
 void logApState() {
   const uint8_t station_count = WiFi.softAPgetStationNum();
   if (station_count == g_last_station_count) return;
-  if (station_count > 0U) {
-    g_air_bootstrap_active = true;
-    g_air_probe_attempts = 0;
-    g_last_air_probe_ms = 0;
-  }
   g_last_station_count = station_count;
   Serial.printf("AP ssid=%s ip=%s clients=%u\n",
                 config_store::get().ap_ssid,
@@ -43,8 +38,8 @@ void printConsoleHelp() {
   Serial.println("  help / h  - show command list");
   Serial.println("  kickair   - resend current stream-rate command to AIR");
   Serial.println("  resetair  - send AIR network reset command");
-  Serial.println("  reudp     - restart GND UDP listener");
-  Serial.println("  seeudp    - start 1Hz UDP metadata stream");
+  Serial.println("  reudp     - restart GND radio link state");
+  Serial.println("  seeudp    - start 1Hz AIR link metadata stream");
   Serial.println("  stats     - start 1Hz status stream");
   Serial.println("  x         - stop status stream");
 }
@@ -68,25 +63,20 @@ void handleConsoleCommands() {
       } else if (line.equalsIgnoreCase("kickair")) {
         const AppConfig& cfg = config_store::get();
         const bool ok = sendConfiguredStreamRateToAir();
-        Serial.printf("KICKAIR tx_ok=%u target=%s:%u ws_hz=%u log_hz=%u\n",
+        Serial.printf("KICKAIR tx_ok=%u target=%s ws_hz=%u log_hz=%u\n",
                       ok ? 1U : 0U,
-                      udp_telem::targetSenderIp().toString().c_str(),
-                      (unsigned)udp_telem::targetSenderPort(),
+                      udp_telem::targetSenderMac().c_str(),
                       (unsigned)cfg.source_rate_hz,
                       (unsigned)cfg.source_rate_hz);
       } else if (line.equalsIgnoreCase("resetair")) {
         const bool ok = udp_telem::sendResetNetwork();
-        Serial.printf("RESETAIR tx_ok=%u target=%s:%u\n",
+        Serial.printf("RESETAIR tx_ok=%u target=%s\n",
                       ok ? 1U : 0U,
-                      udp_telem::targetSenderIp().toString().c_str(),
-                      (unsigned)udp_telem::targetSenderPort());
+                      udp_telem::targetSenderMac().c_str());
       } else if (line.equalsIgnoreCase("reudp") || line.equalsIgnoreCase("restartudp")) {
         const AppConfig& cfg = config_store::get();
         udp_telem::restart(cfg);
-        Serial.printf("REUDP listen=%u target=%s:%u\n",
-                      (unsigned)cfg.udp_listen_port,
-                      udp_telem::targetSenderIp().toString().c_str(),
-                      (unsigned)udp_telem::targetSenderPort());
+        Serial.printf("REUDP target=%s\n", udp_telem::targetSenderMac().c_str());
       } else if (line.equalsIgnoreCase("stats")) {
         g_stats_streaming = true;
         g_udp_streaming = false;
@@ -145,27 +135,31 @@ void updateAirReadiness() {
 
   if (fresh) {
     if (!g_air_ready) {
-      Serial.printf("GND READY air_link sender=%s:%u seq=%lu t_us=%lu\n",
-                    udp_telem::lastSenderIp().toString().c_str(),
-                    (unsigned)udp_telem::lastSenderPort(),
+      Serial.printf("GND READY air_link sender=%s seq=%lu t_us=%lu\n",
+                    udp_telem::lastSenderMac().c_str(),
                     (unsigned long)snap.seq,
                     (unsigned long)snap.t_us);
       g_air_ready = true;
       g_air_wait_announced = false;
     }
     g_air_bootstrap_active = false;
+    g_air_probe_attempts = 0U;
+    g_last_air_probe_ms = 0U;
     return;
   }
 
   if (!g_air_wait_announced) {
-    Serial.printf("GND WAIT air_packets target=%s:%u\n",
-                  udp_telem::targetSenderIp().toString().c_str(),
-                  (unsigned)udp_telem::targetSenderPort());
+    Serial.printf("GND WAIT air_packets target=%s\n", udp_telem::targetSenderMac().c_str());
     g_air_wait_announced = true;
   }
 
-  const uint8_t station_count = WiFi.softAPgetStationNum();
-  if (g_air_bootstrap_active && station_count > 0U && g_air_probe_attempts < kAirProbeMaxAttempts &&
+  if (udp_telem::hasLearnedSender()) {
+    g_air_bootstrap_active = true;
+  } else {
+    g_air_probe_attempts = 0U;
+    g_last_air_probe_ms = 0U;
+  }
+  if (g_air_bootstrap_active && udp_telem::hasLearnedSender() && g_air_probe_attempts < kAirProbeMaxAttempts &&
       (g_last_air_probe_ms == 0U || (uint32_t)(now - g_last_air_probe_ms) >= kAirProbeRetryMs)) {
     const AppConfig& cfg = config_store::get();
     telem::CmdSetStreamRateV1 cmd = {};
@@ -207,7 +201,7 @@ void printStats() {
 void printUdpMeta() {
   const auto snap = udp_telem::snapshot();
   Serial.printf(
-      "SEEUDP has=%u seq=%lu t_us=%lu ack=%u cmd=%u ack_ok=%u code=%lu fusion=%u sender=%s:%u "
+      "SEEUDP has=%u seq=%lu t_us=%lu ack=%u cmd=%u ack_ok=%u code=%lu fusion=%u sender=%s "
       "last_rx_ms=%lu packets=%lu ok=%lu\n",
       snap.has_state ? 1U : 0U,
       (unsigned long)snap.seq,
@@ -217,8 +211,7 @@ void printUdpMeta() {
       snap.ack_ok ? 1U : 0U,
       (unsigned long)snap.ack_code,
       snap.has_fusion_settings ? 1U : 0U,
-      udp_telem::lastSenderIp().toString().c_str(),
-      (unsigned)udp_telem::lastSenderPort(),
+      udp_telem::lastSenderMac().c_str(),
       (unsigned long)snap.stats.last_rx_ms,
       (unsigned long)snap.stats.rx_packets,
       (unsigned long)snap.stats.frames_ok);
@@ -261,13 +254,10 @@ void setup() {
   }
 
   udp_telem::begin(cfg);
-  Serial.printf("UDP listen port=%u\n", (unsigned)cfg.udp_listen_port);
-  Serial.printf("GND READY ap ip=%s udp=%u dhcp=192.168.4.50-192.168.4.100\n",
+  Serial.printf("GND READY ap ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
                 WiFi.softAPIP().toString().c_str(),
-                (unsigned)cfg.udp_listen_port);
-  Serial.printf("GND WAIT air_packets target=%s:%u\n",
-                udp_telem::targetSenderIp().toString().c_str(),
-                (unsigned)udp_telem::targetSenderPort());
+                (unsigned)kApChannel);
+  Serial.printf("GND WAIT air_packets target=%s\n", udp_telem::targetSenderMac().c_str());
   g_air_wait_announced = true;
 
   ws_server::begin();

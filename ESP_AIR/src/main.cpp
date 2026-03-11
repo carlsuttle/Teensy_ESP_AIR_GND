@@ -22,65 +22,20 @@ uint32_t g_last_printed_ack_seq = 0;
 uint32_t g_last_stream_rate_tx_ms = 0;
 uint8_t g_last_stream_rate_ui_hz = 0;
 uint8_t g_last_stream_rate_log_hz = 0;
-wl_status_t g_last_wifi_status = (wl_status_t)255;
-bool g_wifi_ready = false;
+bool g_radio_ready = false;
+bool g_link_ready = false;
+bool g_link_wait_printed = false;
 bool g_teensy_ready = false;
 bool g_teensy_wait_printed = false;
-bool g_last_wifi_link_ok = false;
-bool g_wifi_drop_pending = false;
-bool g_wifi_drop_once_used = false;
-uint32_t g_wifi_drop_due_ms = 0;
-bool g_wifi_offon_pending = false;
-bool g_wifi_offon_once_used = false;
-uint32_t g_wifi_offon_due_ms = 0;
-constexpr uint32_t kWifiDropDelayMs = 3000U;
-constexpr uint32_t kWifiOffOnDelayMs = 9000U;
 constexpr bool kEnableAirFileLogging = false;
 
 void beginWifiStation();
 void restartWifiStation();
 
-const char* wifiStatusName(wl_status_t status) {
-  switch (status) {
-    case WL_NO_SHIELD:
-      return "NO_SHIELD";
-    case WL_IDLE_STATUS:
-      return "IDLE";
-    case WL_NO_SSID_AVAIL:
-      return "NO_SSID";
-    case WL_SCAN_COMPLETED:
-      return "SCAN_DONE";
-    case WL_CONNECTED:
-      return "CONNECTED";
-    case WL_CONNECT_FAILED:
-      return "CONNECT_FAILED";
-    case WL_CONNECTION_LOST:
-      return "CONNECTION_LOST";
-    case WL_DISCONNECTED:
-      return "DISCONNECTED";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-bool wifiLinkHealthy() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  wifi_ap_record_t ap_info = {};
-  return esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
-}
-
-bool wifiConnected() { return wifiLinkHealthy(); }
-
 void resetWifiStatusFlags() {
-  g_wifi_ready = false;
-  g_last_wifi_link_ok = false;
-  g_last_wifi_status = (wl_status_t)255;
-  g_wifi_drop_pending = false;
-  g_wifi_drop_once_used = false;
-  g_wifi_drop_due_ms = 0;
-  g_wifi_offon_pending = false;
-  g_wifi_offon_once_used = false;
-  g_wifi_offon_due_ms = 0;
+  g_radio_ready = false;
+  g_link_ready = false;
+  g_link_wait_printed = false;
 }
 
 void ensureConfiguredStreamRate() {
@@ -126,12 +81,12 @@ void printConsoleHelp() {
   Serial.println("  kickteensy    - resend current stream-rate command to Teensy");
   Serial.println("  resendrate    - same as kickteensy");
   Serial.println("  tx1           - send current state once to GND");
-  Serial.println("  udpclear      - clear AIR UDP state and stop UDP socket");
-  Serial.println("  udpreopen     - reopen AIR UDP socket only");
-  Serial.println("  wifidrop      - disconnect/reconnect Wi-Fi without radio off");
+  Serial.println("  udpclear      - clear AIR radio-link state and stop ESP-NOW");
+  Serial.println("  udpreopen     - reopen AIR radio-link only");
+  Serial.println("  wifidrop      - clear discovered peer state");
   Serial.println("  wifioffon     - power-cycle Wi-Fi only");
-  Serial.println("  reudp         - restart AIR UDP socket");
-  Serial.println("  resetnet      - restart AIR Wi-Fi/UDP network side");
+  Serial.println("  reudp         - restart AIR radio-link");
+  Serial.println("  resetnet      - restart AIR Wi-Fi/ESP-NOW side");
   Serial.println("  setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
   Serial.println("  stats         - start 1Hz STAT stream");
   Serial.println("  x             - stop active stream/mode");
@@ -201,34 +156,31 @@ void handleConsoleCommands() {
         }
       } else if (strcmp(g_console_line, "udpclear") == 0) {
         udp_link::resetNetworkState();
-        Serial.println("UDPCLEAR done state=cleared socket=stopped");
+        resetWifiStatusFlags();
+        Serial.println("UDPCLEAR done state=cleared link=stopped");
       } else if (strcmp(g_console_line, "udpreopen") == 0) {
         const AppConfig& cfg = config_store::get();
         udp_link::reconfigure(cfg);
-        Serial.printf("UDPREOPEN local=%u peer=%s:%u\n",
-                      (unsigned)cfg.udp_local_port,
-                      cfg.gnd_ip,
-                      (unsigned)cfg.udp_gnd_port);
+        Serial.printf("UDPREOPEN peer=%s channel=%u\n",
+                      udp_link::peerMac().c_str(),
+                      (unsigned)telem::kRadioChannel);
       } else if (strcmp(g_console_line, "wifidrop") == 0) {
+        const AppConfig& cfg = config_store::get();
+        udp_link::resetNetworkState();
         resetWifiStatusFlags();
-        WiFi.disconnect(false, false);
-        delay(10);
-        WiFi.reconnect();
-        Serial.println("WIFIDROP disconnect+reconnect");
+        udp_link::reconfigure(cfg);
+        Serial.println("WIFIDROP peer_state_cleared");
       } else if (strcmp(g_console_line, "wifioffon") == 0) {
-        resetWifiStatusFlags();
-        WiFi.disconnect(false, false);
-        WiFi.mode(WIFI_OFF);
-        delay(50);
-        beginWifiStation();
+        restartWifiStation();
         Serial.println("WIFIOFFON radio_power_cycle");
       } else if (strcmp(g_console_line, "reudp") == 0 || strcmp(g_console_line, "restartudp") == 0) {
         const AppConfig& cfg = config_store::get();
+        udp_link::resetNetworkState();
         udp_link::reconfigure(cfg);
-        Serial.printf("REUDP local=%u peer=%s:%u\n",
-                      (unsigned)cfg.udp_local_port,
-                      cfg.gnd_ip,
-                      (unsigned)cfg.udp_gnd_port);
+        resetWifiStatusFlags();
+        Serial.printf("REUDP peer=%s channel=%u\n",
+                      udp_link::peerMac().c_str(),
+                      (unsigned)telem::kRadioChannel);
       } else if (strcmp(g_console_line, "resetnet") == 0 || strcmp(g_console_line, "netreset") == 0) {
         restartWifiStation();
       } else if (strncmp(g_console_line, "setfusion ", 10) == 0) {
@@ -272,25 +224,18 @@ void handleConsoleCommands() {
 
 void beginWifiStation() {
   const AppConfig& cfg = config_store::get();
-  const IPAddress local_ip(192, 168, 4, 2);
-  const IPAddress gateway(192, 168, 4, 1);
-  const IPAddress subnet(255, 255, 255, 0);
 
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  WiFi.disconnect(false, false);
+  WiFi.setAutoReconnect(false);
   WiFi.setSleep(false);
   (void)esp_wifi_set_ps(WIFI_PS_NONE);
   (void)esp_wifi_set_max_tx_power(78);
-  if (!WiFi.config(local_ip, gateway, subnet)) {
-    Serial.println("AIR WARN wifi static IP config failed");
-  }
+  (void)esp_wifi_set_channel(telem::kRadioChannel, WIFI_SECOND_CHAN_NONE);
 
-  Serial.printf("UDP local=%u ground=%s:%u\n",
-                (unsigned)cfg.udp_local_port,
-                cfg.gnd_ip,
-                (unsigned)cfg.udp_gnd_port);
-  Serial.printf("Joining Wi-Fi ssid=%s\n", cfg.ap_ssid);
-  WiFi.begin(cfg.ap_ssid, cfg.ap_pass);
+  Serial.printf("AIR RADIO channel=%u ap=%s\n",
+                (unsigned)telem::kRadioChannel,
+                cfg.ap_ssid);
 }
 
 void restartWifiStation() {
@@ -298,7 +243,6 @@ void restartWifiStation() {
   Serial.println("AIR CMD reset_network");
   udp_link::resetNetworkState();
   resetWifiStatusFlags();
-  WiFi.disconnect(false, false);
   WiFi.mode(WIFI_OFF);
   delay(50);
   beginWifiStation();
@@ -310,84 +254,40 @@ void restartWifiStation() {
 }
 
 void updateWifiReadiness() {
-  const AppConfig& cfg = config_store::get();
-  const uint32_t now = millis();
-  const wl_status_t status = WiFi.status();
-  const bool link_ok = wifiLinkHealthy();
-  const bool was_link_ok = g_last_wifi_link_ok;
-  if (status != g_last_wifi_status) {
-    g_last_wifi_status = status;
-    Serial.printf("Wi-Fi status=%s(%d)\n", wifiStatusName(status), (int)status);
-  }
-  if (link_ok != g_last_wifi_link_ok) {
-    g_last_wifi_link_ok = link_ok;
-    if (!link_ok && status == WL_CONNECTED) {
-      Serial.println("AIR WARN wifi_link_unhealthy ap_info=missing");
+  if (!udp_link::radioReady()) {
+    if (g_radio_ready) {
+      Serial.println("AIR WAIT radio");
+      g_radio_ready = false;
     }
+    g_link_ready = false;
+    g_link_wait_printed = false;
+    return;
   }
 
-  if (link_ok) {
-    g_wifi_drop_pending = false;
-    g_wifi_drop_once_used = false;
-    g_wifi_drop_due_ms = 0;
-    g_wifi_offon_pending = false;
-    g_wifi_offon_once_used = false;
-    g_wifi_offon_due_ms = 0;
-    if (!g_wifi_ready) {
-      udp_link::reconfigure(cfg);
-      Serial.printf("AIR READY wifi ip=%s gateway=%s gnd=%s:%u\n",
-                    WiFi.localIP().toString().c_str(),
-                    WiFi.gatewayIP().toString().c_str(),
-                    cfg.gnd_ip,
-                    (unsigned)cfg.udp_gnd_port);
-      g_wifi_ready = true;
+  if (!g_radio_ready) {
+    Serial.printf("AIR READY radio channel=%u\n", (unsigned)telem::kRadioChannel);
+    g_radio_ready = true;
+  }
+
+  if (udp_link::hasPeer()) {
+    if (!g_link_ready) {
+      Serial.printf("AIR READY gnd_link peer=%s\n", udp_link::peerMac().c_str());
+      g_link_ready = true;
+      g_link_wait_printed = false;
     }
     return;
   }
 
-  if (g_wifi_ready) {
-    Serial.printf("AIR WAIT gnd_ap status=%s(%d) ssid=%s\n",
-                  wifiStatusName(status),
-                  (int)status,
-                  cfg.ap_ssid);
-    g_wifi_ready = false;
+  if (g_link_ready) {
+    Serial.println("AIR WAIT gnd_link peer=discovery");
+    g_link_ready = false;
+    g_link_wait_printed = true;
+    return;
   }
 
-  if (was_link_ok && !g_wifi_drop_pending && !g_wifi_drop_once_used && !g_wifi_offon_pending &&
-      !g_wifi_offon_once_used) {
-    g_wifi_drop_pending = true;
-    g_wifi_drop_due_ms = now + kWifiDropDelayMs;
-    g_wifi_offon_pending = true;
-    g_wifi_offon_due_ms = now + kWifiOffOnDelayMs;
-    Serial.printf("AIR INFO wifi_recovery_scheduled drop_ms=%lu offon_ms=%lu\n",
-                  (unsigned long)kWifiDropDelayMs,
-                  (unsigned long)kWifiOffOnDelayMs);
-  }
-
-  if (g_wifi_drop_pending && !g_wifi_drop_once_used &&
-      (int32_t)(now - g_wifi_drop_due_ms) >= 0) {
-    WiFi.disconnect(false, false);
-    delay(10);
-    WiFi.reconnect();
-    g_wifi_drop_pending = false;
-    g_wifi_drop_once_used = true;
-    Serial.println("AIR INFO wifi_disconnect_reconnect_delayed");
-  }
-
-  if (g_wifi_offon_pending && !g_wifi_offon_once_used &&
-      (int32_t)(now - g_wifi_offon_due_ms) >= 0) {
-    g_wifi_ready = false;
-    g_last_wifi_link_ok = false;
-    g_last_wifi_status = (wl_status_t)255;
-    WiFi.disconnect(false, false);
-    WiFi.mode(WIFI_OFF);
-    delay(50);
-    beginWifiStation();
-    g_wifi_drop_pending = false;
-    g_wifi_drop_once_used = true;
-    g_wifi_offon_pending = false;
-    g_wifi_offon_once_used = true;
-    Serial.println("AIR INFO wifi_power_cycle_delayed");
+  if (!g_link_wait_printed) {
+    Serial.println("AIR WAIT gnd_link peer=discovery");
+    g_link_wait_printed = true;
   }
 }
 
@@ -429,8 +329,6 @@ void updateTeensyReadiness(const uart_telem::Snapshot& snap) {
 }
 
 void publishPendingTelemetry() {
-  if (!wifiConnected()) return;
-
   uart_telem::PendingState pending = {};
   while (uart_telem::popPendingState(pending)) {
     (void)udp_link::publishState(pending.state, pending.seq, pending.t_us);
@@ -476,9 +374,9 @@ void loop() {
   if (udp_link::takeNetworkResetRequest()) {
     restartWifiStation();
   }
-  updateWifiReadiness();
   uart_telem::poll();
   udp_link::poll();
+  updateWifiReadiness();
 
   const auto snap = uart_telem::snapshot();
   updateTeensyReadiness(snap);
@@ -509,9 +407,7 @@ void loop() {
 
   ensureConfiguredStreamRate();
   publishPendingTelemetry();
-  if (wifiConnected()) {
-    udp_link::publish(snap);
-  }
+  udp_link::publish(snap);
 
   const uint32_t now = millis();
   if (g_stats_streaming && (uint32_t)(now - g_last_stat_ms) >= 1000U) {

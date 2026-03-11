@@ -177,6 +177,8 @@ void serveDiagCsv(AsyncWebServerRequest* request) {
   csv += "unknown_msg," + String(snap.stats.unknown_msg) + "\n";
   csv += "drop," + String(snap.stats.drop) + "\n";
   csv += "last_rx_ms," + String(snap.stats.last_rx_ms) + "\n";
+  csv += "last_sender_mac," + udp_telem::lastSenderMac() + "\n";
+  csv += "target_sender_mac," + udp_telem::targetSenderMac() + "\n";
   csv += "last_sender_ip," + udp_telem::lastSenderIp().toString() + "\n";
   csv += "last_sender_port," + String(udp_telem::lastSenderPort()) + "\n";
   request->send(200, "text/csv", csv);
@@ -251,6 +253,8 @@ void begin() {
     doc["len_err"] = snap.stats.len_err;
     doc["unknown_msg"] = snap.stats.unknown_msg;
     doc["drop"] = snap.stats.drop;
+    doc["last_sender_mac"] = udp_telem::lastSenderMac();
+    doc["target_sender_mac"] = udp_telem::targetSenderMac();
     doc["last_sender_ip"] = udp_telem::lastSenderIp().toString();
     doc["last_sender_port"] = udp_telem::lastSenderPort();
     String text;

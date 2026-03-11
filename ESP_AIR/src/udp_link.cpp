@@ -1,7 +1,8 @@
 #include "udp_link.h"
 
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <esp_now.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <string.h>
 
@@ -10,74 +11,220 @@
 namespace udp_link {
 namespace {
 
-WiFiUDP g_udp;
+constexpr uint8_t kUnitAir = 1U;
+constexpr uint8_t kUnitGnd = 2U;
+constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
+constexpr size_t kRxQueueCapacity = 8U;
+constexpr uint32_t kHelloIntervalMs = 500U;
+constexpr uint32_t kPeerStaleMs = 2000U;
+constexpr uint8_t kSendFailThreshold = 6U;
+
+struct RxFrame {
+  uint8_t mac[6] = {};
+  uint16_t len = 0U;
+  uint8_t data[telem::kEspNowMaxDataLen] = {};
+};
+
+portMUX_TYPE g_rx_mux = portMUX_INITIALIZER_UNLOCKED;
+RxFrame g_rx_queue[kRxQueueCapacity];
+volatile uint8_t g_rx_head = 0U;
+volatile uint8_t g_rx_tail = 0U;
+volatile uint32_t g_rx_drop_events = 0U;
+volatile uint32_t g_send_ok_events = 0U;
+volatile uint32_t g_send_fail_events = 0U;
+
 Stats g_stats;
-IPAddress g_peer_ip(192, 168, 4, 2);
-uint16_t g_local_port = 9000U;
-uint16_t g_peer_port = 9000U;
-IPAddress g_last_cmd_ip;
-uint16_t g_last_cmd_port = 0U;
+uint8_t g_gnd_mac[6] = {};
+uint8_t g_last_sender_mac[6] = {};
+bool g_has_gnd_mac = false;
+bool g_has_last_sender_mac = false;
+bool g_espnow_ready = false;
+bool g_network_reset_requested = false;
+uint8_t g_consecutive_send_failures = 0U;
+uint32_t g_last_hello_tx_ms = 0U;
 uint32_t g_last_state_seq = 0U;
 uint32_t g_last_ack_seq = 0U;
 uint32_t g_last_fusion_seq = 0U;
 uint32_t g_tx_seq = 0U;
-uint32_t g_last_socket_restart_ms = 0U;
-uint32_t g_last_wifi_recover_ms = 0U;
-uint16_t g_consecutive_tx_failures = 0U;
-bool g_network_reset_requested = false;
-constexpr uint32_t kSocketRestartBackoffMs = 250U;
-constexpr uint32_t kWifiRecoverBackoffMs = 2000U;
-constexpr uint16_t kWifiRecoverFailureThreshold = 8U;
+uint32_t g_session_id = 0U;
 
-bool parseIp(const char* text, IPAddress& out) {
-  if (!text || !*text) return false;
-  return out.fromString(text);
+bool isBroadcastMac(const uint8_t* mac) {
+  return mac && memcmp(mac, kBroadcastMac, sizeof(kBroadcastMac)) == 0;
 }
 
-bool wifiLinkHealthy() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  wifi_ap_record_t ap_info = {};
-  return esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+bool isZeroMac(const uint8_t* mac) {
+  static const uint8_t kZeroMac[6] = {};
+  return !mac || memcmp(mac, kZeroMac, sizeof(kZeroMac)) == 0;
 }
 
-bool restartSocket() {
-  g_udp.stop();
-  return g_udp.begin(g_local_port) == 1;
+void copyMac(uint8_t* dst, const uint8_t* src) {
+  if (dst && src) memcpy(dst, src, 6U);
 }
 
-void restartSocketAfterFailure() {
-  const uint32_t now = millis();
-  if ((uint32_t)(now - g_last_socket_restart_ms) < kSocketRestartBackoffMs) return;
-  g_last_socket_restart_ms = now;
-  (void)restartSocket();
+String macToString(const uint8_t* mac) {
+  if (isZeroMac(mac)) return String("none");
+  char text[18];
+  snprintf(text,
+           sizeof(text),
+           "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0],
+           mac[1],
+           mac[2],
+           mac[3],
+           mac[4],
+           mac[5]);
+  return String(text);
 }
 
-void recoverWifiAfterFailure() {
-  const uint32_t now = millis();
-  if ((uint32_t)(now - g_last_wifi_recover_ms) < kWifiRecoverBackoffMs) return;
-  g_last_wifi_recover_ms = now;
-  g_udp.stop();
-  WiFi.disconnect(false, false);
+void clearPeerState() {
+  memset(g_gnd_mac, 0, sizeof(g_gnd_mac));
+  memset(g_last_sender_mac, 0, sizeof(g_last_sender_mac));
+  g_has_gnd_mac = false;
+  g_has_last_sender_mac = false;
+  g_consecutive_send_failures = 0U;
+  g_last_hello_tx_ms = 0U;
 }
 
-IPAddress targetIp() {
-  if (g_last_cmd_port != 0U) return g_last_cmd_ip;
-  return g_peer_ip;
+bool ensurePeer(const uint8_t* mac) {
+  if (isZeroMac(mac)) return false;
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, sizeof(peer.peer_addr));
+  peer.channel = telem::kRadioChannel;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  if (esp_now_is_peer_exist(mac)) {
+    return esp_now_mod_peer(&peer) == ESP_OK;
+  }
+  return esp_now_add_peer(&peer) == ESP_OK;
 }
 
-uint16_t targetPort() {
-  if (g_last_cmd_port != 0U) return g_last_cmd_port;
-  return g_peer_port;
+void onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
+  if (!mac_addr || !data || data_len <= 0 || data_len > (int)telem::kEspNowMaxDataLen) return;
+
+  bool queued = false;
+  portENTER_CRITICAL_ISR(&g_rx_mux);
+  const uint8_t next_head = (uint8_t)((g_rx_head + 1U) % kRxQueueCapacity);
+  if (next_head != g_rx_tail) {
+    RxFrame& frame = g_rx_queue[g_rx_head];
+    memcpy(frame.mac, mac_addr, sizeof(frame.mac));
+    frame.len = (uint16_t)data_len;
+    memcpy(frame.data, data, (size_t)data_len);
+    g_rx_head = next_head;
+    queued = true;
+  }
+  portEXIT_CRITICAL_ISR(&g_rx_mux);
+
+  if (!queued) g_rx_drop_events++;
 }
 
-bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us) {
-  if (payload_len > 1024U) return false;
-  if (!wifiLinkHealthy()) return false;
-  IPAddress ip = targetIp();
-  const uint16_t port = targetPort();
-  if (ip == INADDR_NONE || port == 0U) return false;
+void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
+  (void)mac_addr;
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    g_send_ok_events++;
+  } else {
+    g_send_fail_events++;
+  }
+}
 
-  uint8_t buf[sizeof(telem::FrameHeader) + 1024U] = {};
+bool popRxFrame(RxFrame& out) {
+  bool have_frame = false;
+  portENTER_CRITICAL(&g_rx_mux);
+  if (g_rx_tail != g_rx_head) {
+    out = g_rx_queue[g_rx_tail];
+    g_rx_tail = (uint8_t)((g_rx_tail + 1U) % kRxQueueCapacity);
+    have_frame = true;
+  }
+  portEXIT_CRITICAL(&g_rx_mux);
+  return have_frame;
+}
+
+void drainAsyncEvents() {
+  uint32_t rx_drop = 0U;
+  uint32_t send_ok = 0U;
+  uint32_t send_fail = 0U;
+
+  portENTER_CRITICAL(&g_rx_mux);
+  rx_drop = g_rx_drop_events;
+  g_rx_drop_events = 0U;
+  send_ok = g_send_ok_events;
+  g_send_ok_events = 0U;
+  send_fail = g_send_fail_events;
+  g_send_fail_events = 0U;
+  portEXIT_CRITICAL(&g_rx_mux);
+
+  if (rx_drop > 0U) {
+    g_stats.rx_unknown += rx_drop;
+  }
+  if (send_ok > 0U) {
+    g_consecutive_send_failures = 0U;
+  }
+  if (send_fail > 0U) {
+    g_stats.tx_drop += send_fail;
+    if (g_has_gnd_mac) {
+      const uint32_t total = (uint32_t)g_consecutive_send_failures + send_fail;
+      g_consecutive_send_failures = (total > 0xFFU) ? 0xFFU : (uint8_t)total;
+      if (g_consecutive_send_failures >= kSendFailThreshold) {
+        clearPeerState();
+      }
+    }
+  }
+}
+
+bool initEspNow() {
+  if (g_espnow_ready) return true;
+
+  if (esp_now_init() != ESP_OK) {
+    return false;
+  }
+  if (esp_now_register_recv_cb(onDataRecv) != ESP_OK) {
+    esp_now_deinit();
+    return false;
+  }
+  if (esp_now_register_send_cb(onDataSent) != ESP_OK) {
+    esp_now_deinit();
+    return false;
+  }
+  if (!ensurePeer(kBroadcastMac)) {
+    esp_now_deinit();
+    return false;
+  }
+
+  g_espnow_ready = true;
+  return true;
+}
+
+void shutdownEspNow() {
+  if (!g_espnow_ready) return;
+  esp_now_deinit();
+  g_espnow_ready = false;
+}
+
+bool learnPeer(const uint8_t* mac) {
+  if (isZeroMac(mac) || isBroadcastMac(mac)) return false;
+  if (!initEspNow()) return false;
+  if (!ensurePeer(mac)) return false;
+
+  copyMac(g_last_sender_mac, mac);
+  g_has_last_sender_mac = true;
+  if (!g_has_gnd_mac || memcmp(g_gnd_mac, mac, sizeof(g_gnd_mac)) != 0) {
+    copyMac(g_gnd_mac, mac);
+    g_has_gnd_mac = true;
+  }
+  g_consecutive_send_failures = 0U;
+  return true;
+}
+
+bool sendFrameTo(const uint8_t* mac,
+                 telem::MsgType type,
+                 const void* payload,
+                 size_t payload_len,
+                 uint32_t seq,
+                 uint32_t t_us) {
+  constexpr size_t kMaxPayloadLen = telem::kEspNowMaxDataLen - sizeof(telem::FrameHeader);
+  if (payload_len > kMaxPayloadLen || isZeroMac(mac)) return false;
+  if (!initEspNow()) return false;
+
+  uint8_t buf[telem::kEspNowMaxDataLen] = {};
   telem::FrameHeader hdr = {};
   hdr.magic = telem::kMagic;
   hdr.version = telem::kVersion;
@@ -90,29 +237,33 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uin
     memcpy(buf + sizeof(hdr), payload, payload_len);
   }
 
-  if (!g_udp.beginPacket(ip, port)) {
+  const size_t frame_len = sizeof(hdr) + payload_len;
+  const esp_err_t err = esp_now_send(mac, buf, frame_len);
+  if (err != ESP_OK) {
     g_stats.tx_drop++;
-    g_consecutive_tx_failures++;
-    restartSocketAfterFailure();
-    if (g_consecutive_tx_failures >= kWifiRecoverFailureThreshold) {
-      recoverWifiAfterFailure();
+    if (!isBroadcastMac(mac)) {
+      g_consecutive_send_failures++;
+      if (g_consecutive_send_failures >= kSendFailThreshold) clearPeerState();
     }
+    if (err == ESP_ERR_ESPNOW_NOT_INIT) g_espnow_ready = false;
     return false;
   }
-  const size_t wrote = g_udp.write(buf, sizeof(hdr) + payload_len);
-  if (!g_udp.endPacket() || wrote != sizeof(hdr) + payload_len) {
-    g_stats.tx_drop++;
-    g_consecutive_tx_failures++;
-    restartSocketAfterFailure();
-    if (g_consecutive_tx_failures >= kWifiRecoverFailureThreshold) {
-      recoverWifiAfterFailure();
-    }
-    return false;
-  }
-  g_consecutive_tx_failures = 0U;
+
   g_stats.tx_packets++;
-  g_stats.tx_bytes += (uint32_t)wrote;
+  g_stats.tx_bytes += (uint32_t)frame_len;
   return true;
+}
+
+bool sendHelloTo(const uint8_t* mac) {
+  telem::LinkHelloPayloadV1 hello = {};
+  hello.unit_id = kUnitAir;
+  hello.session_id = g_session_id;
+  return sendFrameTo(mac, telem::LINK_HELLO, &hello, sizeof(hello), 0U, micros());
+}
+
+bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us) {
+  if (!g_has_gnd_mac) return false;
+  return sendFrameTo(g_gnd_mac, type, payload, payload_len, seq, t_us);
 }
 
 void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint32_t t_us) {
@@ -120,11 +271,29 @@ void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint
   ack.command = command;
   ack.ok = ok ? 1U : 0U;
   ack.code = code;
-  const telem::MsgType type = ok ? telem::ACK : telem::NACK;
-  (void)sendFrame(type, &ack, sizeof(ack), seq, t_us);
+  (void)sendFrame(ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), seq, t_us);
+}
+
+void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_t* payload) {
+  if (hdr.payload_len != sizeof(telem::LinkHelloPayloadV1)) {
+    g_stats.rx_bad_len++;
+    return;
+  }
+
+  telem::LinkHelloPayloadV1 hello = {};
+  memcpy(&hello, payload, sizeof(hello));
+  if (hello.unit_id != kUnitGnd) {
+    g_stats.rx_unknown++;
+    return;
+  }
+
+  if (learnPeer(mac)) {
+    g_stats.last_rx_ms = millis();
+  }
 }
 
 void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
+  bool handled = true;
   switch ((telem::MsgType)hdr.msg_type) {
     case telem::CMD_SET_FUSION_SETTINGS: {
       if (hdr.payload_len != sizeof(telem::CmdSetFusionSettingsV1)) {
@@ -163,76 +332,93 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_network_reset_requested = true;
       break;
     default:
-      g_stats.rx_unknown++;
+      handled = false;
       break;
   }
+
+  if (handled) {
+    g_stats.last_rx_ms = millis();
+  } else {
+    g_stats.rx_unknown++;
+  }
+}
+
+void handleIncomingFrame(const RxFrame& frame) {
+  g_stats.rx_packets++;
+  g_stats.rx_bytes += frame.len;
+  (void)learnPeer(frame.mac);
+
+  if (frame.len < sizeof(telem::FrameHeader)) {
+    g_stats.rx_bad_len++;
+    return;
+  }
+
+  telem::FrameHeader hdr = {};
+  memcpy(&hdr, frame.data, sizeof(hdr));
+  if (hdr.magic != telem::kMagic || hdr.version != telem::kVersion) {
+    g_stats.rx_bad_magic++;
+    return;
+  }
+  if ((size_t)frame.len != sizeof(hdr) + hdr.payload_len) {
+    g_stats.rx_bad_len++;
+    return;
+  }
+
+  const uint8_t* payload = frame.data + sizeof(hdr);
+  if ((telem::MsgType)hdr.msg_type == telem::LINK_HELLO) {
+    handleHello(frame.mac, hdr, payload);
+    return;
+  }
+  handleCommand(hdr, payload);
+}
+
+void maybeSendHello() {
+  const uint32_t now = millis();
+  if ((uint32_t)(now - g_last_hello_tx_ms) < kHelloIntervalMs) return;
+
+  bool sent = false;
+  if (!g_has_gnd_mac) {
+    sent = sendHelloTo(kBroadcastMac);
+  } else if (g_stats.last_rx_ms == 0U || (uint32_t)(now - g_stats.last_rx_ms) >= kPeerStaleMs) {
+    sent = sendHelloTo(g_gnd_mac);
+  }
+  if (sent) g_last_hello_tx_ms = now;
 }
 
 }  // namespace
 
 void begin(const AppConfig& cfg) {
+  (void)cfg;
   memset(&g_stats, 0, sizeof(g_stats));
-  g_last_cmd_ip = IPAddress();
-  g_last_cmd_port = 0U;
+  clearPeerState();
+  g_espnow_ready = false;
+  g_network_reset_requested = false;
   g_last_state_seq = 0U;
   g_last_ack_seq = 0U;
   g_last_fusion_seq = 0U;
   g_tx_seq = 0U;
-  g_last_wifi_recover_ms = 0U;
-  g_consecutive_tx_failures = 0U;
-  g_network_reset_requested = false;
-  reconfigure(cfg);
+  g_session_id = esp_random();
+  (void)initEspNow();
 }
 
 void reconfigure(const AppConfig& cfg) {
-  IPAddress parsed;
-  if (parseIp(cfg.gnd_ip, parsed)) {
-    g_peer_ip = parsed;
+  (void)cfg;
+  if (!initEspNow()) return;
+  (void)ensurePeer(kBroadcastMac);
+  if (g_has_gnd_mac) {
+    (void)ensurePeer(g_gnd_mac);
   }
-  g_local_port = cfg.udp_local_port;
-  g_peer_port = cfg.udp_gnd_port;
-  g_last_socket_restart_ms = 0U;
-  g_consecutive_tx_failures = 0U;
-  restartSocket();
 }
 
 void poll() {
-  int packet_size = g_udp.parsePacket();
-  while (packet_size > 0) {
-    if (packet_size < (int)sizeof(telem::FrameHeader) || packet_size > 1500) {
-      g_stats.rx_bad_len++;
-      while (packet_size-- > 0) (void)g_udp.read();
-      packet_size = g_udp.parsePacket();
-      continue;
-    }
-    uint8_t buf[1500] = {};
-    const int got = g_udp.read(buf, sizeof(buf));
-    if (got < (int)sizeof(telem::FrameHeader)) {
-      g_stats.rx_bad_len++;
-      packet_size = g_udp.parsePacket();
-      continue;
-    }
-    g_stats.rx_packets++;
-    g_stats.rx_bytes += (uint32_t)got;
-    g_stats.last_rx_ms = millis();
-    g_last_cmd_ip = g_udp.remoteIP();
-    g_last_cmd_port = g_udp.remotePort();
+  drainAsyncEvents();
 
-    telem::FrameHeader hdr = {};
-    memcpy(&hdr, buf, sizeof(hdr));
-    if (hdr.magic != telem::kMagic || hdr.version != telem::kVersion) {
-      g_stats.rx_bad_magic++;
-      packet_size = g_udp.parsePacket();
-      continue;
-    }
-    if ((size_t)got != sizeof(hdr) + hdr.payload_len) {
-      g_stats.rx_bad_len++;
-      packet_size = g_udp.parsePacket();
-      continue;
-    }
-    handleCommand(hdr, buf + sizeof(hdr));
-    packet_size = g_udp.parsePacket();
+  RxFrame frame = {};
+  while (popRxFrame(frame)) {
+    handleIncomingFrame(frame);
   }
+
+  maybeSendHello();
 }
 
 void publish(const uart_telem::Snapshot& snap) {
@@ -252,23 +438,29 @@ void publish(const uart_telem::Snapshot& snap) {
     ack.command = snap.ack_command;
     ack.ok = snap.ack_ok ? 1U : 0U;
     ack.code = snap.ack_code;
-    const telem::MsgType type = snap.ack_ok ? telem::ACK : telem::NACK;
     g_last_ack_seq = snap.ack_rx_seq;
-    (void)sendFrame(type, &ack, sizeof(ack), snap.ack_rx_seq, snap.t_us);
+    (void)sendFrame(snap.ack_ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), snap.ack_rx_seq, snap.t_us);
   }
 }
 
 bool publishState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
   if (seq == g_last_state_seq) return true;
+  if (!g_has_gnd_mac) return false;
   g_last_state_seq = seq;
   return sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
 }
 
 bool publishStressState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
-  return sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
+  return g_has_gnd_mac && sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
 }
 
 Stats stats() { return g_stats; }
+
+bool hasPeer() { return g_has_gnd_mac; }
+
+String peerMac() { return macToString(g_gnd_mac); }
+
+bool radioReady() { return g_espnow_ready; }
 
 bool takeNetworkResetRequest() {
   const bool requested = g_network_reset_requested;
@@ -277,15 +469,11 @@ bool takeNetworkResetRequest() {
 }
 
 void resetNetworkState() {
-  g_udp.stop();
-  g_last_cmd_ip = IPAddress();
-  g_last_cmd_port = 0U;
+  shutdownEspNow();
+  clearPeerState();
   g_last_state_seq = 0U;
   g_last_ack_seq = 0U;
   g_last_fusion_seq = 0U;
-  g_last_socket_restart_ms = 0U;
-  g_last_wifi_recover_ms = 0U;
-  g_consecutive_tx_failures = 0U;
   g_stats.last_rx_ms = 0U;
 }
 
