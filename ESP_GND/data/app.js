@@ -6,6 +6,7 @@ const attEl = document.getElementById("att");
 const fusionStatusEl = document.getElementById("fusionStatus");
 const baroEl = document.getElementById("baro");
 const linkEl = document.getElementById("link");
+const airLoggerTextEl = document.getElementById("airLoggerText");
 
 let wsCtrl = null;
 let wsState = null;
@@ -68,6 +69,27 @@ let linkDirty = true;
 let lastLinkRenderAt = 0;
 let nextCtrlReqId = 1;
 let clientEventLog = [];
+let statusFetchInFlight = false;
+let linkStatus = {
+  transport: "ESP-NOW",
+  air_link_fresh: false,
+  has_link_meta: false,
+  ap_clients: 0,
+  air_radio_ready: false,
+  air_peer_known: false,
+  air_recorder_on: false,
+  air_rssi_valid: false,
+  air_rssi_dbm: null,
+  air_scan_age_ms: null,
+  air_link_age_ms: null,
+  air_sender_mac: "none",
+  air_target_mac: "none",
+  link_rx: 0,
+  ok: 0,
+  len_err: 0,
+  unknown_msg: 0,
+  drop: 0
+};
 
 const RECONNECT_DELAY_MS = 1000;
 const STATE_RECONNECT_DELAY_MS = 200;
@@ -79,6 +101,7 @@ const STATE_HARD_STALE_COOLDOWN_MS = 5000;
 const FILE_OP_STALE_GRACE_MS = 5000;
 const RENDER_PERIOD_MS = 50;
 const LINK_RENDER_PERIOD_MS = 250;
+const LINK_STATUS_PERIOD_MS = 1000;
 const PING_AVG_WINDOW = 30;
 const CLIENT_EVENT_CAPACITY = 256;
 const FUSION_SAMPLE_RATE_HZ = 400;
@@ -229,6 +252,11 @@ function ensureFusionDraft() {
   }
 }
 
+function requestFusionSnapshot() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "get_fusion", req_id: allocCtrlReqId() }));
+}
+
 function sendFusion(partial = {}) {
   if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
   ensureFusionDraft();
@@ -241,10 +269,12 @@ function sendFusion(partial = {}) {
   const payload = {
     type: "set_fusion",
     req_id: allocCtrlReqId(),
-    gain: Number(fusionDraft.gain || 0),
-    accelerationRejection: Number(fusionDraft.accelerationRejection || 0),
-    magneticRejection: Number(fusionDraft.magneticRejection || 0),
-    recoveryTriggerPeriod: Math.round(Number(fusionDraft.recoveryTriggerPeriod || 0))
+    fusion: {
+      gain: Number(fusionDraft.gain || 0),
+      accelerationRejection: Number(fusionDraft.accelerationRejection || 0),
+      magneticRejection: Number(fusionDraft.magneticRejection || 0),
+      recoveryTriggerPeriod: Math.round(Number(fusionDraft.recoveryTriggerPeriod || 0))
+    }
   };
   renderFusionDraftValues();
   wsCtrl.send(JSON.stringify(payload));
@@ -261,6 +291,30 @@ function fmt(v, n = 3) {
 
 function dash(v) {
   return (v === null || v === undefined || Number.isNaN(v)) ? "-" : String(v);
+}
+
+function fmtRssi(valid, dbm) {
+  if (!valid || dbm === null || dbm === undefined || Number.isNaN(dbm)) return "-";
+  return `${Math.round(Number(dbm))} dBm`;
+}
+
+function setRecorderUi(enabled, known = true) {
+  recEl.classList.remove("on", "off", "unknown");
+  if (!known) {
+    recEl.classList.add("unknown");
+    recEl.textContent = "REC --";
+    airLoggerTextEl.textContent = "Waiting for AIR recorder status...";
+    return;
+  }
+  if (enabled) {
+    recEl.classList.add("on");
+    recEl.textContent = "REC ON";
+    airLoggerTextEl.textContent = "AIR recorder is on";
+    return;
+  }
+  recEl.classList.add("off");
+  recEl.textContent = "REC OFF";
+  airLoggerTextEl.textContent = "AIR recorder is off in firmware";
 }
 
 function allocCtrlReqId() {
@@ -365,11 +419,35 @@ function updateStatus() {
     setStatus("Disconnected");
     return;
   }
+  if (linkStatus.has_link_meta && !linkStatus.air_link_fresh) {
+    setStatus("Connected / AIR link waiting");
+    return;
+  }
   if (waitingForTelemetry()) {
     setStatus("Connected / waiting for AIR");
     return;
   }
   setStatus(telemetryLooksStale() ? "Connected / stale telemetry" : "Connected");
+}
+
+async function fetchStatus() {
+  if (statusFetchInFlight) return;
+  statusFetchInFlight = true;
+  try {
+    const resp = await fetch("/api/status", { cache: "no-store" });
+    if (!resp.ok) throw new Error(`status ${resp.status}`);
+    const data = await resp.json();
+    linkStatus = {
+      ...linkStatus,
+      ...data
+    };
+    setRecorderUi(!!linkStatus.air_recorder_on, !!linkStatus.has_link_meta);
+    uiDirty = true;
+    linkDirty = true;
+  } catch (_err) {
+  } finally {
+    statusFetchInFlight = false;
+  }
 }
 
 function renderGpsStale() {
@@ -407,13 +485,29 @@ temp: - C`;
 
 function renderLinkStale() {
 linkEl.textContent =
-`ctrl_socket: -
-state_socket: -
+`transport: ${dash(linkStatus.transport)}
+air_link: -
+air_radio: -
+air_peer: -
+air_sender_mac: ${dash(linkStatus.air_sender_mac)}
+air_target_mac: ${dash(linkStatus.air_target_mac)}
+air_rssi: -
+air_scan_age_ms: -
+air_link_age_ms: -
+air_recorder: -
+ap_clients: ${dash(linkStatus.ap_clients)}
+ctrl_ws: -
+state_ws: -
 state_fps: -
 state_age_ms: -
 source_seq: -
 source_t_us: -
 esp_rx_ms: -
+link_rx: ${dash(linkStatus.link_rx)}
+frames_ok: ${dash(linkStatus.ok)}
+len_err: ${dash(linkStatus.len_err)}
+unknown_msg: ${dash(linkStatus.unknown_msg)}
+drop: ${dash(linkStatus.drop)}
 ws_loss: -
 binary_parse_fail: -
 ctrl_reconnects: -
@@ -497,14 +591,37 @@ function renderLinkPanel() {
   const stateReconnectTxt = String(stateReconnects);
   const ctrlLastCloseTxt = `${ctrlCloseCode}/${ctrlCloseClean}`;
   const stateLastCloseTxt = `${stateCloseCode}/${stateCloseClean}`;
+  const airLinkTxt = linkStatus.air_link_fresh ? "up" : "waiting";
+  const airRadioTxt = linkStatus.air_radio_ready ? "ready" : "starting";
+  const airPeerTxt = linkStatus.air_peer_known ? "known" : "discovering";
+  const airRssiTxt = fmtRssi(linkStatus.air_rssi_valid, linkStatus.air_rssi_dbm);
+  const airScanAgeTxt = dash(linkStatus.air_scan_age_ms);
+  const airLinkAgeTxt = dash(linkStatus.air_link_age_ms);
+  const airRecorderTxt = !linkStatus.has_link_meta ? "unknown" : (linkStatus.air_recorder_on ? "on" : "off");
   linkEl.textContent =
-`ctrl_socket: ${ctrlSocketTxt}
-state_socket: ${stateSocketTxt}
+`transport: ${dash(linkStatus.transport)}
+air_link: ${airLinkTxt}
+air_radio: ${airRadioTxt}
+air_peer: ${airPeerTxt}
+air_sender_mac: ${dash(linkStatus.air_sender_mac)}
+air_target_mac: ${dash(linkStatus.air_target_mac)}
+air_rssi: ${airRssiTxt}
+air_scan_age_ms: ${airScanAgeTxt}
+air_link_age_ms: ${airLinkAgeTxt}
+air_recorder: ${airRecorderTxt}
+ap_clients: ${dash(linkStatus.ap_clients)}
+ctrl_ws: ${ctrlSocketTxt}
+state_ws: ${stateSocketTxt}
 state_fps: ${stateFpsTxt}
 state_age_ms: ${stateAgeTxt}
 source_seq: ${sourceSeqTxt}
 source_t_us: ${sourceTusTxt}
 esp_rx_ms: ${espRxMsTxt}
+link_rx: ${dash(linkStatus.link_rx)}
+frames_ok: ${dash(linkStatus.ok)}
+len_err: ${dash(linkStatus.len_err)}
+unknown_msg: ${dash(linkStatus.unknown_msg)}
+drop: ${dash(linkStatus.drop)}
 ws_loss: ${wsLossTxt}
 binary_parse_fail: ${parseFailTxt}
 ctrl_reconnects: ${ctrlReconnectTxt}
@@ -706,8 +823,14 @@ function handleCtrlMessage(text) {
         );
       }
     }
-    if (m.cmd === "set_fusion" && !m.ok) {
-      fusionDirty = false;
+    if (m.cmd === "set_fusion") {
+      if (!m.ok) {
+        fusionDirty = false;
+      } else {
+        setTimeout(requestFusionSnapshot, 150);
+        setTimeout(requestFusionSnapshot, 600);
+        setTimeout(requestFusionSnapshot, 1200);
+      }
     }
     uiDirty = true;
     linkDirty = true;
@@ -716,7 +839,6 @@ function handleCtrlMessage(text) {
   if (m.type === "config") {
     document.getElementById("sourceHz").value = m.source_rate_hz ?? 50;
     document.getElementById("uiHz").value = m.ui_rate_hz ?? 20;
-    recEl.textContent = "REC ON";
     uiDirty = true;
     linkDirty = true;
     return;
@@ -757,7 +879,7 @@ function connectCtrl() {
     ctrlCloseClean = "-";
     resetPingStats();
     updateStatus();
-    socket.send(JSON.stringify({ type: "get_fusion", req_id: allocCtrlReqId() }));
+    requestFusionSnapshot();
     connectState();
     uiDirty = true;
   };
@@ -936,6 +1058,10 @@ setInterval(() => {
   }
 }, RENDER_PERIOD_MS);
 
+setInterval(() => {
+  fetchStatus();
+}, LINK_STATUS_PERIOD_MS);
+
 document.querySelectorAll(".tabs button").forEach((b) => {
   b.addEventListener("click", () => {
     document.querySelectorAll(".tabs button").forEach((x) => x.classList.remove("active"));
@@ -1005,7 +1131,6 @@ document.getElementById("applyRate").addEventListener("click", async () => {
     }
   } catch (_err) {
   }
-  recEl.textContent = "REC ON";
 });
 
 document.getElementById("resetAirNetwork").addEventListener("click", async () => {
@@ -1015,7 +1140,7 @@ document.getElementById("resetAirNetwork").addEventListener("click", async () =>
     if (!resp.ok) {
       throw new Error(`reset failed: ${resp.status}`);
     }
-    setStatus("Connected / resetting AIR network");
+    setStatus("Connected / resetting AIR link");
   } catch (_err) {
     setStatus("Connected / AIR reset failed");
   }
@@ -1081,5 +1206,6 @@ setFusionUiValues(
 );
 connectCtrl();
 connectState();
-recEl.textContent = "REC ON";
+setRecorderUi(false, false);
+fetchStatus();
 renderStale();

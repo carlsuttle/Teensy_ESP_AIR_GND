@@ -2,7 +2,10 @@ body { font-family: Arial, sans-serif; margin: 0; background: #0f172a; color: #e
 .top { display: grid; grid-template-columns: 1fr auto auto auto; gap: 12px; padding: 10px 14px; background: #111827; position: sticky; top: 0; }
 .title { font-weight: 700; }
 #status { font-weight: 600; }
-.rec { font-weight: 700; color: #ef4444; }
+.rec { font-weight: 700; }
+.rec.on { color: #22c55e; }
+.rec.off { color: #f59e0b; }
+.rec.unknown { color: #94a3b8; }
 .tabs { display: flex; gap: 8px; padding: 10px 14px; background: #1f2937; }
 .tabs button { background: #374151; color: #fff; border: 0; padding: 8px 12px; cursor: pointer; }
 .tabs button.active { background: #0284c7; }

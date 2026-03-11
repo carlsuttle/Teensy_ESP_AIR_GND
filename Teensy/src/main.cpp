@@ -1365,7 +1365,7 @@ void printSummary2Hz() {
   Serial.printf(
       "STAT unit=TEENSY seq=%lu t_us=%lu has=1 ack=0 cmd=0 ack_ok=0 code=0 "
       "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu "
-      "udp_tx=0 udp_rx=0 udp_drop=0\r\n",
+      "link_tx=0 link_rx=0 link_drop=0\r\n",
       (unsigned long)g_last_mirror_seq,
       (unsigned long)g_last_mirror_t_us,
       (unsigned long)mdbg.rxBytes,

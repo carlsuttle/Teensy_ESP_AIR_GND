@@ -84,7 +84,7 @@ The system does not need:
 
 - delivery of every telemetry frame to the browser
 - browser rendering at `50-100 Hz`
-- raw UDP inside the browser
+- raw datagram transport inside the browser
 - CSV as the hot-path log write format
 
 ## 6. Required Top-Level Architecture
@@ -745,7 +745,7 @@ The implementation must preserve the following:
 - explicit ACK/NACK semantics for commands
 - binary telemetry state payload for `/ws_state`
 - browser compatibility with Safari on iPhone and iPad and standard desktop browsers
-- no design that requires browser UDP support
+- no design that requires browser datagram support
 - no design that blocks ingest on browser send completion
 
 The implementation must avoid:

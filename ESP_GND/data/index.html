@@ -9,16 +9,16 @@
 <body>
   <header class="top">
     <div class="title">Telemetry GND Unit</div>
-    <div id="status">Disconnected</div>
+    <div id="status">Loading</div>
     <div id="stats">state_fps: -- | seq: -- | ctrl: -- | state: -- | ping: -- ms</div>
-    <div id="rec" class="rec">REC ON</div>
+    <div id="rec" class="rec unknown">REC --</div>
   </header>
 
   <nav class="tabs">
     <button data-tab="gps" class="active">GPS</button>
     <button data-tab="att">Attitude</button>
-    <button data-tab="baro">BaroLink</button>
-    <button data-tab="link">Link</button>
+    <button data-tab="baro">Baro</button>
+    <button data-tab="link">Radio</button>
   </nav>
 
   <main>
@@ -58,9 +58,9 @@
       <h3>Stream</h3>
       <div class="row"><label>Source Hz</label><input id="sourceHz" type="number" min="1" max="50" step="1" value="50" /></div>
       <div class="row"><label>UI Hz</label><input id="uiHz" type="number" min="5" max="20" step="1" value="20" /></div>
-      <div class="row"><label>AIR Logger</label><span>Always on at source rate</span></div>
+      <div class="row"><label>AIR Recorder</label><span id="airLoggerText">Checking AIR recorder...</span></div>
       <button id="applyRate">Apply Rates</button>
-      <button id="resetAirNetwork">Reset AIR Network</button>
+      <button id="resetAirNetwork">Reset AIR Link</button>
       <button id="downloadDiag">Download Diag CSV</button>
       <button id="downloadWsEvents">Download WS Event CSV</button>
       <button id="downloadClientEvents">Download Client Event CSV</button>
@@ -68,6 +68,6 @@
     </section>
   </main>
 
-  <script src="/app.js?v=20260310g"></script>
+  <script src="/app.js?v=20260311a"></script>
 </body>
 </html>

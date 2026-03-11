@@ -47,9 +47,6 @@ void setDefaults(AppConfig& c) {
   memset(&c, 0, sizeof(c));
   strncpy(c.ap_ssid, "Telemetry", sizeof(c.ap_ssid) - 1);
   strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
-  strncpy(c.gnd_ip, "192.168.4.1", sizeof(c.gnd_ip) - 1);
-  c.udp_local_port = 9000;
-  c.udp_gnd_port = 9000;
   c.uart_port = 1;
   c.uart_rx_pin = 3;
   c.uart_tx_pin = 4;
@@ -62,10 +59,6 @@ void setDefaults(AppConfig& c) {
 }
 
 void sanitize(AppConfig& c) {
-  if (c.gnd_ip[0] == '\0') strncpy(c.gnd_ip, "192.168.4.1", sizeof(c.gnd_ip) - 1);
-  c.gnd_ip[sizeof(c.gnd_ip) - 1] = '\0';
-  c.udp_local_port = clampv<uint16_t>(c.udp_local_port, 1U, 65535U);
-  c.udp_gnd_port = clampv<uint16_t>(c.udp_gnd_port, 1U, 65535U);
   c.source_rate_hz = clampv<uint8_t>(c.source_rate_hz, 1, 50);
   c.ui_rate_hz = clampv<uint8_t>(c.ui_rate_hz, 5, 20);
   c.log_rate_hz = c.source_rate_hz;
@@ -105,9 +98,6 @@ void begin() {
     g_prefs.getBytes("cfg", &legacy, sizeof(legacy));
     strlcpy(g_cfg.ap_ssid, legacy.ap_ssid, sizeof(g_cfg.ap_ssid));
     strlcpy(g_cfg.ap_pass, legacy.ap_pass, sizeof(g_cfg.ap_pass));
-    strlcpy(g_cfg.gnd_ip, "192.168.4.1", sizeof(g_cfg.gnd_ip));
-    g_cfg.udp_local_port = 9000U;
-    g_cfg.udp_gnd_port = 9000U;
     g_cfg.uart_port = legacy.uart_port;
     g_cfg.uart_rx_pin = legacy.uart_rx_pin;
     g_cfg.uart_tx_pin = legacy.uart_tx_pin;
@@ -123,9 +113,6 @@ void begin() {
     g_prefs.getBytes("cfg", &legacy, sizeof(legacy));
     strlcpy(g_cfg.ap_ssid, legacy.ap_ssid, sizeof(g_cfg.ap_ssid));
     strlcpy(g_cfg.ap_pass, legacy.ap_pass, sizeof(g_cfg.ap_pass));
-    strlcpy(g_cfg.gnd_ip, "192.168.4.1", sizeof(g_cfg.gnd_ip));
-    g_cfg.udp_local_port = 9000U;
-    g_cfg.udp_gnd_port = 9000U;
     g_cfg.uart_port = legacy.uart_port;
     g_cfg.uart_rx_pin = legacy.uart_rx_pin;
     g_cfg.uart_tx_pin = legacy.uart_tx_pin;
@@ -156,10 +143,6 @@ void begin() {
   }
   if (g_cfg.uart_baud != 921600UL) {
     g_cfg.uart_baud = 921600UL;
-    changed = true;
-  }
-  if (strncmp(g_cfg.gnd_ip, "192.168.4.1", sizeof(g_cfg.gnd_ip)) != 0) {
-    strlcpy(g_cfg.gnd_ip, "192.168.4.1", sizeof(g_cfg.gnd_ip));
     changed = true;
   }
   if (g_cfg.source_rate_hz != 50U) {

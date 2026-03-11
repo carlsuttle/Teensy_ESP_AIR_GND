@@ -1,12 +1,11 @@
 #pragma once
 
 #include <Arduino.h>
-#include <WiFiUdp.h>
 
 #include "config_store.h"
 #include "types_shared.h"
 
-namespace udp_telem {
+namespace radio_link {
 
 struct Stats {
   uint32_t rx_packets = 0;
@@ -24,10 +23,12 @@ struct Snapshot {
   bool has_state = false;
   bool has_ack = false;
   bool has_fusion_settings = false;
+  bool has_link_meta = false;
   uint32_t seq = 0;
   uint32_t t_us = 0;
   telem::TelemetryFullStateV1 state = {};
   telem::FusionSettingsV1 fusion_settings = {};
+  telem::LinkMetaPayloadV1 link_meta = {};
   uint16_t ack_command = 0;
   bool ack_ok = false;
   uint32_t ack_code = 0;
@@ -47,9 +48,5 @@ bool sendResetNetwork();
 bool hasLearnedSender();
 String targetSenderMac();
 String lastSenderMac();
-IPAddress targetSenderIp();
-uint16_t targetSenderPort();
-IPAddress lastSenderIp();
-uint16_t lastSenderPort();
 
-}  // namespace udp_telem
+}  // namespace radio_link

@@ -7,7 +7,7 @@
 
 #include "config_store.h"
 #include "types_shared.h"
-#include "udp_telem.h"
+#include "radio_link.h"
 
 namespace ws_server {
 namespace {
@@ -103,23 +103,59 @@ void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t le
   }
 
   if (strcmp(type, "get_fusion") == 0) {
-    const auto snap = udp_telem::snapshot();
+    const bool requested = radio_link::sendGetFusionSettings();
+    const auto snap = radio_link::snapshot();
+    telem::FusionSettingsV1 fusion = {};
+    bool has_fusion = false;
     if (snap.has_fusion_settings) {
-      sendAck(client, "get_fusion", true, 0, &snap.fusion_settings);
-    } else {
-      sendAck(client, "get_fusion", false, 1, nullptr);
+      fusion = snap.fusion_settings;
+      has_fusion = true;
+    } else if (snap.has_state) {
+      fusion.gain = snap.state.fusion_gain;
+      fusion.accelerationRejection = snap.state.fusion_accel_rej;
+      fusion.magneticRejection = snap.state.fusion_mag_rej;
+      fusion.recoveryTriggerPeriod = snap.state.fusion_recovery_period;
+      has_fusion = true;
     }
+    sendAck(client, "get_fusion", requested, has_fusion ? 0 : 1, has_fusion ? &fusion : nullptr);
     return;
   }
 
   if (strcmp(type, "set_fusion") == 0) {
     telem::CmdSetFusionSettingsV1 cmd = {};
-    JsonObject fusion = doc["fusion"];
-    cmd.gain = fusion["gain"] | 0.0f;
-    cmd.accelerationRejection = fusion["accelerationRejection"] | 0.0f;
-    cmd.magneticRejection = fusion["magneticRejection"] | 0.0f;
-    cmd.recoveryTriggerPeriod = fusion["recoveryTriggerPeriod"] | 0;
-    const bool ok = udp_telem::sendSetFusionSettings(cmd);
+    const bool has_nested = !doc["fusion"].isNull();
+    if (has_nested) {
+      JsonObject fusion = doc["fusion"];
+      if (fusion["gain"].isNull() || fusion["accelerationRejection"].isNull() ||
+          fusion["magneticRejection"].isNull() || fusion["recoveryTriggerPeriod"].isNull()) {
+        sendAck(client, "set_fusion", false, 2, nullptr);
+        return;
+      }
+      cmd.gain = fusion["gain"].as<float>();
+      cmd.accelerationRejection = fusion["accelerationRejection"].as<float>();
+      cmd.magneticRejection = fusion["magneticRejection"].as<float>();
+      cmd.recoveryTriggerPeriod = fusion["recoveryTriggerPeriod"].as<uint16_t>();
+    } else {
+      if (doc["gain"].isNull() || doc["accelerationRejection"].isNull() || doc["magneticRejection"].isNull() ||
+          doc["recoveryTriggerPeriod"].isNull()) {
+        sendAck(client, "set_fusion", false, 2, nullptr);
+        return;
+      }
+      cmd.gain = doc["gain"].as<float>();
+      cmd.accelerationRejection = doc["accelerationRejection"].as<float>();
+      cmd.magneticRejection = doc["magneticRejection"].as<float>();
+      cmd.recoveryTriggerPeriod = doc["recoveryTriggerPeriod"].as<uint16_t>();
+    }
+    const bool ok = radio_link::sendSetFusionSettings(cmd);
+    Serial.printf("SET_FUSION tx_ok=%u gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
+                  ok ? 1U : 0U,
+                  (double)cmd.gain,
+                  (double)cmd.accelerationRejection,
+                  (double)cmd.magneticRejection,
+                  (unsigned)cmd.recoveryTriggerPeriod);
+    if (ok) {
+      (void)radio_link::sendGetFusionSettings();
+    }
     sendAck(client, "set_fusion", ok, ok ? 0 : 1, nullptr);
     return;
   }
@@ -166,10 +202,15 @@ void onStateEvent(AsyncWebSocket* server,
 }
 
 void serveDiagCsv(AsyncWebServerRequest* request) {
-  const auto snap = udp_telem::snapshot();
+  const auto snap = radio_link::snapshot();
+  const bool air_link_fresh =
+      snap.stats.last_rx_ms != 0U && (uint32_t)(millis() - snap.stats.last_rx_ms) <= 3000U;
   String csv;
-  csv.reserve(512);
+  csv.reserve(768);
   csv += "metric,value\n";
+  csv += "transport,ESP-NOW\n";
+  csv += "air_link_fresh," + String(air_link_fresh ? 1 : 0) + "\n";
+  csv += "ap_clients," + String(WiFi.softAPgetStationNum()) + "\n";
   csv += "rx_packets," + String(snap.stats.rx_packets) + "\n";
   csv += "rx_bytes," + String(snap.stats.rx_bytes) + "\n";
   csv += "frames_ok," + String(snap.stats.frames_ok) + "\n";
@@ -177,10 +218,19 @@ void serveDiagCsv(AsyncWebServerRequest* request) {
   csv += "unknown_msg," + String(snap.stats.unknown_msg) + "\n";
   csv += "drop," + String(snap.stats.drop) + "\n";
   csv += "last_rx_ms," + String(snap.stats.last_rx_ms) + "\n";
-  csv += "last_sender_mac," + udp_telem::lastSenderMac() + "\n";
-  csv += "target_sender_mac," + udp_telem::targetSenderMac() + "\n";
-  csv += "last_sender_ip," + udp_telem::lastSenderIp().toString() + "\n";
-  csv += "last_sender_port," + String(udp_telem::lastSenderPort()) + "\n";
+  csv += "air_radio_ready," +
+         String((snap.link_meta.flags & telem::kLinkMetaFlagRadioReady) ? 1 : 0) + "\n";
+  csv += "air_peer_known," +
+         String((snap.link_meta.flags & telem::kLinkMetaFlagPeerKnown) ? 1 : 0) + "\n";
+  csv += "air_recorder_on," +
+         String((snap.link_meta.flags & telem::kLinkMetaFlagRecorderOn) ? 1 : 0) + "\n";
+  csv += "air_rssi_valid," +
+         String((snap.link_meta.flags & telem::kLinkMetaFlagRssiValid) ? 1 : 0) + "\n";
+  csv += "air_rssi_dbm," + String((int)snap.link_meta.gnd_ap_rssi_dbm) + "\n";
+  csv += "air_scan_age_ms," + String((unsigned long)snap.link_meta.scan_age_ms) + "\n";
+  csv += "air_link_age_ms," + String((unsigned long)snap.link_meta.link_age_ms) + "\n";
+  csv += "air_sender_mac," + radio_link::lastSenderMac() + "\n";
+  csv += "air_target_mac," + radio_link::targetSenderMac() + "\n";
   request->send(200, "text/csv", csv);
 }
 
@@ -214,7 +264,7 @@ void broadcastState() {
   if ((now - g_last_state_broadcast_ms) < interval_ms) return;
   g_last_state_broadcast_ms = now;
 
-  const auto snap = udp_telem::snapshot();
+  const auto snap = radio_link::snapshot();
   if (!snap.has_state) return;
 
   telem::WsStateHeaderV2 hdr = {};
@@ -243,20 +293,31 @@ void begin() {
   g_server.addHandler(&g_ws_state);
 
   g_server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
-    const auto snap = udp_telem::snapshot();
-    StaticJsonDocument<512> doc;
+    const auto snap = radio_link::snapshot();
+    const bool air_link_fresh =
+        snap.stats.last_rx_ms != 0U && (uint32_t)(millis() - snap.stats.last_rx_ms) <= 3000U;
+    StaticJsonDocument<768> doc;
+    doc["transport"] = "ESP-NOW";
+    doc["air_link_fresh"] = air_link_fresh;
+    doc["ap_clients"] = WiFi.softAPgetStationNum();
     doc["has_state"] = snap.has_state;
+    doc["has_link_meta"] = snap.has_link_meta;
     doc["seq"] = snap.seq;
     doc["t_us"] = snap.t_us;
-    doc["udp_rx"] = snap.stats.rx_packets;
+    doc["link_rx"] = snap.stats.rx_packets;
     doc["ok"] = snap.stats.frames_ok;
     doc["len_err"] = snap.stats.len_err;
     doc["unknown_msg"] = snap.stats.unknown_msg;
     doc["drop"] = snap.stats.drop;
-    doc["last_sender_mac"] = udp_telem::lastSenderMac();
-    doc["target_sender_mac"] = udp_telem::targetSenderMac();
-    doc["last_sender_ip"] = udp_telem::lastSenderIp().toString();
-    doc["last_sender_port"] = udp_telem::lastSenderPort();
+    doc["air_radio_ready"] = (snap.link_meta.flags & telem::kLinkMetaFlagRadioReady) != 0U;
+    doc["air_peer_known"] = (snap.link_meta.flags & telem::kLinkMetaFlagPeerKnown) != 0U;
+    doc["air_recorder_on"] = (snap.link_meta.flags & telem::kLinkMetaFlagRecorderOn) != 0U;
+    doc["air_rssi_valid"] = (snap.link_meta.flags & telem::kLinkMetaFlagRssiValid) != 0U;
+    doc["air_rssi_dbm"] = snap.link_meta.gnd_ap_rssi_dbm;
+    doc["air_scan_age_ms"] = snap.link_meta.scan_age_ms;
+    doc["air_link_age_ms"] = snap.link_meta.link_age_ms;
+    doc["air_sender_mac"] = radio_link::lastSenderMac();
+    doc["air_target_mac"] = radio_link::targetSenderMac();
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -269,7 +330,6 @@ void begin() {
     doc["ui_rate_hz"] = cfg.ui_rate_hz;
     doc["log_rate_hz"] = cfg.source_rate_hz;
     doc["log_mode"] = 1;
-    doc["udp_listen_port"] = cfg.udp_listen_port;
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -298,12 +358,12 @@ void begin() {
         cfg.log_rate_hz = cfg.source_rate_hz;
         cfg.log_mode = 1U;
         config_store::update(cfg);
-        udp_telem::reconfigure(cfg);
+        radio_link::reconfigure(cfg);
 
         telem::CmdSetStreamRateV1 cmd = {};
         cmd.ws_rate_hz = cfg.source_rate_hz;
         cmd.log_rate_hz = cfg.source_rate_hz;
-        (void)udp_telem::sendSetStreamRate(cmd);
+        (void)radio_link::sendSetStreamRate(cmd);
 
         broadcastConfig();
       });
@@ -318,7 +378,7 @@ void begin() {
     request->send(200, "application/json", "{\"ok\":1}");
   });
   g_server.on("/api/reset_air_network", HTTP_POST, [](AsyncWebServerRequest* request) {
-    const bool ok = udp_telem::sendResetNetwork();
+    const bool ok = radio_link::sendResetNetwork();
     request->send(ok ? 200 : 503, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0}");
   });
   g_server.on("/api/diag", HTTP_GET, serveDiagCsv);
@@ -330,6 +390,7 @@ void begin() {
 
   g_server.serveStatic("/", LittleFS, "/")
       .setDefaultFile("index.html")
+      .setTryGzipFirst(false)
       .setCacheControl("no-cache, no-store, must-revalidate");
   g_server.begin();
 }

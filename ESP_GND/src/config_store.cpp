@@ -20,7 +20,6 @@ void setDefaults(AppConfig& c) {
   memset(&c, 0, sizeof(c));
   strncpy(c.ap_ssid, "Telemetry", sizeof(c.ap_ssid) - 1);
   strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
-  c.udp_listen_port = 9000;
   c.source_rate_hz = 50;
   c.ui_rate_hz = 20;
   c.log_rate_hz = 50;
@@ -29,7 +28,6 @@ void setDefaults(AppConfig& c) {
 }
 
 void sanitize(AppConfig& c) {
-  c.udp_listen_port = clampv<uint16_t>(c.udp_listen_port, 1U, 65535U);
   c.source_rate_hz = clampv<uint8_t>(c.source_rate_hz, 1, 50);
   c.ui_rate_hz = clampv<uint8_t>(c.ui_rate_hz, 1, 20);
   c.log_rate_hz = c.source_rate_hz;

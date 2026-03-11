@@ -8,7 +8,7 @@
 #include "config_store.h"
 #include "log_store.h"
 #include "uart_telem.h"
-#include "udp_link.h"
+#include "radio_link.h"
 
 namespace {
 
@@ -81,11 +81,11 @@ void printConsoleHelp() {
   Serial.println("  kickteensy    - resend current stream-rate command to Teensy");
   Serial.println("  resendrate    - same as kickteensy");
   Serial.println("  tx1           - send current state once to GND");
-  Serial.println("  udpclear      - clear AIR radio-link state and stop ESP-NOW");
-  Serial.println("  udpreopen     - reopen AIR radio-link only");
+  Serial.println("  linkclear     - clear AIR radio-link state and stop ESP-NOW");
+  Serial.println("  linkopen      - reopen AIR radio-link only");
   Serial.println("  wifidrop      - clear discovered peer state");
   Serial.println("  wifioffon     - power-cycle Wi-Fi only");
-  Serial.println("  reudp         - restart AIR radio-link");
+  Serial.println("  relink        - restart AIR radio-link");
   Serial.println("  resetnet      - restart AIR Wi-Fi/ESP-NOW side");
   Serial.println("  setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
   Serial.println("  stats         - start 1Hz STAT stream");
@@ -93,11 +93,11 @@ void printConsoleHelp() {
 }
 
 void printStats(const uart_telem::Snapshot& snap) {
-  const auto udp = udp_link::stats();
+  const auto link = radio_link::stats();
   Serial.printf(
       "STAT unit=AIR seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
       "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu "
-      "udp_tx=%lu udp_rx=%lu udp_drop=%lu\n",
+      "link_tx=%lu link_rx=%lu link_drop=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -112,9 +112,9 @@ void printStats(const uart_telem::Snapshot& snap) {
       (unsigned long)snap.stats.len_err,
       (unsigned long)snap.stats.unknown_msg,
       (unsigned long)snap.stats.drop,
-      (unsigned long)udp.tx_packets,
-      (unsigned long)udp.rx_packets,
-      (unsigned long)udp.tx_drop);
+      (unsigned long)link.tx_packets,
+      (unsigned long)link.rx_packets,
+      (unsigned long)link.tx_drop);
 }
 
 void handleConsoleCommands() {
@@ -148,38 +148,38 @@ void handleConsoleCommands() {
         if (!snap.has_state) {
           Serial.println("TX1 tx_ok=0 reason=no_state");
         } else {
-          const bool ok = udp_link::publishStressState(snap.state, snap.seq, snap.t_us);
+          const bool ok = radio_link::publishStressState(snap.state, snap.seq, snap.t_us);
           Serial.printf("TX1 tx_ok=%u seq=%lu t_us=%lu\n",
                         ok ? 1U : 0U,
                         (unsigned long)snap.seq,
                         (unsigned long)snap.t_us);
         }
-      } else if (strcmp(g_console_line, "udpclear") == 0) {
-        udp_link::resetNetworkState();
+      } else if (strcmp(g_console_line, "linkclear") == 0) {
+        radio_link::resetNetworkState();
         resetWifiStatusFlags();
-        Serial.println("UDPCLEAR done state=cleared link=stopped");
-      } else if (strcmp(g_console_line, "udpreopen") == 0) {
+        Serial.println("LINKCLEAR done state=cleared link=stopped");
+      } else if (strcmp(g_console_line, "linkopen") == 0) {
         const AppConfig& cfg = config_store::get();
-        udp_link::reconfigure(cfg);
-        Serial.printf("UDPREOPEN peer=%s channel=%u\n",
-                      udp_link::peerMac().c_str(),
+        radio_link::reconfigure(cfg);
+        Serial.printf("LINKOPEN peer=%s channel=%u\n",
+                      radio_link::peerMac().c_str(),
                       (unsigned)telem::kRadioChannel);
       } else if (strcmp(g_console_line, "wifidrop") == 0) {
         const AppConfig& cfg = config_store::get();
-        udp_link::resetNetworkState();
+        radio_link::resetNetworkState();
         resetWifiStatusFlags();
-        udp_link::reconfigure(cfg);
+        radio_link::reconfigure(cfg);
         Serial.println("WIFIDROP peer_state_cleared");
       } else if (strcmp(g_console_line, "wifioffon") == 0) {
         restartWifiStation();
         Serial.println("WIFIOFFON radio_power_cycle");
-      } else if (strcmp(g_console_line, "reudp") == 0 || strcmp(g_console_line, "restartudp") == 0) {
+      } else if (strcmp(g_console_line, "relink") == 0) {
         const AppConfig& cfg = config_store::get();
-        udp_link::resetNetworkState();
-        udp_link::reconfigure(cfg);
+        radio_link::resetNetworkState();
+        radio_link::reconfigure(cfg);
         resetWifiStatusFlags();
-        Serial.printf("REUDP peer=%s channel=%u\n",
-                      udp_link::peerMac().c_str(),
+        Serial.printf("RELINK peer=%s channel=%u\n",
+                      radio_link::peerMac().c_str(),
                       (unsigned)telem::kRadioChannel);
       } else if (strcmp(g_console_line, "resetnet") == 0 || strcmp(g_console_line, "netreset") == 0) {
         restartWifiStation();
@@ -241,7 +241,7 @@ void beginWifiStation() {
 void restartWifiStation() {
   const AppConfig& cfg = config_store::get();
   Serial.println("AIR CMD reset_network");
-  udp_link::resetNetworkState();
+  radio_link::resetNetworkState();
   resetWifiStatusFlags();
   WiFi.mode(WIFI_OFF);
   delay(50);
@@ -250,11 +250,11 @@ void restartWifiStation() {
   g_last_stream_rate_tx_ms = 0;
   g_last_stream_rate_ui_hz = 0;
   g_last_stream_rate_log_hz = 0;
-  udp_link::reconfigure(cfg);
+  radio_link::reconfigure(cfg);
 }
 
 void updateWifiReadiness() {
-  if (!udp_link::radioReady()) {
+  if (!radio_link::radioReady()) {
     if (g_radio_ready) {
       Serial.println("AIR WAIT radio");
       g_radio_ready = false;
@@ -269,9 +269,9 @@ void updateWifiReadiness() {
     g_radio_ready = true;
   }
 
-  if (udp_link::hasPeer()) {
+  if (radio_link::hasPeer()) {
     if (!g_link_ready) {
-      Serial.printf("AIR READY gnd_link peer=%s\n", udp_link::peerMac().c_str());
+      Serial.printf("AIR READY gnd_link peer=%s\n", radio_link::peerMac().c_str());
       g_link_ready = true;
       g_link_wait_printed = false;
     }
@@ -331,7 +331,7 @@ void updateTeensyReadiness(const uart_telem::Snapshot& snap) {
 void publishPendingTelemetry() {
   uart_telem::PendingState pending = {};
   while (uart_telem::popPendingState(pending)) {
-    (void)udp_link::publishState(pending.state, pending.seq, pending.t_us);
+    (void)radio_link::publishState(pending.state, pending.seq, pending.t_us);
   }
 }
 
@@ -355,13 +355,13 @@ void setup() {
   if (!fs_ready) {
     Serial.println("LittleFS mount failed");
   }
+  const bool air_file_logging_enabled = fs_ready && kEnableAirFileLogging;
 
   uart_telem::begin(cfg);
-  udp_link::begin(cfg);
-  log_store::begin(cfg, fs_ready && kEnableAirFileLogging);
-  if (!kEnableAirFileLogging) {
-    Serial.println("AIR INFO file_logging_disabled");
-  }
+  radio_link::begin(cfg);
+  radio_link::setRecorderEnabled(air_file_logging_enabled);
+  log_store::begin(cfg, air_file_logging_enabled);
+  Serial.printf("AIR INFO recorder=%s\n", air_file_logging_enabled ? "on" : "off");
   g_last_stream_rate_ui_hz = 0;
   g_last_stream_rate_log_hz = 0;
   g_last_stream_rate_tx_ms = 0;
@@ -371,11 +371,11 @@ void setup() {
 
 void loop() {
   handleConsoleCommands();
-  if (udp_link::takeNetworkResetRequest()) {
+  if (radio_link::takeNetworkResetRequest()) {
     restartWifiStation();
   }
   uart_telem::poll();
-  udp_link::poll();
+  radio_link::poll();
   updateWifiReadiness();
 
   const auto snap = uart_telem::snapshot();
@@ -407,7 +407,7 @@ void loop() {
 
   ensureConfiguredStreamRate();
   publishPendingTelemetry();
-  udp_link::publish(snap);
+  radio_link::publish(snap);
 
   const uint32_t now = millis();
   if (g_stats_streaming && (uint32_t)(now - g_last_stat_ms) >= 1000U) {

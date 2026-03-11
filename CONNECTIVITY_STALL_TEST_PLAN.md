@@ -12,14 +12,14 @@ Prove that:
 This plan is focused on:
 
 - `ESP_GND` AP startup and browser access
-- `ESP_AIR` STA reconnect and UDP resume
+- `ESP_AIR` radio-link discovery and `ESP-NOW` resume
 - `Teensy` telemetry resume
 - end-to-end sequence continuity and stall detection
 
 ## Preconditions
 
 - `ESP_GND` is the AP at `192.168.4.1`
-- `ESP_AIR` is the STA at `192.168.4.2`
+- `ESP_AIR` runs on the same radio channel and discovers `ESP_GND` over `ESP-NOW`
 - GND DHCP lease pool starts at `192.168.4.50`
 - iPad/phone/browser clients get `.50+` addresses
 - the current baseline config is known
@@ -31,8 +31,9 @@ This plan is focused on:
 ## Pass Criteria
 
 - `ESP_GND` reaches `GND READY ap` without retries or lockout
-- `ESP_AIR` reaches `AIR READY wifi` once the AP exists
+- `ESP_AIR` reaches `AIR READY radio` once Wi-Fi/ESP-NOW is initialized
 - `ESP_AIR` reaches `AIR READY teensy_link` once Teensy telemetry exists
+- `ESP_AIR` reaches `AIR READY gnd_link` once GND is discovered
 - `ESP_GND` reaches `GND READY air_link` once AIR packets exist
 - after any interruption, recovery happens without manual reset
 - no unit stays in a `WAIT` state past the configured deadline
@@ -55,7 +56,7 @@ Run each scenario from full power-off.
 For each run, verify:
 
 - GND AP becomes visible and browser can join
-- AIR joins the AP automatically
+- AIR discovers the GND link automatically
 - Teensy telemetry appears on AIR
 - GND receives packets
 - UI loads and stays connected
@@ -79,7 +80,7 @@ For each interruption, verify:
 - no permanent lockout
 - all `READY` states return automatically
 - `seq` resumes increasing on all active units
-- `udp_rx` resumes on GND
+- `link_rx` resumes on GND
 - UI reconnects without manual board reset
 
 ## Suggested Deadlines
@@ -87,9 +88,10 @@ For each interruption, verify:
 These are operational targets for the soak.
 
 - GND AP ready: `<= 15 s` after GND boot
-- AIR Wi-Fi ready: `<= 30 s` after both AIR boot and GND AP ready
-- AIR Teensy link ready: `<= 30 s` after both AIR Wi-Fi ready and Teensy stats active
-- GND AIR link ready: `<= 30 s` after both GND AP ready and AIR Wi-Fi ready
+- AIR radio ready: `<= 10 s` after AIR boot
+- AIR GND link ready: `<= 30 s` after both AIR and GND are booted
+- AIR Teensy link ready: `<= 30 s` after both AIR radio ready and Teensy stats active
+- GND AIR link ready: `<= 30 s` after both GND AP ready and AIR radio ready
 - live telemetry stall threshold: `4 s`
 
 Adjust only if real hardware measurements justify it.

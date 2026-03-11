@@ -1,4 +1,4 @@
-#include "udp_link.h"
+#include "radio_link.h"
 
 #include <WiFi.h>
 #include <esp_now.h>
@@ -6,17 +6,13 @@
 #include <esp_wifi.h>
 #include <string.h>
 
-#include "types_shared.h"
-
-namespace udp_link {
+namespace radio_link {
 namespace {
 
 constexpr uint8_t kUnitAir = 1U;
 constexpr uint8_t kUnitGnd = 2U;
 constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
 constexpr size_t kRxQueueCapacity = 8U;
-constexpr uint32_t kHelloIntervalMs = 500U;
-constexpr uint32_t kPeerStaleMs = 2000U;
 constexpr uint8_t kSendFailThreshold = 6U;
 
 struct RxFrame {
@@ -33,18 +29,13 @@ volatile uint32_t g_rx_drop_events = 0U;
 volatile uint32_t g_send_ok_events = 0U;
 volatile uint32_t g_send_fail_events = 0U;
 
-Stats g_stats;
-uint8_t g_gnd_mac[6] = {};
+Snapshot g_snapshot;
+uint8_t g_air_mac[6] = {};
 uint8_t g_last_sender_mac[6] = {};
-bool g_has_gnd_mac = false;
+bool g_has_air_mac = false;
 bool g_has_last_sender_mac = false;
 bool g_espnow_ready = false;
-bool g_network_reset_requested = false;
 uint8_t g_consecutive_send_failures = 0U;
-uint32_t g_last_hello_tx_ms = 0U;
-uint32_t g_last_state_seq = 0U;
-uint32_t g_last_ack_seq = 0U;
-uint32_t g_last_fusion_seq = 0U;
 uint32_t g_tx_seq = 0U;
 uint32_t g_session_id = 0U;
 
@@ -77,12 +68,11 @@ String macToString(const uint8_t* mac) {
 }
 
 void clearPeerState() {
-  memset(g_gnd_mac, 0, sizeof(g_gnd_mac));
+  memset(g_air_mac, 0, sizeof(g_air_mac));
   memset(g_last_sender_mac, 0, sizeof(g_last_sender_mac));
-  g_has_gnd_mac = false;
+  g_has_air_mac = false;
   g_has_last_sender_mac = false;
   g_consecutive_send_failures = 0U;
-  g_last_hello_tx_ms = 0U;
 }
 
 bool ensurePeer(const uint8_t* mac) {
@@ -90,7 +80,7 @@ bool ensurePeer(const uint8_t* mac) {
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, mac, sizeof(peer.peer_addr));
   peer.channel = telem::kRadioChannel;
-  peer.ifidx = WIFI_IF_STA;
+  peer.ifidx = WIFI_IF_AP;
   peer.encrypt = false;
   if (esp_now_is_peer_exist(mac)) {
     return esp_now_mod_peer(&peer) == ESP_OK;
@@ -153,20 +143,15 @@ void drainAsyncEvents() {
   portEXIT_CRITICAL(&g_rx_mux);
 
   if (rx_drop > 0U) {
-    g_stats.rx_unknown += rx_drop;
+    g_snapshot.stats.drop += rx_drop;
   }
   if (send_ok > 0U) {
     g_consecutive_send_failures = 0U;
   }
-  if (send_fail > 0U) {
-    g_stats.tx_drop += send_fail;
-    if (g_has_gnd_mac) {
-      const uint32_t total = (uint32_t)g_consecutive_send_failures + send_fail;
-      g_consecutive_send_failures = (total > 0xFFU) ? 0xFFU : (uint8_t)total;
-      if (g_consecutive_send_failures >= kSendFailThreshold) {
-        clearPeerState();
-      }
-    }
+  if (send_fail > 0U && g_has_air_mac) {
+    const uint32_t total = (uint32_t)g_consecutive_send_failures + send_fail;
+    g_consecutive_send_failures = (total > 0xFFU) ? 0xFFU : (uint8_t)total;
+    if (g_consecutive_send_failures >= kSendFailThreshold) clearPeerState();
   }
 }
 
@@ -193,12 +178,6 @@ bool initEspNow() {
   return true;
 }
 
-void shutdownEspNow() {
-  if (!g_espnow_ready) return;
-  esp_now_deinit();
-  g_espnow_ready = false;
-}
-
 bool learnPeer(const uint8_t* mac) {
   if (isZeroMac(mac) || isBroadcastMac(mac)) return false;
   if (!initEspNow()) return false;
@@ -206,20 +185,15 @@ bool learnPeer(const uint8_t* mac) {
 
   copyMac(g_last_sender_mac, mac);
   g_has_last_sender_mac = true;
-  if (!g_has_gnd_mac || memcmp(g_gnd_mac, mac, sizeof(g_gnd_mac)) != 0) {
-    copyMac(g_gnd_mac, mac);
-    g_has_gnd_mac = true;
+  if (!g_has_air_mac || memcmp(g_air_mac, mac, sizeof(g_air_mac)) != 0) {
+    copyMac(g_air_mac, mac);
+    g_has_air_mac = true;
   }
   g_consecutive_send_failures = 0U;
   return true;
 }
 
-bool sendFrameTo(const uint8_t* mac,
-                 telem::MsgType type,
-                 const void* payload,
-                 size_t payload_len,
-                 uint32_t seq,
-                 uint32_t t_us) {
+bool sendFrameTo(const uint8_t* mac, telem::MsgType type, const void* payload, size_t payload_len) {
   constexpr size_t kMaxPayloadLen = telem::kEspNowMaxDataLen - sizeof(telem::FrameHeader);
   if (payload_len > kMaxPayloadLen || isZeroMac(mac)) return false;
   if (!initEspNow()) return false;
@@ -230,8 +204,8 @@ bool sendFrameTo(const uint8_t* mac,
   hdr.version = telem::kVersion;
   hdr.msg_type = static_cast<uint16_t>(type);
   hdr.payload_len = (uint16_t)payload_len;
-  hdr.seq = seq ? seq : ++g_tx_seq;
-  hdr.t_us = t_us;
+  hdr.seq = ++g_tx_seq;
+  hdr.t_us = micros();
   memcpy(buf, &hdr, sizeof(hdr));
   if (payload && payload_len > 0U) {
     memcpy(buf + sizeof(hdr), payload, payload_len);
@@ -240,7 +214,6 @@ bool sendFrameTo(const uint8_t* mac,
   const size_t frame_len = sizeof(hdr) + payload_len;
   const esp_err_t err = esp_now_send(mac, buf, frame_len);
   if (err != ESP_OK) {
-    g_stats.tx_drop++;
     if (!isBroadcastMac(mac)) {
       g_consecutive_send_failures++;
       if (g_consecutive_send_failures >= kSendFailThreshold) clearPeerState();
@@ -248,119 +221,114 @@ bool sendFrameTo(const uint8_t* mac,
     if (err == ESP_ERR_ESPNOW_NOT_INIT) g_espnow_ready = false;
     return false;
   }
-
-  g_stats.tx_packets++;
-  g_stats.tx_bytes += (uint32_t)frame_len;
   return true;
 }
 
 bool sendHelloTo(const uint8_t* mac) {
   telem::LinkHelloPayloadV1 hello = {};
-  hello.unit_id = kUnitAir;
+  hello.unit_id = kUnitGnd;
   hello.session_id = g_session_id;
-  return sendFrameTo(mac, telem::LINK_HELLO, &hello, sizeof(hello), 0U, micros());
+  return sendFrameTo(mac, telem::LINK_HELLO, &hello, sizeof(hello));
 }
 
-bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us) {
-  if (!g_has_gnd_mac) return false;
-  return sendFrameTo(g_gnd_mac, type, payload, payload_len, seq, t_us);
-}
-
-void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint32_t t_us) {
-  telem::AckPayloadV1 ack = {};
-  ack.command = command;
-  ack.ok = ok ? 1U : 0U;
-  ack.code = code;
-  (void)sendFrame(ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), seq, t_us);
+bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
+  if (!g_has_air_mac) return false;
+  return sendFrameTo(g_air_mac, type, payload, payload_len);
 }
 
 void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_t* payload) {
   if (hdr.payload_len != sizeof(telem::LinkHelloPayloadV1)) {
-    g_stats.rx_bad_len++;
+    g_snapshot.stats.len_err++;
     return;
   }
 
   telem::LinkHelloPayloadV1 hello = {};
   memcpy(&hello, payload, sizeof(hello));
-  if (hello.unit_id != kUnitGnd) {
-    g_stats.rx_unknown++;
+  if (hello.unit_id != kUnitAir) {
+    g_snapshot.stats.unknown_msg++;
     return;
   }
 
   if (learnPeer(mac)) {
-    g_stats.last_rx_ms = millis();
+    (void)sendHelloTo(mac);
   }
 }
 
-void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
-  bool handled = true;
+void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
   switch ((telem::MsgType)hdr.msg_type) {
-    case telem::CMD_SET_FUSION_SETTINGS: {
-      if (hdr.payload_len != sizeof(telem::CmdSetFusionSettingsV1)) {
-        g_stats.rx_bad_len++;
+    case telem::TELEM_FULL_STATE:
+      if (hdr.payload_len != sizeof(telem::TelemetryFullStateV1)) {
+        g_snapshot.stats.len_err++;
         return;
       }
-      telem::CmdSetFusionSettingsV1 cmd = {};
-      memcpy(&cmd, payload, sizeof(cmd));
-      (void)uart_telem::sendSetFusionSettings(cmd);
+      memcpy(&g_snapshot.state, payload, sizeof(g_snapshot.state));
+      g_snapshot.has_state = true;
+      g_snapshot.seq = hdr.seq;
+      g_snapshot.t_us = hdr.t_us;
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
+    case telem::TELEM_FUSION_SETTINGS:
+      if (hdr.payload_len != sizeof(telem::FusionSettingsV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      memcpy(&g_snapshot.fusion_settings, payload, sizeof(g_snapshot.fusion_settings));
+      g_snapshot.has_fusion_settings = true;
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
+    case telem::TELEM_META:
+      if (hdr.payload_len != sizeof(telem::LinkMetaPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      memcpy(&g_snapshot.link_meta, payload, sizeof(g_snapshot.link_meta));
+      g_snapshot.has_link_meta = true;
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
+    case telem::ACK:
+    case telem::NACK: {
+      if (hdr.payload_len != sizeof(telem::AckPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      telem::AckPayloadV1 ack = {};
+      memcpy(&ack, payload, sizeof(ack));
+      g_snapshot.has_ack = true;
+      g_snapshot.ack_command = ack.command;
+      g_snapshot.ack_ok = ack.ok != 0U;
+      g_snapshot.ack_code = ack.code;
+      g_snapshot.ack_rx_seq = hdr.seq;
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
       break;
     }
-    case telem::CMD_GET_FUSION_SETTINGS:
-      if (hdr.payload_len != 0U) {
-        g_stats.rx_bad_len++;
-        return;
-      }
-      (void)uart_telem::sendGetFusionSettings();
-      break;
-    case telem::CMD_SET_STREAM_RATE: {
-      if (hdr.payload_len != sizeof(telem::CmdSetStreamRateV1)) {
-        g_stats.rx_bad_len++;
-        return;
-      }
-      telem::CmdSetStreamRateV1 cmd = {};
-      memcpy(&cmd, payload, sizeof(cmd));
-      (void)uart_telem::sendSetStreamRate(cmd);
-      break;
-    }
-    case telem::CMD_RESET_NETWORK:
-      if (hdr.payload_len != 0U) {
-        g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
-        return;
-      }
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
-      g_network_reset_requested = true;
-      break;
     default:
-      handled = false;
+      g_snapshot.stats.unknown_msg++;
       break;
-  }
-
-  if (handled) {
-    g_stats.last_rx_ms = millis();
-  } else {
-    g_stats.rx_unknown++;
   }
 }
 
 void handleIncomingFrame(const RxFrame& frame) {
-  g_stats.rx_packets++;
-  g_stats.rx_bytes += frame.len;
+  g_snapshot.stats.rx_packets++;
+  g_snapshot.stats.rx_bytes += frame.len;
   (void)learnPeer(frame.mac);
 
   if (frame.len < sizeof(telem::FrameHeader)) {
-    g_stats.rx_bad_len++;
+    g_snapshot.stats.len_err++;
     return;
   }
 
   telem::FrameHeader hdr = {};
   memcpy(&hdr, frame.data, sizeof(hdr));
   if (hdr.magic != telem::kMagic || hdr.version != telem::kVersion) {
-    g_stats.rx_bad_magic++;
+    g_snapshot.stats.unknown_msg++;
     return;
   }
   if ((size_t)frame.len != sizeof(hdr) + hdr.payload_len) {
-    g_stats.rx_bad_len++;
+    g_snapshot.stats.len_err++;
     return;
   }
 
@@ -369,33 +337,17 @@ void handleIncomingFrame(const RxFrame& frame) {
     handleHello(frame.mac, hdr, payload);
     return;
   }
-  handleCommand(hdr, payload);
-}
 
-void maybeSendHello() {
-  const uint32_t now = millis();
-  if ((uint32_t)(now - g_last_hello_tx_ms) < kHelloIntervalMs) return;
-
-  bool sent = false;
-  if (!g_has_gnd_mac) {
-    sent = sendHelloTo(kBroadcastMac);
-  } else if (g_stats.last_rx_ms == 0U || (uint32_t)(now - g_stats.last_rx_ms) >= kPeerStaleMs) {
-    sent = sendHelloTo(g_gnd_mac);
-  }
-  if (sent) g_last_hello_tx_ms = now;
+  applyFrame(hdr, payload);
 }
 
 }  // namespace
 
 void begin(const AppConfig& cfg) {
   (void)cfg;
-  memset(&g_stats, 0, sizeof(g_stats));
+  memset(&g_snapshot, 0, sizeof(g_snapshot));
   clearPeerState();
   g_espnow_ready = false;
-  g_network_reset_requested = false;
-  g_last_state_seq = 0U;
-  g_last_ack_seq = 0U;
-  g_last_fusion_seq = 0U;
   g_tx_seq = 0U;
   g_session_id = esp_random();
   (void)initEspNow();
@@ -405,9 +357,14 @@ void reconfigure(const AppConfig& cfg) {
   (void)cfg;
   if (!initEspNow()) return;
   (void)ensurePeer(kBroadcastMac);
-  if (g_has_gnd_mac) {
-    (void)ensurePeer(g_gnd_mac);
+  if (g_has_air_mac) {
+    (void)ensurePeer(g_air_mac);
   }
+}
+
+void restart(const AppConfig& cfg) {
+  clearPeerState();
+  reconfigure(cfg);
 }
 
 void poll() {
@@ -417,64 +374,26 @@ void poll() {
   while (popRxFrame(frame)) {
     handleIncomingFrame(frame);
   }
-
-  maybeSendHello();
 }
 
-void publish(const uart_telem::Snapshot& snap) {
-  if (snap.has_state && snap.seq != g_last_state_seq) {
-    (void)publishState(snap.state, snap.seq, snap.t_us);
-  }
-  if (snap.has_fusion_settings && snap.fusion_rx_seq != g_last_fusion_seq) {
-    g_last_fusion_seq = snap.fusion_rx_seq;
-    (void)sendFrame(telem::TELEM_FUSION_SETTINGS,
-                    &snap.fusion_settings,
-                    sizeof(snap.fusion_settings),
-                    snap.fusion_rx_seq,
-                    snap.t_us);
-  }
-  if (snap.has_ack && snap.ack_rx_seq != g_last_ack_seq) {
-    telem::AckPayloadV1 ack = {};
-    ack.command = snap.ack_command;
-    ack.ok = snap.ack_ok ? 1U : 0U;
-    ack.code = snap.ack_code;
-    g_last_ack_seq = snap.ack_rx_seq;
-    (void)sendFrame(snap.ack_ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), snap.ack_rx_seq, snap.t_us);
-  }
+Snapshot snapshot() { return g_snapshot; }
+
+bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
+  return sendFrame(telem::CMD_SET_FUSION_SETTINGS, &cmd, sizeof(cmd));
 }
 
-bool publishState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
-  if (seq == g_last_state_seq) return true;
-  if (!g_has_gnd_mac) return false;
-  g_last_state_seq = seq;
-  return sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
+bool sendGetFusionSettings() { return sendFrame(telem::CMD_GET_FUSION_SETTINGS, nullptr, 0U); }
+
+bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd) {
+  return sendFrame(telem::CMD_SET_STREAM_RATE, &cmd, sizeof(cmd));
 }
 
-bool publishStressState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
-  return g_has_gnd_mac && sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
-}
+bool sendResetNetwork() { return sendFrame(telem::CMD_RESET_NETWORK, nullptr, 0U); }
 
-Stats stats() { return g_stats; }
+bool hasLearnedSender() { return g_has_air_mac; }
 
-bool hasPeer() { return g_has_gnd_mac; }
+String targetSenderMac() { return macToString(g_air_mac); }
 
-String peerMac() { return macToString(g_gnd_mac); }
+String lastSenderMac() { return macToString(g_last_sender_mac); }
 
-bool radioReady() { return g_espnow_ready; }
-
-bool takeNetworkResetRequest() {
-  const bool requested = g_network_reset_requested;
-  g_network_reset_requested = false;
-  return requested;
-}
-
-void resetNetworkState() {
-  shutdownEspNow();
-  clearPeerState();
-  g_last_state_seq = 0U;
-  g_last_ack_seq = 0U;
-  g_last_fusion_seq = 0U;
-  g_stats.last_rx_ms = 0U;
-}
-
-}  // namespace udp_link
+}  // namespace radio_link

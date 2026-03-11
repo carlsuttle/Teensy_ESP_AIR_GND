@@ -6,7 +6,7 @@
 #include "types_shared.h"
 #include "uart_telem.h"
 
-namespace udp_link {
+namespace radio_link {
 
 struct Stats {
   uint32_t tx_packets = 0;
@@ -30,7 +30,8 @@ Stats stats();
 bool hasPeer();
 String peerMac();
 bool radioReady();
+void setRecorderEnabled(bool enabled);
 bool takeNetworkResetRequest();
 void resetNetworkState();
 
-}  // namespace udp_link
+}  // namespace radio_link

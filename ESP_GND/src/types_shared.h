@@ -10,6 +10,10 @@ static constexpr uint32_t kWsStateMagic = 0x57535445UL;  // "WSTE"
 static constexpr uint16_t kWsStateVersion = 2;
 static constexpr uint8_t kRadioChannel = 6;
 static constexpr uint16_t kEspNowMaxDataLen = 250;
+static constexpr uint8_t kLinkMetaFlagPeerKnown = 1U << 0;
+static constexpr uint8_t kLinkMetaFlagRadioReady = 1U << 1;
+static constexpr uint8_t kLinkMetaFlagRecorderOn = 1U << 2;
+static constexpr uint8_t kLinkMetaFlagRssiValid = 1U << 3;
 
 enum MsgType : uint16_t {
   TELEM_FULL_STATE = 1,
@@ -104,6 +108,14 @@ struct LinkHelloPayloadV1 {
   uint8_t flags;
   uint16_t reserved;
   uint32_t session_id;
+};
+
+struct LinkMetaPayloadV1 {
+  int16_t gnd_ap_rssi_dbm;
+  uint8_t flags;
+  uint8_t reserved0;
+  uint32_t scan_age_ms;
+  uint32_t link_age_ms;
 };
 
 struct WsStateHeaderV1 {
