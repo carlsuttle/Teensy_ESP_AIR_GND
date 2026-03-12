@@ -15,6 +15,8 @@ namespace {
 AsyncWebServer g_server(80);
 AsyncWebSocket g_ws_ctrl("/ws_ctrl");
 AsyncWebSocket g_ws_state("/ws_state");
+constexpr uint16_t kFixedDownlinkRateHz = 30U;
+constexpr uint16_t kFixedUiRateHz = 30U;
 
 uint32_t g_ws_state_seq = 0;
 uint32_t g_last_state_broadcast_ms = 0;
@@ -69,9 +71,10 @@ void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
   JsonDocument doc;
   doc["type"] = "config";
   doc["source_rate_hz"] = cfg.source_rate_hz;
-  doc["ui_rate_hz"] = cfg.ui_rate_hz;
+  doc["capture_rate_hz"] = cfg.source_rate_hz;
+  doc["ui_rate_hz"] = kFixedUiRateHz;
   doc["log_rate_hz"] = cfg.log_rate_hz;
-  doc["download_rate_hz"] = cfg.log_rate_hz;
+  doc["download_rate_hz"] = kFixedDownlinkRateHz;
   doc["log_mode"] = 1;
   doc["radio_state_only"] = cfg.radio_state_only != 0U;
 
@@ -320,11 +323,8 @@ void serveWsEventsCsv(AsyncWebServerRequest* request) {
 }
 
 void broadcastState() {
-  const AppConfig& cfg = config_store::get();
-  if (cfg.ui_rate_hz == 0) return;
-
   const uint32_t now = millis();
-  const uint32_t interval_ms = 1000UL / (uint32_t)cfg.ui_rate_hz;
+  const uint32_t interval_ms = 1000UL / (uint32_t)kFixedUiRateHz;
   if ((now - g_last_state_broadcast_ms) < interval_ms) return;
   g_last_state_broadcast_ms = now;
 
@@ -408,9 +408,10 @@ void begin() {
     const AppConfig& cfg = config_store::get();
     JsonDocument doc;
     doc["source_rate_hz"] = cfg.source_rate_hz;
-    doc["ui_rate_hz"] = cfg.ui_rate_hz;
+    doc["capture_rate_hz"] = cfg.source_rate_hz;
+    doc["ui_rate_hz"] = kFixedUiRateHz;
     doc["log_rate_hz"] = cfg.log_rate_hz;
-    doc["download_rate_hz"] = cfg.log_rate_hz;
+    doc["download_rate_hz"] = kFixedDownlinkRateHz;
     doc["log_mode"] = 1;
     doc["radio_state_only"] = cfg.radio_state_only != 0U;
     String text;
@@ -437,12 +438,6 @@ void begin() {
 
         AppConfig cfg = config_store::get();
         if (!doc["source_rate_hz"].isNull()) cfg.source_rate_hz = doc["source_rate_hz"].as<uint16_t>();
-        if (!doc["ui_rate_hz"].isNull()) cfg.ui_rate_hz = doc["ui_rate_hz"].as<uint16_t>();
-        if (!doc["download_rate_hz"].isNull()) {
-          cfg.log_rate_hz = doc["download_rate_hz"].as<uint16_t>();
-        } else if (!doc["log_rate_hz"].isNull()) {
-          cfg.log_rate_hz = doc["log_rate_hz"].as<uint16_t>();
-        }
         if (!doc["radio_state_only"].isNull()) cfg.radio_state_only = doc["radio_state_only"].as<bool>() ? 1U : 0U;
         cfg.log_mode = 1U;
         config_store::update(cfg);
@@ -454,7 +449,7 @@ void begin() {
         telem::CmdSetRadioModeV1 radio_mode = {};
         radio_mode.state_only = cfg.radio_state_only ? 1U : 0U;
         radio_mode.control_rate_hz = 2U;
-        radio_mode.telem_rate_hz = cfg.log_rate_hz;
+        radio_mode.telem_rate_hz = kFixedDownlinkRateHz;
         (void)radio_link::sendSetRadioMode(radio_mode);
         (void)radio_link::sendSetStreamRate(cmd);
 

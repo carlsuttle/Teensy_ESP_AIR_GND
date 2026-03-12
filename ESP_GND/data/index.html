@@ -70,11 +70,11 @@
     <section id="tab-link" class="tab">
       <pre id="link"></pre>
       <h3>Stream</h3>
-      <div class="row"><label>Capture Hz</label><input id="sourceHz" type="number" min="1" max="400" step="1" value="50" /></div>
-      <div class="row"><label>Download Hz</label><input id="downloadHz" type="number" min="1" max="30" step="1" value="30" /></div>
-      <div class="row"><label>UI Hz</label><input id="uiHz" type="number" min="1" max="30" step="1" value="20" /></div>
+      <div class="row"><label>Capture / Log Hz</label><input id="sourceHz" type="number" min="1" max="400" step="1" value="50" /></div>
+      <div class="row"><label>Download Hz</label><span>30 (fixed)</span></div>
+      <div class="row"><label>UI Hz</label><span>30 (fixed)</span></div>
       <div class="row"><label>AIR Recorder</label><span id="airLoggerText">Checking AIR recorder...</span></div>
-      <button id="applyRate">Apply Rates</button>
+      <button id="applyRate">Apply Capture Hz</button>
     </section>
     <section id="tab-logs" class="tab">
       <pre id="logs"></pre>
@@ -95,6 +95,6 @@
     </section>
   </main>
 
-  <script src="/app.js?v=20260311c"></script>
+  <script src="/app.js?v=20260311d"></script>
 </body>
 </html>

@@ -32,8 +32,8 @@ void setDefaults(AppConfig& c) {
   strncpy(c.ap_ssid, "Telemetry", sizeof(c.ap_ssid) - 1);
   strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
   c.source_rate_hz = 50;
-  c.ui_rate_hz = 20;
-  c.log_rate_hz = 30;
+  c.ui_rate_hz = 30;
+  c.log_rate_hz = 50;
   c.log_mode = 1;
   c.radio_state_only = 0;
   c.max_log_bytes = 4UL * 1024UL * 1024UL;
@@ -41,8 +41,8 @@ void setDefaults(AppConfig& c) {
 
 void sanitize(AppConfig& c) {
   c.source_rate_hz = clampv<uint16_t>(c.source_rate_hz, 1U, 400U);
-  c.ui_rate_hz = clampv<uint16_t>(c.ui_rate_hz, 1U, 30U);
-  c.log_rate_hz = clampv<uint16_t>(c.log_rate_hz, 1U, 30U);
+  c.ui_rate_hz = 30U;
+  c.log_rate_hz = c.source_rate_hz;
   c.log_mode = 1;
   c.radio_state_only = c.radio_state_only ? 1U : 0U;
   if (c.max_log_bytes < 512UL * 1024UL) c.max_log_bytes = 512UL * 1024UL;

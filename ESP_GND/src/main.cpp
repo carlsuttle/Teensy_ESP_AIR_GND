@@ -18,12 +18,13 @@ bool g_link_streaming = false;
 bool g_air_ready = false;
 bool g_air_wait_announced = false;
 uint16_t g_last_configured_source_rate_hz = 0U;
-uint16_t g_last_configured_download_rate_hz = 0U;
 uint8_t g_last_configured_radio_state_only = 0U;
 uint32_t g_last_air_ack_seq = 0U;
 bool g_pending_stream_rate_apply = true;
 bool g_pending_radio_mode_apply = true;
 constexpr uint32_t kAirConfigRetryMs = 1000U;
+constexpr uint16_t kNormalDownlinkRateHz = 30U;
+constexpr uint16_t kNormalUiRateHz = 30U;
 
 void scheduleAirStreamRateApply() {
   g_pending_stream_rate_apply = true;
@@ -73,7 +74,7 @@ bool sendConfiguredRadioModeToAir() {
   telem::CmdSetRadioModeV1 cmd = {};
   cmd.state_only = config_store::get().radio_state_only ? 1U : 0U;
   cmd.control_rate_hz = 2U;
-  cmd.telem_rate_hz = config_store::get().log_rate_hz;
+  cmd.telem_rate_hz = kNormalDownlinkRateHz;
   return radio_link::sendSetRadioMode(cmd);
 }
 
@@ -81,11 +82,6 @@ void syncConfiguredAirTargets() {
   const AppConfig& cfg = config_store::get();
   if (cfg.source_rate_hz != g_last_configured_source_rate_hz) {
     g_last_configured_source_rate_hz = cfg.source_rate_hz;
-    scheduleAirStreamRateApply();
-  }
-  if (cfg.log_rate_hz != g_last_configured_download_rate_hz) {
-    g_last_configured_download_rate_hz = cfg.log_rate_hz;
-    scheduleAirRadioModeApply();
     scheduleAirStreamRateApply();
   }
   if (cfg.radio_state_only != g_last_configured_radio_state_only) {
@@ -107,12 +103,14 @@ void handleConsoleCommands() {
         scheduleAirConfigApply();
         const bool mode_ok = sendConfiguredRadioModeToAir();
         const bool rate_ok = sendConfiguredStreamRateToAir();
-        Serial.printf("KICKAIR mode_ok=%u rate_ok=%u target=%s ws_hz=%u log_hz=%u state_only=%u\n",
+        Serial.printf("KICKAIR mode_ok=%u rate_ok=%u target=%s capture_hz=%u log_hz=%u downlink_hz=%u ui_hz=%u state_only=%u\n",
                       mode_ok ? 1U : 0U,
                       rate_ok ? 1U : 0U,
                       radio_link::targetSenderMac().c_str(),
                       (unsigned)cfg.source_rate_hz,
                       (unsigned)cfg.log_rate_hz,
+                      (unsigned)kNormalDownlinkRateHz,
+                      (unsigned)kNormalUiRateHz,
                       (unsigned)cfg.radio_state_only);
       } else if (line.equalsIgnoreCase("resetair")) {
         const bool ok = radio_link::sendResetNetwork();
@@ -318,7 +316,6 @@ void setup() {
 
   radio_link::begin(cfg);
   g_last_configured_source_rate_hz = cfg.source_rate_hz;
-  g_last_configured_download_rate_hz = cfg.log_rate_hz;
   g_last_configured_radio_state_only = cfg.radio_state_only;
   scheduleAirConfigApply();
   Serial.printf("GND READY ap ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",

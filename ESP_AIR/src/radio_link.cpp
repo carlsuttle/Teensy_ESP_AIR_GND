@@ -18,7 +18,8 @@ constexpr size_t kRxQueueCapacity = 8U;
 constexpr uint32_t kHelloIntervalMs = 500U;
 constexpr uint32_t kPeerStaleMs = 2000U;
 constexpr uint32_t kRssiSampleIntervalMs = 5000U;
-constexpr uint16_t kDefaultRadioTelemRateHz = 30U;
+constexpr uint16_t kUnifiedDownlinkRateHz = 30U;
+constexpr uint16_t kUnifiedGpsRateHz = 10U;
 constexpr uint8_t kDefaultRadioControlRateHz = 2U;
 constexpr uint8_t kSendFailThreshold = 24U;
 constexpr size_t kTxQueueCapacity = 24U;
@@ -65,6 +66,7 @@ uint8_t g_consecutive_send_failures = 0U;
 uint8_t g_radio_control_rate_hz = kDefaultRadioControlRateHz;
 uint32_t g_last_hello_tx_ms = 0U;
 uint32_t g_last_telem_tx_ms = 0U;
+uint32_t g_last_gps_tx_ms = 0U;
 uint32_t g_last_control_tx_ms = 0U;
 uint32_t g_last_rssi_sample_ms = 0U;
 uint32_t g_last_state_seq = 0U;
@@ -75,7 +77,7 @@ uint32_t g_log_session_id = 0U;
 uint32_t g_log_last_change_ms = 0U;
 uint16_t g_log_last_command = 0U;
 uint16_t g_control_ack_command = 0U;
-uint16_t g_radio_telem_rate_hz = kDefaultRadioTelemRateHz;
+uint16_t g_radio_telem_rate_hz = kUnifiedDownlinkRateHz;
 int16_t g_gnd_ap_rssi_dbm = 0;
 uint32_t g_control_ack_code = 0U;
 uint8_t g_tx_head = 0U;
@@ -207,6 +209,7 @@ void clearPeerState() {
   g_control_ack_ok = false;
   g_last_hello_tx_ms = 0U;
   g_last_telem_tx_ms = 0U;
+  g_last_gps_tx_ms = 0U;
   g_last_control_tx_ms = 0U;
   clearTxQueue();
 }
@@ -507,23 +510,8 @@ void captureSnapshotAck(const uart_telem::Snapshot& snap) {
   g_control_ack_ok = snap.ack_ok;
 }
 
-bool maybeSendTelemetryState(const uart_telem::Snapshot& snap) {
-  if (!snap.has_state || !g_has_gnd_mac) return false;
-  const uint32_t now = millis();
-  const uint32_t interval_ms = rateIntervalMs(g_radio_telem_rate_hz);
-  if (g_last_telem_tx_ms != 0U && (uint32_t)(now - g_last_telem_tx_ms) < interval_ms) return false;
-  if (!publishState(snap.state, snap.seq, snap.t_us)) return false;
-  g_last_telem_tx_ms = now;
-  return true;
-}
-
-bool maybeSendControlStatus(const uart_telem::Snapshot& snap) {
-  if (!g_has_gnd_mac) return false;
-  const uint32_t now = millis();
-  const uint32_t interval_ms = rateIntervalMs(g_radio_control_rate_hz);
-  if (g_last_control_tx_ms != 0U && (uint32_t)(now - g_last_control_tx_ms) < interval_ms) return false;
-
-  telem::ControlStatusPayloadV1 control = {};
+void fillControlStatus(const uart_telem::Snapshot& snap, telem::ControlStatusPayloadV1& control) {
+  control = {};
   control.control_rate_hz = g_radio_control_rate_hz;
 
   if (g_control_has_ack) {
@@ -549,9 +537,86 @@ bool maybeSendControlStatus(const uart_telem::Snapshot& snap) {
 
   control.flags |= telem::kControlStatusFlagHasLogStatus;
   control.log_status = currentLogStatus();
+  control.mirror_tx_ok = snap.state.mirror_tx_ok;
+  control.mirror_drop_count = snap.state.mirror_drop_count;
+}
 
-  if (!sendFrame(telem::TELEM_CONTROL_STATUS, &control, sizeof(control), 0U, micros())) return false;
-  g_last_control_tx_ms = now;
+void fillFastState(const telem::TelemetryFullStateV1& state, telem::DownlinkFastStateV1& fast) {
+  fast.roll_deg = state.roll_deg;
+  fast.pitch_deg = state.pitch_deg;
+  fast.yaw_deg = state.yaw_deg;
+  fast.last_imu_ms = state.last_imu_ms;
+  fast.baro_temp_c = state.baro_temp_c;
+  fast.baro_press_hpa = state.baro_press_hpa;
+  fast.baro_alt_m = state.baro_alt_m;
+  fast.baro_vsi_mps = state.baro_vsi_mps;
+  fast.last_baro_ms = state.last_baro_ms;
+  fast.flags = state.flags;
+}
+
+void fillGpsState(const telem::TelemetryFullStateV1& state, telem::DownlinkGpsStateV1& gps) {
+  gps.iTOW_ms = state.iTOW_ms;
+  gps.fixType = state.fixType;
+  gps.numSV = state.numSV;
+  gps.lat_1e7 = state.lat_1e7;
+  gps.lon_1e7 = state.lon_1e7;
+  gps.hMSL_mm = state.hMSL_mm;
+  gps.gSpeed_mms = state.gSpeed_mms;
+  gps.headMot_1e5deg = state.headMot_1e5deg;
+  gps.hAcc_mm = state.hAcc_mm;
+  gps.sAcc_mms = state.sAcc_mms;
+  gps.gps_parse_errors = state.gps_parse_errors;
+  gps.last_gps_ms = state.last_gps_ms;
+}
+
+bool maybeSendUnifiedDownlink(const uart_telem::Snapshot& snap) {
+  if (!snap.has_state || !g_has_gnd_mac) return false;
+
+  const uint32_t now = millis();
+  const uint32_t telem_interval_ms = rateIntervalMs(g_radio_telem_rate_hz);
+  if (g_last_telem_tx_ms != 0U && (uint32_t)(now - g_last_telem_tx_ms) < telem_interval_ms) return false;
+
+  telem::UnifiedDownlinkBaseV1 base = {};
+  base.source_seq = snap.seq;
+  fillFastState(snap.state, base.fast);
+
+  uint8_t payload[telem::kEspNowMaxDataLen - sizeof(telem::FrameHeader)] = {};
+  size_t payload_len = sizeof(base);
+  bool included_gps = false;
+  bool included_control = false;
+  memcpy(payload, &base, sizeof(base));
+
+  const uint32_t gps_interval_ms = rateIntervalMs(kUnifiedGpsRateHz);
+  if (g_last_gps_tx_ms == 0U || (uint32_t)(now - g_last_gps_tx_ms) >= gps_interval_ms) {
+    telem::DownlinkGpsStateV1 gps = {};
+    fillGpsState(snap.state, gps);
+    memcpy(payload + payload_len, &gps, sizeof(gps));
+    payload_len += sizeof(gps);
+    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |= telem::kUnifiedDownlinkFlagHasGps;
+    included_gps = true;
+  }
+
+  const uint32_t control_interval_ms = rateIntervalMs(g_radio_control_rate_hz);
+  if (g_last_control_tx_ms == 0U || (uint32_t)(now - g_last_control_tx_ms) >= control_interval_ms) {
+    telem::ControlStatusPayloadV1 control = {};
+    fillControlStatus(snap, control);
+    memcpy(payload + payload_len, &control, sizeof(control));
+    payload_len += sizeof(control);
+    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |= telem::kUnifiedDownlinkFlagHasControl;
+    included_control = true;
+  }
+
+  if (!sendFrame(telem::TELEM_UNIFIED_DOWNLINK, payload, payload_len, 0U, snap.t_us)) return false;
+  g_last_state_seq = snap.seq;
+  g_last_telem_tx_ms = now;
+  if (included_gps) g_last_gps_tx_ms = now;
+  if (included_control) {
+    g_last_control_tx_ms = now;
+    g_control_has_ack = false;
+    g_control_ack_command = 0U;
+    g_control_ack_code = 0U;
+    g_control_ack_ok = false;
+  }
   return true;
 }
 
@@ -635,7 +700,8 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       const bool new_state_only = cmd.state_only != 0U;
       const uint8_t new_control_rate_hz =
           constrain((uint8_t)(cmd.control_rate_hz == 0U ? kDefaultRadioControlRateHz : cmd.control_rate_hz), 1U, 10U);
-      const uint16_t new_telem_rate_hz = constrain((uint16_t)cmd.telem_rate_hz, 1U, 30U);
+      const uint16_t new_telem_rate_hz =
+          new_state_only ? constrain((uint16_t)cmd.telem_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
       const bool changed = new_state_only != g_state_only_mode || new_control_rate_hz != g_radio_control_rate_hz ||
                            new_telem_rate_hz != g_radio_telem_rate_hz;
       g_state_only_mode = new_state_only;
@@ -644,6 +710,7 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       if (changed) {
         g_last_hello_tx_ms = 0U;
         g_last_telem_tx_ms = 0U;
+        g_last_gps_tx_ms = 0U;
         g_last_control_tx_ms = 0U;
         markLogStatusDirty();
       }
@@ -769,7 +836,7 @@ void begin(const AppConfig& cfg) {
   g_network_reset_requested = false;
   g_state_only_mode = cfg.radio_state_only != 0U;
   g_radio_control_rate_hz = kDefaultRadioControlRateHz;
-  g_radio_telem_rate_hz = constrain((uint16_t)cfg.log_rate_hz, 1U, 30U);
+  g_radio_telem_rate_hz = g_state_only_mode ? constrain((uint16_t)cfg.log_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
   g_control_has_ack = false;
   g_control_ack_command = 0U;
   g_control_ack_code = 0U;
@@ -784,7 +851,7 @@ void begin(const AppConfig& cfg) {
 void reconfigure(const AppConfig& cfg) {
   g_state_only_mode = cfg.radio_state_only != 0U;
   g_radio_control_rate_hz = kDefaultRadioControlRateHz;
-  g_radio_telem_rate_hz = constrain((uint16_t)cfg.log_rate_hz, 1U, 30U);
+  g_radio_telem_rate_hz = g_state_only_mode ? constrain((uint16_t)cfg.log_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
   if (!initEspNow()) return;
   (void)ensurePeer(kBroadcastMac);
   if (g_has_gnd_mac) {
@@ -808,8 +875,7 @@ void poll() {
 void publish(const uart_telem::Snapshot& snap) {
   captureSnapshotAck(snap);
   if (stateOnlyModeEnabled()) return;
-  (void)maybeSendTelemetryState(snap);
-  (void)maybeSendControlStatus(snap);
+  (void)maybeSendUnifiedDownlink(snap);
 }
 
 bool publishState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {

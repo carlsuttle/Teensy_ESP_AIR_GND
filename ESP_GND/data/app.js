@@ -337,6 +337,11 @@ function fmt(v, n = 3) {
   return Number(v).toFixed(n);
 }
 
+function fmtMs(v) {
+  if (v === null || v === undefined || v === "-" || Number.isNaN(v) || Number(v) <= 0) return "-";
+  return `${Math.round(Number(v))} ms`;
+}
+
 function dash(v) {
   return (v === null || v === undefined || Number.isNaN(v)) ? "-" : String(v);
 }
@@ -660,19 +665,19 @@ function renderStale() {
   renderBaroStale();
   renderLinkStale();
   renderLogsStale();
-  statsEl.textContent = `state_fps: - | seq: - | ctrl: - | state: - | ping: - ms | radio: - ms | avg: - ms`;
+  statsEl.textContent = `state_fps: - | seq: - | ctrl: - | state: - | ping: - | radio: - | avg: -`;
 }
 
 function renderHeader() {
-  const pingTxt = isPongFresh() ? String(pingMs ?? "-") : "-";
-  const pingAvgTxt = isPongFresh() ? String(pingAvgMs ?? "-") : "-";
-  const radioRttTxt = linkStatus.air_link_fresh && linkStatus.radio_rtt_ms ? String(linkStatus.radio_rtt_ms) : "-";
+  const pingTxt = isPongFresh() ? pingMs : null;
+  const pingAvgTxt = isPongFresh() ? pingAvgMs : null;
+  const radioRttTxt = linkStatus.air_link_fresh ? linkStatus.radio_rtt_ms : null;
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
   const seqTxt = lastSourceSeq > 0 ? String(lastSourceSeq) : "-";
   const ctrlTxt = isCtrlOpen() ? "open" : "closed";
   const stateTxt = isStateOpen() ? "open" : "closed";
   statsEl.textContent =
-    `state_fps: ${stateFpsTxt} | seq: ${seqTxt} | ctrl: ${ctrlTxt} | state: ${stateTxt} | ping: ${pingTxt} ms | radio: ${radioRttTxt} ms | avg: ${pingAvgTxt} ms`;
+    `state_fps: ${stateFpsTxt} | seq: ${seqTxt} | ctrl: ${ctrlTxt} | state: ${stateTxt} | ping: ${fmtMs(pingTxt)} | radio: ${fmtMs(radioRttTxt)} | avg: ${fmtMs(pingAvgTxt)}`;
 }
 
 function renderGpsPanel() {
@@ -711,11 +716,10 @@ temp: ${fmt(baro.t, 2)} C`;
 }
 
 function renderLinkPanel() {
-  const pingTxt = isPongFresh() ? String(pingMs ?? "-") : "-";
-  const pingAvgTxt = isPongFresh() ? String(pingAvgMs ?? "-") : "-";
-  const radioRttTxt = linkStatus.air_link_fresh && linkStatus.radio_rtt_ms ? String(linkStatus.radio_rtt_ms) : "-";
-  const radioRttAvgTxt =
-    linkStatus.air_link_fresh && linkStatus.radio_rtt_avg_ms ? String(linkStatus.radio_rtt_avg_ms) : "-";
+  const pingTxt = isPongFresh() ? pingMs : null;
+  const pingAvgTxt = isPongFresh() ? pingAvgMs : null;
+  const radioRttTxt = linkStatus.air_link_fresh ? linkStatus.radio_rtt_ms : null;
+  const radioRttAvgTxt = linkStatus.air_link_fresh ? linkStatus.radio_rtt_avg_ms : null;
   const radioStateFpsTxt = linkStatus.air_link_fresh && radioStateFps !== null ? fmt(radioStateFps, 1) : "-";
   const ctrlSocketTxt = isCtrlOpen() ? "open" : "closed";
   const stateSocketTxt = isStateOpen() ? "open" : "closed";
@@ -733,7 +737,7 @@ function renderLinkPanel() {
   const airLinkTxt = linkStatus.air_link_fresh ? "up" : "waiting";
   const airRadioTxt = linkStatus.air_radio_ready ? "ready" : "starting";
   const airPeerTxt = linkStatus.air_peer_known ? "known" : "discovering";
-  const radioModeTxt = linkStatus.radio_state_only ? "state-only stress" : "mixed";
+  const radioModeTxt = linkStatus.radio_state_only ? "state-only stress" : "normal unified";
   const airRssiTxt = fmtRssi(linkStatus.air_rssi_valid, linkStatus.air_rssi_dbm);
   const airScanAgeTxt = dash(linkStatus.air_scan_age_ms);
   const airLinkAgeTxt = dash(linkStatus.air_link_age_ms);
@@ -750,8 +754,8 @@ air_rssi: ${airRssiTxt}
 air_scan_age_ms: ${airScanAgeTxt}
 air_link_age_ms: ${airLinkAgeTxt}
 air_recorder: ${airRecorderTxt}
-radio_rtt: ${radioRttTxt} ms
-radio_rtt_avg: ${radioRttAvgTxt} ms
+radio_rtt: ${fmtMs(radioRttTxt)}
+radio_rtt_avg: ${fmtMs(radioRttAvgTxt)}
 radio_state_fps: ${radioStateFpsTxt}
 ap_clients: ${dash(linkStatus.ap_clients)}
 ctrl_ws: ${ctrlSocketTxt}
@@ -775,8 +779,8 @@ ctrl_reconnects: ${ctrlReconnectTxt}
 state_reconnects: ${stateReconnectTxt}
 ctrl_last_close: ${ctrlLastCloseTxt}
 state_last_close: ${stateLastCloseTxt}
-ping: ${pingTxt} ms
-ping_avg: ${pingAvgTxt} ms`;
+ping: ${fmtMs(pingTxt)}
+ping_avg: ${fmtMs(pingAvgTxt)}`;
 }
 
 function renderLogsPanel() {
@@ -1021,9 +1025,7 @@ function handleCtrlMessage(text) {
     return;
   }
   if (m.type === "config") {
-    document.getElementById("sourceHz").value = m.source_rate_hz ?? 50;
-    document.getElementById("downloadHz").value = m.download_rate_hz ?? m.log_rate_hz ?? 30;
-    document.getElementById("uiHz").value = m.ui_rate_hz ?? 20;
+    document.getElementById("sourceHz").value = m.source_rate_hz ?? m.capture_rate_hz ?? m.log_rate_hz ?? 50;
     uiDirty = true;
     linkDirty = true;
     return;
@@ -1305,8 +1307,6 @@ document.getElementById("recoverySlider").addEventListener("change", () => {
 document.getElementById("applyRate").addEventListener("click", async () => {
   const body = {
     source_rate_hz: Math.min(400, parseInt(document.getElementById("sourceHz").value, 10)),
-    download_rate_hz: Math.min(30, parseInt(document.getElementById("downloadHz").value, 10)),
-    ui_rate_hz: Math.min(30, parseInt(document.getElementById("uiHz").value, 10)),
     radio_state_only: false
   };
   await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -1314,9 +1314,7 @@ document.getElementById("applyRate").addEventListener("click", async () => {
     const resp = await fetch("/api/config");
     if (resp.ok) {
       const cfg = await resp.json();
-      document.getElementById("sourceHz").value = cfg.source_rate_hz ?? 50;
-      document.getElementById("downloadHz").value = cfg.download_rate_hz ?? cfg.log_rate_hz ?? 30;
-      document.getElementById("uiHz").value = cfg.ui_rate_hz ?? 20;
+      document.getElementById("sourceHz").value = cfg.source_rate_hz ?? cfg.capture_rate_hz ?? cfg.log_rate_hz ?? 50;
     }
   } catch (_err) {
   }

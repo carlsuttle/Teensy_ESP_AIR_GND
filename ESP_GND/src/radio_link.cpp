@@ -356,6 +356,120 @@ void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_
   }
 }
 
+void applyControlStatusPayload(const telem::ControlStatusPayloadV1& control, const telem::FrameHeader& hdr) {
+  if ((control.flags & telem::kControlStatusFlagHasAck) != 0U) {
+    g_snapshot.has_ack = true;
+    g_snapshot.ack_command = control.ack_command;
+    g_snapshot.ack_ok = (control.flags & telem::kControlStatusFlagAckOk) != 0U;
+    g_snapshot.ack_code = control.ack_code;
+    g_snapshot.ack_rx_seq = hdr.seq;
+  }
+  if ((control.flags & telem::kControlStatusFlagHasFusion) != 0U) {
+    g_snapshot.fusion_settings = control.fusion;
+    g_snapshot.has_fusion_settings = true;
+    g_snapshot.state.fusion_gain = control.fusion.gain;
+    g_snapshot.state.fusion_accel_rej = control.fusion.accelerationRejection;
+    g_snapshot.state.fusion_mag_rej = control.fusion.magneticRejection;
+    g_snapshot.state.fusion_recovery_period = control.fusion.recoveryTriggerPeriod;
+  }
+  if ((control.flags & telem::kControlStatusFlagHasLinkMeta) != 0U) {
+    g_snapshot.link_meta = control.link_meta;
+    g_snapshot.has_link_meta = true;
+  }
+  if ((control.flags & telem::kControlStatusFlagHasLogStatus) != 0U) {
+    g_snapshot.log_status = control.log_status;
+    g_snapshot.has_log_status = true;
+  }
+  g_snapshot.state.mirror_tx_ok = control.mirror_tx_ok;
+  g_snapshot.state.mirror_drop_count = control.mirror_drop_count;
+}
+
+void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload) {
+  if (hdr.payload_len < sizeof(telem::UnifiedDownlinkBaseV1)) {
+    g_snapshot.stats.len_err++;
+    return;
+  }
+
+  telem::UnifiedDownlinkBaseV1 base = {};
+  memcpy(&base, payload, sizeof(base));
+
+  size_t offset = sizeof(base);
+  telem::DownlinkGpsStateV1 gps = {};
+  telem::ControlStatusPayloadV1 control = {};
+
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasGps) != 0U) {
+    if (offset + sizeof(gps) > hdr.payload_len) {
+      g_snapshot.stats.len_err++;
+      return;
+    }
+    memcpy(&gps, payload + offset, sizeof(gps));
+    offset += sizeof(gps);
+  }
+
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasControl) != 0U) {
+    if (offset + sizeof(control) > hdr.payload_len) {
+      g_snapshot.stats.len_err++;
+      return;
+    }
+    memcpy(&control, payload + offset, sizeof(control));
+    offset += sizeof(control);
+  }
+
+  if (offset != hdr.payload_len) {
+    g_snapshot.stats.len_err++;
+    return;
+  }
+
+  if (g_has_last_state_seq) {
+    if (hdr.seq > g_last_state_seq) {
+      g_snapshot.stats.state_seq_gap += (hdr.seq - g_last_state_seq - 1U);
+      g_last_state_seq = hdr.seq;
+    } else {
+      g_snapshot.stats.state_seq_rewind++;
+    }
+  } else {
+    g_last_state_seq = hdr.seq;
+    g_has_last_state_seq = true;
+  }
+
+  g_snapshot.state.roll_deg = base.fast.roll_deg;
+  g_snapshot.state.pitch_deg = base.fast.pitch_deg;
+  g_snapshot.state.yaw_deg = base.fast.yaw_deg;
+  g_snapshot.state.last_imu_ms = base.fast.last_imu_ms;
+  g_snapshot.state.baro_temp_c = base.fast.baro_temp_c;
+  g_snapshot.state.baro_press_hpa = base.fast.baro_press_hpa;
+  g_snapshot.state.baro_alt_m = base.fast.baro_alt_m;
+  g_snapshot.state.baro_vsi_mps = base.fast.baro_vsi_mps;
+  g_snapshot.state.last_baro_ms = base.fast.last_baro_ms;
+  g_snapshot.state.flags = base.fast.flags;
+
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasGps) != 0U) {
+    g_snapshot.state.iTOW_ms = gps.iTOW_ms;
+    g_snapshot.state.fixType = gps.fixType;
+    g_snapshot.state.numSV = gps.numSV;
+    g_snapshot.state.lat_1e7 = gps.lat_1e7;
+    g_snapshot.state.lon_1e7 = gps.lon_1e7;
+    g_snapshot.state.hMSL_mm = gps.hMSL_mm;
+    g_snapshot.state.gSpeed_mms = gps.gSpeed_mms;
+    g_snapshot.state.headMot_1e5deg = gps.headMot_1e5deg;
+    g_snapshot.state.hAcc_mm = gps.hAcc_mm;
+    g_snapshot.state.sAcc_mms = gps.sAcc_mms;
+    g_snapshot.state.gps_parse_errors = gps.gps_parse_errors;
+    g_snapshot.state.last_gps_ms = gps.last_gps_ms;
+  }
+
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasControl) != 0U) {
+    applyControlStatusPayload(control, hdr);
+  }
+
+  g_snapshot.has_state = true;
+  g_snapshot.seq = base.source_seq;
+  g_snapshot.t_us = hdr.t_us;
+  g_snapshot.stats.frames_ok++;
+  g_snapshot.stats.state_packets++;
+  g_snapshot.stats.last_rx_ms = millis();
+}
+
 void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
   switch ((telem::MsgType)hdr.msg_type) {
     case telem::TELEM_FULL_STATE:
@@ -381,6 +495,9 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.state_packets++;
       g_snapshot.stats.last_rx_ms = millis();
+      break;
+    case telem::TELEM_UNIFIED_DOWNLINK:
+      applyUnifiedDownlink(hdr, payload);
       break;
     case telem::TELEM_FUSION_SETTINGS:
       if (hdr.payload_len != sizeof(telem::FusionSettingsV1)) {
@@ -419,25 +536,7 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::ControlStatusPayloadV1 control = {};
       memcpy(&control, payload, sizeof(control));
-      if ((control.flags & telem::kControlStatusFlagHasAck) != 0U) {
-        g_snapshot.has_ack = true;
-        g_snapshot.ack_command = control.ack_command;
-        g_snapshot.ack_ok = (control.flags & telem::kControlStatusFlagAckOk) != 0U;
-        g_snapshot.ack_code = control.ack_code;
-        g_snapshot.ack_rx_seq = hdr.seq;
-      }
-      if ((control.flags & telem::kControlStatusFlagHasFusion) != 0U) {
-        g_snapshot.fusion_settings = control.fusion;
-        g_snapshot.has_fusion_settings = true;
-      }
-      if ((control.flags & telem::kControlStatusFlagHasLinkMeta) != 0U) {
-        g_snapshot.link_meta = control.link_meta;
-        g_snapshot.has_link_meta = true;
-      }
-      if ((control.flags & telem::kControlStatusFlagHasLogStatus) != 0U) {
-        g_snapshot.log_status = control.log_status;
-        g_snapshot.has_log_status = true;
-      }
+      applyControlStatusPayload(control, hdr);
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.last_rx_ms = millis();
       break;

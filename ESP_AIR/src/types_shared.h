@@ -32,6 +32,7 @@ enum MsgType : uint16_t {
   TELEM_FUSION_SETTINGS = 4,
   TELEM_LOG_STATUS = 5,
   TELEM_CONTROL_STATUS = 6,
+  TELEM_UNIFIED_DOWNLINK = 7,
   CMD_SET_FUSION_SETTINGS = 100,
   CMD_GET_FUSION_SETTINGS = 101,
   CMD_SET_STREAM_RATE = 102,
@@ -91,6 +92,45 @@ struct TelemetryFullStateV1 {
   float fusion_mag_rej;
   uint16_t fusion_recovery_period;
   uint16_t flags;
+};
+
+static constexpr uint8_t kUnifiedDownlinkFlagHasGps = 1U << 0;
+static constexpr uint8_t kUnifiedDownlinkFlagHasControl = 1U << 1;
+
+struct DownlinkFastStateV1 {
+  float roll_deg;
+  float pitch_deg;
+  float yaw_deg;
+  uint32_t last_imu_ms;
+  float baro_temp_c;
+  float baro_press_hpa;
+  float baro_alt_m;
+  float baro_vsi_mps;
+  uint32_t last_baro_ms;
+  uint16_t flags;
+};
+
+struct DownlinkGpsStateV1 {
+  uint32_t iTOW_ms;
+  uint8_t fixType;
+  uint8_t numSV;
+  int32_t lat_1e7;
+  int32_t lon_1e7;
+  int32_t hMSL_mm;
+  int32_t gSpeed_mms;
+  int32_t headMot_1e5deg;
+  uint32_t hAcc_mm;
+  uint32_t sAcc_mms;
+  uint32_t gps_parse_errors;
+  uint32_t last_gps_ms;
+};
+
+struct UnifiedDownlinkBaseV1 {
+  uint8_t section_flags;
+  uint8_t reserved0;
+  uint16_t reserved1;
+  uint32_t source_seq;
+  DownlinkFastStateV1 fast;
 };
 
 struct CmdSetFusionSettingsV1 {
@@ -165,6 +205,8 @@ struct ControlStatusPayloadV1 {
   FusionSettingsV1 fusion;
   LinkMetaPayloadV1 link_meta;
   LogStatusPayloadV1 log_status;
+  uint32_t mirror_tx_ok;
+  uint32_t mirror_drop_count;
 };
 
 struct WsStateHeaderV1 {

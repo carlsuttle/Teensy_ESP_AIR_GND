@@ -71,17 +71,14 @@ function Parse-RateProfileText {
     throw "Rate profile text is empty."
   }
 
-  if ($Text -notmatch '^\s*(\d+)\s*/\s*(\d+)\s*$') {
-    throw "Invalid -RateProfile '$Text'. Use source/ui format such as 100/20."
+  if ($Text -notmatch '^\s*(\d+)(?:\s*/\s*(\d+))?\s*$') {
+    throw "Invalid -RateProfile '$Text'. Use source or source/ui format such as 100 or 100/30."
   }
 
   $sourceHz = [int]$matches[1]
-  $uiHz = [int]$matches[2]
+  $uiHz = 30
   if ($sourceHz -lt 1 -or $sourceHz -gt 400) {
     throw "source_rate_hz out of range in '$Text'. Expected 1..400."
-  }
-  if ($uiHz -lt 1 -or $uiHz -gt 30) {
-    throw "ui_rate_hz out of range in '$Text'. Expected 1..30."
   }
 
   return [ordered]@{
@@ -320,8 +317,6 @@ function Apply-RateProfile {
 
   $body = @{
     source_rate_hz = $Profile.SourceHz
-    download_rate_hz = $Profile.UiHz
-    ui_rate_hz = $Profile.UiHz
     radio_state_only = [bool]$StateOnly
   }
 
@@ -331,8 +326,8 @@ function Apply-RateProfile {
     return $false
   }
   if (($config.source_rate_hz -as [int]) -ne $Profile.SourceHz -or
-      ($config.download_rate_hz -as [int]) -ne $Profile.UiHz -or
-      ($config.ui_rate_hz -as [int]) -ne $Profile.UiHz -or
+      ($config.download_rate_hz -as [int]) -ne 30 -or
+      ($config.ui_rate_hz -as [int]) -ne 30 -or
       [bool]$config.radio_state_only -ne [bool]$StateOnly) {
     Write-EventLog "WARN" "MON" "profile_mismatch" (
       "requested={0} state_only={1} confirmed={2}/{3}/{4} state_only={5}" -f
