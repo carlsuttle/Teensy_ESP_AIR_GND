@@ -37,8 +37,8 @@ Current defaults:
 - accel rejection: `20 deg`
 - magnetic rejection: `60 deg`
 - recovery trigger period: `1200 samples` (`3.0 s @ 400 Hz`)
-- mirror/source stream rate default: `50 Hz`
-- mirror/log rate default: `50 Hz`
+- mirror/source capture rate default: `50 Hz`
+- mirror secondary rate field default: `50 Hz`
 
 ## Folder Structure
 
@@ -93,7 +93,7 @@ Main runtime responsibilities:
 - GPS polling/parser in the main loop
 - baro polling/filtering in the main loop
 - mirror RX command handling
-- mirror TX at runtime-configurable stream rate
+- mirror TX at runtime-configurable capture rate
 - CRSF telemetry scheduling
 - 2 Hz USB summary output
 
@@ -101,6 +101,12 @@ Implemented mirror command types:
 - `CMD_SET_FUSION_SETTINGS`
 - `CMD_GET_FUSION_SETTINGS`
 - `CMD_SET_STREAM_RATE`
+
+Current mirror-rate model:
+- `ws_rate_hz` is the Teensy capture/source transmit rate toward `ESP_AIR`
+- the second rate field is stored and reported for ESP coordination and AIR->GND download control
+- the Teensy mirror TX scheduler currently follows `ws_rate_hz`
+- the browser/UI rate is handled on `ESP_GND`, not here
 
 Implemented mirror outbound data:
 - full state frame
@@ -180,6 +186,7 @@ Observed in the current three-unit bench setup:
 - the Teensy mirror link recovers cleanly across AIR and GND reflashes/resets
 - fusion setting changes from the GND web UI are now applied and read back correctly
 - repeated system reflashes and resets have not shown bad behavior
+- the Teensy remains the high-rate side of the system; AIR/GND can now downsample the radio/web path independently
 
 For higher-level architecture notes, see:
 - [TELEMETRY_PIPELINE_SPEC.md](TELEMETRY_PIPELINE_SPEC.md)

@@ -8,7 +8,7 @@ Aircraft-side ESP32 project for the `Teensy_ESP_AIR_GND` split architecture.
 
 Current responsibilities:
 - ingest Teensy telemetry and ACK/NACK traffic over UART
-- forward latest telemetry, fusion settings, and command ACK/NACK to `ESP_GND` over bidirectional `ESP-NOW`
+- forward telemetry and control/status to `ESP_GND` over bidirectional `ESP-NOW`
 - receive commands from `ESP_GND` and relay them to the Teensy
 - publish AIR link metadata such as recorder state and approximate GND AP RSSI
 
@@ -21,13 +21,17 @@ Implemented transport behavior:
 - peer discovery uses `LINK_HELLO`
 - telemetry/control transport is `ESP-NOW`
 - command flow is bidirectional
-- command ACK/NACK is preserved end to end
+- normal mixed mode sends only 2 AIR->GND packet classes:
+  - telemetry state at the configured downlink rate
+  - combined control/status at `2 Hz`
+- stress testing can still switch AIR into state-only mode for rate characterization
 
 Implemented UART/bridge behavior:
 - UART bridge uses `UART1`
 - RX pin `3`, TX pin `4`
 - baud `921600`
 - Teensy telemetry is treated as the source of truth for state and fusion settings
+- Teensy capture/source rate is independent of AIR->GND download rate
 
 Implemented metadata behavior:
 - AIR reports whether radio is ready
@@ -38,9 +42,10 @@ Implemented metadata behavior:
 Current defaults:
 - AP SSID hint: `Telemetry`
 - AP password hint: `telemetry`
-- source rate: `50 Hz`
-- UI rate compatibility field: `20 Hz`
-- log rate compatibility field mirrors source rate
+- capture/source rate: `50 Hz`
+- download/radio telemetry rate: `30 Hz`
+- mixed-mode control/status rate: `2 Hz`
+- stress mode: off
 
 ## Logging
 
@@ -50,6 +55,7 @@ Current state:
 - `log_store` code remains in place
 - recorder state is exposed to GND/web UI
 - `kEnableAirFileLogging` is currently `false`
+- start/stop/status commands already flow through the radio link for later SD-card integration
 
 Reason:
 - there is still no finished quota/rotation/download workflow for onboard log files
@@ -98,6 +104,8 @@ Observed on the current bench setup:
 - AIR power cycles relink cleanly to GND
 - GND power cycles relink cleanly once the AP returns
 - repeated reflashes/resets have not shown bad transport behavior
+- normal mixed mode is intended for flight use
+- state-only mode is retained as a bench/stress tool
 
 ## Related Projects
 

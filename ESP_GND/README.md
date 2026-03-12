@@ -10,7 +10,7 @@ Ground-side ESP32 project for the `Teensy_ESP_AIR_GND` split architecture.
 
 Current responsibilities:
 - host the browser UI on `http://192.168.4.1/`
-- receive telemetry, fusion settings, ACK/NACK, and link metadata from AIR
+- receive telemetry plus bundled control/status from AIR
 - push latest state to the browser on `/ws_state`
 - accept browser control on `/ws_ctrl`
 - send fusion/rate/reset commands back to AIR
@@ -41,23 +41,29 @@ Implemented browser/control behavior:
 - websocket event CSV on `/api/ws_events`
 
 Current UI features:
-- GPS, Attitude, Baro, and Radio tabs
+- GPS, Attitude, Baro, Radio, and Logs tabs
 - live fusion control sliders
 - AIR link freshness and MAC display
 - AIR recorder state display
 - approximate AIR-side view of GND AP RSSI
+- separate `Capture Hz`, `Download Hz`, and `UI Hz` controls
 - AIR link reset button
 
 Current transport behavior:
 - bidirectional `ESP-NOW` command/data link
 - discovery/relink using `LINK_HELLO`
-- command ACK/NACK preserved
+- normal mixed mode uses only 2 AIR->GND radio packet classes:
+  - telemetry state at the configured download rate
+  - combined control/status at `2 Hz`
+- command ACK/NACK is still preserved end to end, but in normal mode it is bundled into the control/status packet
 - AIR reset and GND reset recovery verified on bench
+- state-only mode remains available for bench stress testing
 
 Current limitations:
 - file listing/download/delete APIs are still placeholders
 - authoritative file logging on AIR remains disabled in firmware
 - AIR RSSI shown in the UI is an approximation from AIR AP scanning, not native per-packet `ESP-NOW` RSSI
+- radio RTT probing is not part of the normal mixed-mode path
 
 ## Serial Console
 
@@ -100,6 +106,7 @@ Observed on the current bench setup:
 - short GND outages let the browser resume automatically
 - longer GND outages may require the phone/tablet to rejoin the AP, after which data resumes immediately
 - repeated reflashes and resets have shown no bad transport behavior
+- current normal-flight assumption is `Download Hz <= 30`
 
 ## Related Projects
 
