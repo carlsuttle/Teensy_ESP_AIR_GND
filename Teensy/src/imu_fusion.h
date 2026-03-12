@@ -30,6 +30,7 @@ void getGyroBiasDps(float& gx, float& gy, float& gz);
 void getAccelBiasMps2(float& ax, float& ay, float& az);
 void getGyroScale(float& lsbPerDps, float& dpsPerLsb);
 void getFusionSettings(float& gain, float& accelRejection, float& magRejection, uint16_t& recoveryPeriod);
+void getFusionFlags(bool& initialising, bool& angularRecovery, bool& accelerationRecovery, bool& magneticRecovery);
 bool setFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod);
 bool getImuConfig(ImuConfig& cfg);
 bool setImuConfig(const ImuConfig& cfg);

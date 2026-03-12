@@ -14,12 +14,17 @@ constexpr uint16_t kMsgTypeGetFusion = 101U;
 constexpr uint16_t kMsgTypeSetStreamRate = 102U;
 constexpr uint16_t kMsgTypeAck = 200U;
 constexpr uint16_t kMsgTypeNack = 201U;
+constexpr uint16_t kStateFlagGpsFix3d = 1U << 0;
+constexpr uint16_t kStateFlagFusionInitialising = 1U << 1;
+constexpr uint16_t kStateFlagFusionAngularRecovery = 1U << 2;
+constexpr uint16_t kStateFlagFusionAccelerationRecovery = 1U << 3;
+constexpr uint16_t kStateFlagFusionMagneticRecovery = 1U << 4;
 constexpr size_t kPacketMax = 512U;
 constexpr size_t kRxMax = 768U;
 constexpr uint16_t kDefaultStreamRateHz = 50U;
 constexpr uint16_t kDefaultLogRateHz = 50U;
 constexpr uint16_t kMinStreamRateHz = 1U;
-constexpr uint16_t kMaxStreamRateHz = 100U;
+constexpr uint16_t kMaxStreamRateHz = 400U;
 
 #pragma pack(push, 1)
 struct FrameHeader {
@@ -343,8 +348,18 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us) {
   payload.baro_vsi_mps = s.baro_vsi_mps;
   imu_fusion::getFusionSettings(payload.fusion_gain, payload.fusion_accel_rej, payload.fusion_mag_rej,
                                 payload.fusion_recovery_period);
+  bool fusionInitialising = false;
+  bool fusionAngularRecovery = false;
+  bool fusionAccelerationRecovery = false;
+  bool fusionMagneticRecovery = false;
+  imu_fusion::getFusionFlags(
+      fusionInitialising, fusionAngularRecovery, fusionAccelerationRecovery, fusionMagneticRecovery);
   payload.flags = 0U;
-  if (s.fixType >= 3U) payload.flags |= 0x0001U;
+  if (s.fixType >= 3U) payload.flags |= kStateFlagGpsFix3d;
+  if (fusionInitialising) payload.flags |= kStateFlagFusionInitialising;
+  if (fusionAngularRecovery) payload.flags |= kStateFlagFusionAngularRecovery;
+  if (fusionAccelerationRecovery) payload.flags |= kStateFlagFusionAccelerationRecovery;
+  if (fusionMagneticRecovery) payload.flags |= kStateFlagFusionMagneticRecovery;
 
   FrameHeader hdr{};
   hdr.magic = kMagic;

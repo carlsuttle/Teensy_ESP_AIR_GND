@@ -4,6 +4,12 @@ param(
   [string]$TeensyPort = "",
   [switch]$TeensyStats,
   [string]$OutDir = ".\\soak_logs",
+  [string]$GndBaseUrl = "http://192.168.4.1",
+  [switch]$StateOnly,
+  [string[]]$RateProfile = @(),
+  [int]$ProfileSettleSec = 10,
+  [int]$ProfileRunSec = 60,
+  [int]$StatusPollMs = 1000,
   [int]$Baud = 115200,
   [int]$StatsDelayMs = 2500,
   [int]$StatsRetryMs = 5000,
@@ -19,8 +25,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-if (-not $AirPort -and -not $GndPort -and -not $TeensyPort) {
-  throw "Specify at least one of -AirPort, -GndPort, or -TeensyPort."
+if (-not $AirPort -and -not $GndPort -and -not $TeensyPort -and $RateProfile.Count -eq 0) {
+  throw "Specify at least one of -AirPort, -GndPort, -TeensyPort, or -RateProfile."
 }
 
 $sessionStart = Get-Date
@@ -31,6 +37,18 @@ $script:EventPath = Join-Path $sessionDir "events.csv"
 $script:EventWriter = [System.IO.StreamWriter]::new($script:EventPath, $false, [System.Text.Encoding]::ASCII)
 $script:EventWriter.AutoFlush = $true
 $script:EventWriter.WriteLine("ts,level,unit,type,message")
+$script:StatusPath = Join-Path $sessionDir "status.csv"
+$script:StatusWriter = $null
+$script:ProfileSummaryPath = Join-Path $sessionDir "profiles.csv"
+$script:ProfileSummaryWriter = $null
+$script:Profiles = @()
+$script:CurrentProfileIndex = -1
+$script:CurrentProfile = $null
+$script:CurrentProfileAppliedAt = $null
+$script:CurrentProfileSummary = $null
+$script:NextStatusPollAt = $null
+$script:ProfilesFinished = $false
+$script:RestoreConfig = $null
 
 function Write-EventLog {
   param(
@@ -44,6 +62,380 @@ function Write-EventLog {
   $safeMessage = $Message.Replace('"', '""')
   $script:EventWriter.WriteLine(('{0},{1},{2},{3},"{4}"' -f $ts.ToString("o"), $Level, $Unit, $Type, $safeMessage))
   Write-Host ('[{0}] {1,-5} {2,-6} {3} {4}' -f $ts.ToString("HH:mm:ss.fff"), $Level, $Unit, $Type, $Message)
+}
+
+function Parse-RateProfileText {
+  param([string]$Text)
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    throw "Rate profile text is empty."
+  }
+
+  if ($Text -notmatch '^\s*(\d+)\s*/\s*(\d+)\s*$') {
+    throw "Invalid -RateProfile '$Text'. Use source/ui format such as 100/20."
+  }
+
+  $sourceHz = [int]$matches[1]
+  $uiHz = [int]$matches[2]
+  if ($sourceHz -lt 1 -or $sourceHz -gt 400) {
+    throw "source_rate_hz out of range in '$Text'. Expected 1..400."
+  }
+  if ($uiHz -lt 1 -or $uiHz -gt 30) {
+    throw "ui_rate_hz out of range in '$Text'. Expected 1..30."
+  }
+
+  return [ordered]@{
+    Name = ('{0}/{1}' -f $sourceHz, $uiHz)
+    SourceHz = $sourceHz
+    UiHz = $uiHz
+  }
+}
+
+function Init-RateProfiles {
+  if ($RateProfile.Count -eq 0) {
+    return
+  }
+
+  foreach ($entry in $RateProfile) {
+    foreach ($piece in ($entry -split ',')) {
+      $trimmed = $piece.Trim()
+      if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        continue
+      }
+      $script:Profiles += Parse-RateProfileText $trimmed
+    }
+  }
+
+  $script:StatusWriter = [System.IO.StreamWriter]::new($script:StatusPath, $false, [System.Text.Encoding]::ASCII)
+  $script:StatusWriter.AutoFlush = $true
+  $script:StatusWriter.WriteLine(
+    "ts,profile,phase,source_hz,ui_hz,air_link_fresh,seq,link_rx,state_packets,state_seq_gap,state_seq_rewind,ok,len_err,unknown_msg,drop,radio_rtt_ms,radio_rtt_avg_ms,air_rssi_dbm,air_link_age_ms,ap_clients"
+  )
+  $script:ProfileSummaryWriter = [System.IO.StreamWriter]::new($script:ProfileSummaryPath, $false, [System.Text.Encoding]::ASCII)
+  $script:ProfileSummaryWriter.AutoFlush = $true
+  $script:ProfileSummaryWriter.WriteLine(
+    "profile,source_hz,ui_hz,samples,duration_s,air_link_fresh_pct,state_rx_delta,state_gap_delta,state_rewind_delta,len_err_delta,unknown_msg_delta,drop_delta,radio_rtt_avg_ms,radio_rtt_max_ms,air_rssi_avg_dbm,air_rssi_min_dbm,effective_state_hz"
+  )
+  $script:NextStatusPollAt = Get-Date
+}
+
+function New-ProfileSummary {
+  param([System.Collections.Specialized.OrderedDictionary]$Profile)
+
+  return [ordered]@{
+    Name = $Profile.Name
+    SourceHz = $Profile.SourceHz
+    UiHz = $Profile.UiHz
+    Samples = 0
+    FreshSamples = 0
+    FirstAt = $null
+    LastAt = $null
+    FirstStatePackets = $null
+    LastStatePackets = $null
+    FirstStateGap = $null
+    LastStateGap = $null
+    FirstStateRewind = $null
+    LastStateRewind = $null
+    FirstLenErr = $null
+    LastLenErr = $null
+    FirstUnknownMsg = $null
+    LastUnknownMsg = $null
+    FirstDrop = $null
+    LastDrop = $null
+    RadioRttTotal = 0.0
+    RadioRttSamples = 0
+    RadioRttMax = 0.0
+    AirRssiTotal = 0.0
+    AirRssiSamples = 0
+    AirRssiMin = $null
+  }
+}
+
+function Delta-Counter {
+  param(
+    [object]$First,
+    [object]$Last
+  )
+
+  if ($null -eq $First -or $null -eq $Last) {
+    return 0
+  }
+
+  $firstValue = [double]$First
+  $lastValue = [double]$Last
+  if ($lastValue -ge $firstValue) {
+    return [int64]($lastValue - $firstValue)
+  }
+  return [int64]$lastValue
+}
+
+function Update-ProfileSummary {
+  param(
+    [object]$Status,
+    [datetime]$Timestamp
+  )
+
+  if (-not $script:CurrentProfile) {
+    return
+  }
+  if (-not $script:CurrentProfileSummary -or $script:CurrentProfileSummary.Name -ne $script:CurrentProfile.Name) {
+    $script:CurrentProfileSummary = New-ProfileSummary $script:CurrentProfile
+  }
+
+  $summary = $script:CurrentProfileSummary
+  if (-not $summary.FirstAt) {
+    $summary.FirstAt = $Timestamp
+    $summary.FirstStatePackets = ($Status.state_packets -as [int64])
+    $summary.FirstStateGap = ($Status.state_seq_gap -as [int64])
+    $summary.FirstStateRewind = ($Status.state_seq_rewind -as [int64])
+    $summary.FirstLenErr = ($Status.len_err -as [int64])
+    $summary.FirstUnknownMsg = ($Status.unknown_msg -as [int64])
+    $summary.FirstDrop = ($Status.drop -as [int64])
+  }
+
+  $summary.Samples++
+  if ($Status.air_link_fresh) {
+    $summary.FreshSamples++
+  }
+  $summary.LastAt = $Timestamp
+  $summary.LastStatePackets = ($Status.state_packets -as [int64])
+  $summary.LastStateGap = ($Status.state_seq_gap -as [int64])
+  $summary.LastStateRewind = ($Status.state_seq_rewind -as [int64])
+  $summary.LastLenErr = ($Status.len_err -as [int64])
+  $summary.LastUnknownMsg = ($Status.unknown_msg -as [int64])
+  $summary.LastDrop = ($Status.drop -as [int64])
+
+  $radioRttMs = ($Status.radio_rtt_ms -as [double])
+  if ($radioRttMs -gt 0) {
+    $summary.RadioRttTotal += $radioRttMs
+    $summary.RadioRttSamples++
+    if ($radioRttMs -gt $summary.RadioRttMax) {
+      $summary.RadioRttMax = $radioRttMs
+    }
+  }
+
+  if ($Status.air_rssi_valid) {
+    $airRssiDbm = ($Status.air_rssi_dbm -as [double])
+    $summary.AirRssiTotal += $airRssiDbm
+    $summary.AirRssiSamples++
+    if ($null -eq $summary.AirRssiMin -or $airRssiDbm -lt $summary.AirRssiMin) {
+      $summary.AirRssiMin = $airRssiDbm
+    }
+  }
+}
+
+function Write-ProfileSummary {
+  if (-not $script:ProfileSummaryWriter -or -not $script:CurrentProfileSummary) {
+    return
+  }
+
+  $summary = $script:CurrentProfileSummary
+  $durationSec = 0.0
+  if ($summary.FirstAt -and $summary.LastAt) {
+    $durationSec = ($summary.LastAt - $summary.FirstAt).TotalSeconds
+  }
+  $freshPct = if ($summary.Samples -gt 0) { [math]::Round((100.0 * $summary.FreshSamples) / $summary.Samples, 1) } else { 0.0 }
+  $stateRxDelta = Delta-Counter $summary.FirstStatePackets $summary.LastStatePackets
+  $stateGapDelta = Delta-Counter $summary.FirstStateGap $summary.LastStateGap
+  $stateRewindDelta = Delta-Counter $summary.FirstStateRewind $summary.LastStateRewind
+  $lenErrDelta = Delta-Counter $summary.FirstLenErr $summary.LastLenErr
+  $unknownMsgDelta = Delta-Counter $summary.FirstUnknownMsg $summary.LastUnknownMsg
+  $dropDelta = Delta-Counter $summary.FirstDrop $summary.LastDrop
+  $radioRttAvgMs = if ($summary.RadioRttSamples -gt 0) {
+    [math]::Round($summary.RadioRttTotal / $summary.RadioRttSamples, 2)
+  } else {
+    ""
+  }
+  $radioRttMaxMs = if ($summary.RadioRttSamples -gt 0) {
+    [math]::Round($summary.RadioRttMax, 2)
+  } else {
+    ""
+  }
+  $airRssiAvgDbm = if ($summary.AirRssiSamples -gt 0) {
+    [math]::Round($summary.AirRssiTotal / $summary.AirRssiSamples, 1)
+  } else {
+    ""
+  }
+  $airRssiMinDbm = if ($summary.AirRssiSamples -gt 0) {
+    [math]::Round([double]$summary.AirRssiMin, 1)
+  } else {
+    ""
+  }
+  $effectiveStateHz = if ($durationSec -gt 0) {
+    [math]::Round($stateRxDelta / $durationSec, 2)
+  } else {
+    0.0
+  }
+
+  $script:ProfileSummaryWriter.WriteLine(
+    ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16}' -f
+      $summary.Name,
+      $summary.SourceHz,
+      $summary.UiHz,
+      $summary.Samples,
+      ([math]::Round($durationSec, 3)),
+      $freshPct,
+      $stateRxDelta,
+      $stateGapDelta,
+      $stateRewindDelta,
+      $lenErrDelta,
+      $unknownMsgDelta,
+      $dropDelta,
+      $radioRttAvgMs,
+      $radioRttMaxMs,
+      $airRssiAvgDbm,
+      $airRssiMinDbm,
+      $effectiveStateHz
+    )
+  )
+  Write-EventLog "INFO" "MON" "profile_summary" (
+    "profile={0} rx_hz={1} gap={2} rewind={3} rtt_avg={4} rssi_avg={5}" -f
+      $summary.Name, $effectiveStateHz, $stateGapDelta, $stateRewindDelta, $radioRttAvgMs, $airRssiAvgDbm
+  )
+  $script:CurrentProfileSummary = $null
+}
+
+function Invoke-GndRequest {
+  param(
+    [string]$Method,
+    [string]$Path,
+    [object]$Body = $null
+  )
+
+  $uri = $GndBaseUrl.TrimEnd("/") + $Path
+  try {
+    if ($null -eq $Body) {
+      return Invoke-RestMethod -Method $Method -Uri $uri -TimeoutSec 4
+    }
+    $json = $Body | ConvertTo-Json -Compress
+    return Invoke-RestMethod -Method $Method -Uri $uri -Body $json -ContentType "application/json" -TimeoutSec 4
+  } catch {
+    Write-EventLog "WARN" "MON" "http_error" ("{0} {1}: {2}" -f $Method, $uri, $_.Exception.Message)
+    return $null
+  }
+}
+
+function Apply-RateProfile {
+  param([System.Collections.Specialized.OrderedDictionary]$Profile)
+
+  $body = @{
+    source_rate_hz = $Profile.SourceHz
+    download_rate_hz = $Profile.UiHz
+    ui_rate_hz = $Profile.UiHz
+    radio_state_only = [bool]$StateOnly
+  }
+
+  $null = Invoke-GndRequest "POST" "/api/config" $body
+  $config = Invoke-GndRequest "GET" "/api/config"
+  if (-not $config) {
+    return $false
+  }
+  if (($config.source_rate_hz -as [int]) -ne $Profile.SourceHz -or
+      ($config.download_rate_hz -as [int]) -ne $Profile.UiHz -or
+      ($config.ui_rate_hz -as [int]) -ne $Profile.UiHz -or
+      [bool]$config.radio_state_only -ne [bool]$StateOnly) {
+    Write-EventLog "WARN" "MON" "profile_mismatch" (
+      "requested={0} state_only={1} confirmed={2}/{3}/{4} state_only={5}" -f
+        $Profile.Name, [int][bool]$StateOnly, $config.source_rate_hz, $config.download_rate_hz, $config.ui_rate_hz,
+        [int][bool]$config.radio_state_only
+    )
+    return $false
+  }
+
+  $null = Invoke-GndRequest "POST" "/api/reset_counters"
+  $script:CurrentProfileSummary = New-ProfileSummary $Profile
+  Write-EventLog "INFO" "MON" "profile_apply" ("applied {0} state_only={1}" -f $Profile.Name, [int][bool]$StateOnly)
+  return $true
+}
+
+function Poll-GndStatus {
+  if (-not $script:StatusWriter -or -not $script:CurrentProfile) {
+    return
+  }
+
+  if (-not $script:NextStatusPollAt -or (Get-Date) -lt $script:NextStatusPollAt) {
+    return
+  }
+
+  $script:NextStatusPollAt = (Get-Date).AddMilliseconds($StatusPollMs)
+  $timestamp = Get-Date
+  $status = Invoke-GndRequest "GET" "/api/status"
+  if (-not $status) {
+    return
+  }
+  $phase = "settle"
+  if ($script:CurrentProfileAppliedAt -and ($timestamp - $script:CurrentProfileAppliedAt).TotalSeconds -ge $ProfileSettleSec) {
+    $phase = "run"
+  }
+
+  $script:StatusWriter.WriteLine(
+    ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16},{17},{18},{19}' -f
+      $timestamp.ToString("o"),
+      $script:CurrentProfile.Name,
+      $phase,
+      $script:CurrentProfile.SourceHz,
+      $script:CurrentProfile.UiHz,
+      ([int][bool]$status.air_link_fresh),
+      ($status.seq -as [int64]),
+      ($status.link_rx -as [int64]),
+      ($status.state_packets -as [int64]),
+      ($status.state_seq_gap -as [int64]),
+      ($status.state_seq_rewind -as [int64]),
+      ($status.ok -as [int64]),
+      ($status.len_err -as [int64]),
+      ($status.unknown_msg -as [int64]),
+      ($status.drop -as [int64]),
+      ($status.radio_rtt_ms -as [int64]),
+      ($status.radio_rtt_avg_ms -as [int64]),
+      ($status.air_rssi_dbm -as [int64]),
+      ($status.air_link_age_ms -as [int64]),
+      ($status.ap_clients -as [int64])
+    )
+  )
+  if ($phase -eq "run") {
+    Update-ProfileSummary $status $timestamp
+  }
+}
+
+function Advance-RateProfiles {
+  if ($script:Profiles.Count -eq 0 -or $script:ProfilesFinished) {
+    return
+  }
+
+  $now = Get-Date
+  if (-not $script:CurrentProfile) {
+    $script:CurrentProfileIndex = 0
+    $script:CurrentProfile = $script:Profiles[$script:CurrentProfileIndex]
+    if (Apply-RateProfile $script:CurrentProfile) {
+      $script:CurrentProfileAppliedAt = $now
+    } else {
+      $script:CurrentProfileAppliedAt = $null
+    }
+    return
+  }
+
+  if (-not $script:CurrentProfileAppliedAt) {
+    if (Apply-RateProfile $script:CurrentProfile) {
+      $script:CurrentProfileAppliedAt = $now
+    }
+    return
+  }
+
+  $elapsedSec = ($now - $script:CurrentProfileAppliedAt).TotalSeconds
+  if ($elapsedSec -lt ($ProfileSettleSec + $ProfileRunSec)) {
+    return
+  }
+
+  Write-ProfileSummary
+  $script:CurrentProfileIndex++
+  if ($script:CurrentProfileIndex -ge $script:Profiles.Count) {
+    $script:ProfilesFinished = $true
+    Write-EventLog "INFO" "MON" "profiles_done" "all rate profiles completed"
+    return
+  }
+
+  $script:CurrentProfile = $script:Profiles[$script:CurrentProfileIndex]
+  $script:CurrentProfileAppliedAt = $null
 }
 
 function New-UnitState {
@@ -106,7 +498,7 @@ function Reset-Readiness {
     "AIR" {
       $Unit.ReadyWifiAt = $null
       $Unit.ReadyTeensyLinkAt = $null
-      $Unit.WaitingOn = "gnd_ap"
+      $Unit.WaitingOn = "radio"
     }
     "GND" {
       $Unit.ReadyApAt = $null
@@ -405,11 +797,14 @@ function Process-Line {
         Mark-Boot $Unit
         return
       }
-      if ($trimmed -match '^AIR READY wifi ') {
+      if ($trimmed -match '^AIR READY radio ') {
         if (-not $Unit.ReadyWifiAt) {
           $Unit.ReadyWifiAt = Get-Date
-          Write-EventLog "INFO" $Unit.Name "ready_wifi" $trimmed
+          Write-EventLog "INFO" $Unit.Name "ready_radio" $trimmed
         }
+        $Unit.WaitingOn = ""
+      } elseif ($trimmed -match '^AIR READY gnd_link ') {
+        Write-EventLog "INFO" $Unit.Name "ready_gnd_link" $trimmed
         $Unit.WaitingOn = ""
       } elseif ($trimmed -match '^AIR READY teensy_link ') {
         if (-not $Unit.ReadyTeensyLinkAt) {
@@ -417,11 +812,16 @@ function Process-Line {
           Write-EventLog "INFO" $Unit.Name "ready_teensy_link" $trimmed
         }
         $Unit.WaitingOn = ""
-      } elseif ($trimmed -match '^AIR WAIT gnd_ap ') {
-        if ($Unit.WaitingOn -ne "gnd_ap") {
-          Write-EventLog "WARN" $Unit.Name "wait_gnd_ap" $trimmed
+      } elseif ($trimmed -match '^AIR WAIT gnd_link ') {
+        if ($Unit.WaitingOn -ne "gnd_link") {
+          Write-EventLog "WARN" $Unit.Name "wait_gnd_link" $trimmed
         }
-        $Unit.WaitingOn = "gnd_ap"
+        $Unit.WaitingOn = "gnd_link"
+      } elseif ($trimmed -match '^AIR WAIT radio') {
+        if ($Unit.WaitingOn -ne "radio") {
+          Write-EventLog "WARN" $Unit.Name "wait_radio" $trimmed
+        }
+        $Unit.WaitingOn = "radio"
       } elseif ($trimmed -match '^AIR WAIT teensy telemetry') {
         if ($Unit.WaitingOn -ne "teensy") {
           Write-EventLog "WARN" $Unit.Name "wait_teensy" $trimmed
@@ -511,17 +911,16 @@ function Check-Deadlines {
     }
   }
 
-  if ($Air.Active -and $Air.BootAt -and $Gnd.ReadyApAt -and -not $Air.ReadyWifiAt) {
-    $anchor = Later-Of $Air.BootAt $Gnd.ReadyApAt
-    if ($anchor -and ($now - $anchor).TotalSeconds -gt $WifiReadyDeadlineSec) {
-      Flag-TimeoutOnce $Air "ready_wifi" ("AIR wifi not ready within {0}s of AIR boot + GND AP ready" -f $WifiReadyDeadlineSec)
+  if ($Air.Active -and $Air.BootAt -and -not $Air.ReadyWifiAt) {
+    if (($now - $Air.BootAt).TotalSeconds -gt $WifiReadyDeadlineSec) {
+      Flag-TimeoutOnce $Air "ready_radio" ("AIR radio not ready within {0}s of AIR boot" -f $WifiReadyDeadlineSec)
     }
   }
 
   if ($Air.Active -and $Air.ReadyWifiAt -and $Teensy.Active -and $Teensy.ReadyStatsAt -and -not $Air.ReadyTeensyLinkAt) {
     $anchor = Later-Of $Air.ReadyWifiAt $Teensy.ReadyStatsAt
     if ($anchor -and ($now - $anchor).TotalSeconds -gt $LinkReadyDeadlineSec) {
-      Flag-TimeoutOnce $Air "ready_teensy_link" ("AIR teensy link not ready within {0}s of AIR wifi + Teensy stats" -f $LinkReadyDeadlineSec)
+      Flag-TimeoutOnce $Air "ready_teensy_link" ("AIR teensy link not ready within {0}s of AIR radio + Teensy stats" -f $LinkReadyDeadlineSec)
     }
   }
 
@@ -590,6 +989,12 @@ function Write-Summary {
       air_port = $Air.PortName
       gnd_port = $Gnd.PortName
       teensy_port = $Teensy.PortName
+      gnd_base_url = $GndBaseUrl
+      radio_state_only = [bool]$StateOnly
+      rate_profiles = @($script:Profiles | ForEach-Object { $_.Name })
+      profile_settle_sec = $ProfileSettleSec
+      profile_run_sec = $ProfileRunSec
+      status_poll_ms = $StatusPollMs
       baud = $Baud
       stats_delay_ms = $StatsDelayMs
       stats_retry_ms = $StatsRetryMs
@@ -619,6 +1024,7 @@ function Write-Summary {
       last_seq = $unit.LastSeq
       last_t_us = $unit.LastTus
       ready_ap_at = if ($unit.ReadyApAt) { $unit.ReadyApAt.ToString("o") } else { $null }
+      ready_radio_at = if ($unit.ReadyWifiAt) { $unit.ReadyWifiAt.ToString("o") } else { $null }
       ready_wifi_at = if ($unit.ReadyWifiAt) { $unit.ReadyWifiAt.ToString("o") } else { $null }
       ready_air_link_at = if ($unit.ReadyAirLinkAt) { $unit.ReadyAirLinkAt.ToString("o") } else { $null }
       ready_teensy_link_at = if ($unit.ReadyTeensyLinkAt) { $unit.ReadyTeensyLinkAt.ToString("o") } else { $null }
@@ -639,9 +1045,30 @@ $gnd = New-UnitState "GND" $GndPort $true
 $teensy = New-UnitState "TEENSY" $TeensyPort $TeensyStats.IsPresent
 
 try {
+  Init-RateProfiles
   Write-EventLog "INFO" "MON" "session_start" ("logs={0}" -f $sessionDir)
+  if ($script:Profiles.Count -gt 0) {
+    $initialConfig = Invoke-GndRequest "GET" "/api/config"
+    if ($initialConfig) {
+      $script:RestoreConfig = @{
+        source_rate_hz = ($initialConfig.source_rate_hz -as [int])
+        download_rate_hz = ($initialConfig.download_rate_hz -as [int])
+        ui_rate_hz = ($initialConfig.ui_rate_hz -as [int])
+        radio_state_only = [bool]$initialConfig.radio_state_only
+      }
+      Write-EventLog "INFO" "MON" "restore_capture" (
+        "captured source={0} download={1} ui={2} state_only={3}" -f
+          $script:RestoreConfig.source_rate_hz, $script:RestoreConfig.download_rate_hz, $script:RestoreConfig.ui_rate_hz,
+          [int][bool]$script:RestoreConfig.radio_state_only
+      )
+    }
+    Write-EventLog "INFO" "MON" "profiles" ("profiles={0}" -f (($script:Profiles | ForEach-Object { $_.Name }) -join " "))
+  }
 
   while ($true) {
+    Advance-RateProfiles
+    Poll-GndStatus
+
     foreach ($unit in @($air, $gnd, $teensy)) {
       Ensure-UnitPort $unit
       Send-StatsIfDue $unit
@@ -657,10 +1084,28 @@ try {
       }
     }
 
+    if ($script:ProfilesFinished -and $RunSeconds -le 0) {
+      break
+    }
+
     Start-Sleep -Milliseconds $LoopSleepMs
   }
 } finally {
   try {
+    if ($script:RestoreConfig) {
+      $null = Invoke-GndRequest "POST" "/api/config" $script:RestoreConfig
+      $restoredConfig = Invoke-GndRequest "GET" "/api/config"
+      if ($restoredConfig) {
+        Write-EventLog "INFO" "MON" "restore_config" (
+          "restored source={0} download={1} ui={2} state_only={3}" -f
+            $restoredConfig.source_rate_hz, $restoredConfig.download_rate_hz, $restoredConfig.ui_rate_hz,
+            [int][bool]$restoredConfig.radio_state_only
+        )
+      } else {
+        Write-EventLog "WARN" "MON" "restore_config" "restore request sent but confirmation failed"
+      }
+    }
+    Write-ProfileSummary
     Write-Summary $air $gnd $teensy
   } catch {
     Write-Host ("Failed to write summary: {0}" -f $_.Exception.Message)
@@ -673,5 +1118,19 @@ try {
   try {
     $script:EventWriter.Dispose()
   } catch {
+  }
+
+  if ($script:StatusWriter) {
+    try {
+      $script:StatusWriter.Dispose()
+    } catch {
+    }
+  }
+
+  if ($script:ProfileSummaryWriter) {
+    try {
+      $script:ProfileSummaryWriter.Dispose()
+    } catch {
+    }
   }
 }

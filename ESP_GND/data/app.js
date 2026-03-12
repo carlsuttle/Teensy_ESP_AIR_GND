@@ -3,10 +3,13 @@ const statsEl = document.getElementById("stats");
 const recEl = document.getElementById("rec");
 const gpsEl = document.getElementById("gps");
 const attEl = document.getElementById("att");
-const fusionStatusEl = document.getElementById("fusionStatus");
 const baroEl = document.getElementById("baro");
 const linkEl = document.getElementById("link");
+const logsEl = document.getElementById("logs");
 const airLoggerTextEl = document.getElementById("airLoggerText");
+const fusionAngularLightEl = document.getElementById("fusionAngularLight");
+const fusionAccelLightEl = document.getElementById("fusionAccelLight");
+const fusionMagLightEl = document.getElementById("fusionMagLight");
 
 let wsCtrl = null;
 let wsState = null;
@@ -25,6 +28,9 @@ let binaryParseFailCount = 0;
 let clientStateFps = 0;
 let binaryRxCountLast = 0;
 let binaryRxFpsLastMs = 0;
+let radioStateFps = null;
+let lastRadioStatePackets = null;
+let lastRadioStatusAt = 0;
 let lastBinarySeq = 0;
 let lastSourceSeq = 0;
 let lastSourceTus = 0;
@@ -40,6 +46,12 @@ let latestGps = null;
 let latestAtt = null;
 let latestBaro = null;
 let fusionLast = null;
+let fusionFlagsLast = {
+  initialising: false,
+  angularRecovery: false,
+  accelerationRecovery: false,
+  magneticRecovery: false
+};
 let fusionUiHoldUntilMs = 0;
 let fusionDraft = null;
 let fusionDirty = false;
@@ -72,6 +84,7 @@ let clientEventLog = [];
 let statusFetchInFlight = false;
 let linkStatus = {
   transport: "ESP-NOW",
+  radio_state_only: false,
   air_link_fresh: false,
   has_link_meta: false,
   ap_clients: 0,
@@ -84,6 +97,22 @@ let linkStatus = {
   air_link_age_ms: null,
   air_sender_mac: "none",
   air_target_mac: "none",
+  radio_rtt_ms: null,
+  radio_rtt_avg_ms: null,
+  last_radio_pong_ms: 0,
+  has_log_status: false,
+  air_log_active: false,
+  air_log_requested: false,
+  air_log_backend_ready: false,
+  air_log_media_present: false,
+  air_log_last_command: 0,
+  air_log_session_id: 0,
+  air_log_bytes_written: 0,
+  air_log_free_bytes: null,
+  air_log_last_change_ms: null,
+  state_packets: 0,
+  state_seq_gap: 0,
+  state_seq_rewind: 0,
   link_rx: 0,
   ok: 0,
   len_err: 0,
@@ -111,6 +140,10 @@ const FUSION_DEFAULTS = {
   magneticRejection: 60.0,
   recoveryTriggerPeriod: 1200
 };
+const STATE_FLAG_FUSION_INITIALISING = 1 << 1;
+const STATE_FLAG_FUSION_ANGULAR_RECOVERY = 1 << 2;
+const STATE_FLAG_FUSION_ACCELERATION_RECOVERY = 1 << 3;
+const STATE_FLAG_FUSION_MAGNETIC_RECOVERY = 1 << 4;
 
 const WS_STATE_MAGIC = 0x57535445;
 const WS_STATE_VERSION = 2;
@@ -257,6 +290,21 @@ function requestFusionSnapshot() {
   wsCtrl.send(JSON.stringify({ type: "get_fusion", req_id: allocCtrlReqId() }));
 }
 
+function requestLogStatus() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "get_log_status", req_id: allocCtrlReqId() }));
+}
+
+function sendLogStart() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "start_log", req_id: allocCtrlReqId() }));
+}
+
+function sendLogStop() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "stop_log", req_id: allocCtrlReqId() }));
+}
+
 function sendFusion(partial = {}) {
   if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
   ensureFusionDraft();
@@ -296,6 +344,48 @@ function dash(v) {
 function fmtRssi(valid, dbm) {
   if (!valid || dbm === null || dbm === undefined || Number.isNaN(dbm)) return "-";
   return `${Math.round(Number(dbm))} dBm`;
+}
+
+function fmtBytes(bytes) {
+  if (bytes === null || bytes === undefined || Number.isNaN(bytes)) return "-";
+  if (Number(bytes) === 0xFFFFFFFF) return "unknown";
+  const value = Number(bytes);
+  if (value >= 1024 * 1024) return `${fmt(value / (1024 * 1024), 2)} MiB`;
+  if (value >= 1024) return `${fmt(value / 1024, 1)} KiB`;
+  return `${Math.round(value)} B`;
+}
+
+function logCommandText(command) {
+  if (command === 104) return "start";
+  if (command === 105) return "stop";
+  if (command === 106) return "status";
+  return command ? String(command) : "-";
+}
+
+function setFusionLight(el, on) {
+  if (!el) return;
+  el.classList.toggle("on", !!on);
+  el.classList.toggle("off", !on);
+}
+
+function renderFusionLights() {
+  setFusionLight(fusionAngularLightEl, fusionFlagsLast.angularRecovery);
+  setFusionLight(fusionAccelLightEl, fusionFlagsLast.accelerationRecovery);
+  setFusionLight(fusionMagLightEl, fusionFlagsLast.magneticRecovery);
+}
+
+function applyLogStatus(logStatus = null) {
+  if (!logStatus) return;
+  linkStatus.has_log_status = true;
+  linkStatus.air_log_active = !!logStatus.active;
+  linkStatus.air_log_requested = !!logStatus.requested;
+  linkStatus.air_log_backend_ready = !!logStatus.backend_ready;
+  linkStatus.air_log_media_present = !!logStatus.media_present;
+  linkStatus.air_log_last_command = Number(logStatus.last_command ?? 0);
+  linkStatus.air_log_session_id = Number(logStatus.session_id ?? 0);
+  linkStatus.air_log_bytes_written = Number(logStatus.bytes_written ?? 0);
+  linkStatus.air_log_free_bytes = Number(logStatus.free_bytes ?? 0xFFFFFFFF);
+  linkStatus.air_log_last_change_ms = Number(logStatus.last_change_ms ?? 0);
 }
 
 function setRecorderUi(enabled, known = true) {
@@ -441,6 +531,31 @@ async function fetchStatus() {
       ...linkStatus,
       ...data
     };
+    const now = Date.now();
+    const statePackets = Number(linkStatus.state_packets ?? 0);
+    if (lastRadioStatusAt > 0 && lastRadioStatePackets !== null && statePackets >= lastRadioStatePackets) {
+      const dtMs = now - lastRadioStatusAt;
+      if (dtMs > 0) {
+        radioStateFps = (statePackets - lastRadioStatePackets) * 1000 / dtMs;
+      }
+    } else if (lastRadioStatePackets !== null && statePackets < lastRadioStatePackets) {
+      radioStateFps = null;
+    }
+    lastRadioStatePackets = statePackets;
+    lastRadioStatusAt = now;
+    if (data.has_log_status) {
+      applyLogStatus({
+        active: data.air_log_active,
+        requested: data.air_log_requested,
+        backend_ready: data.air_log_backend_ready,
+        media_present: data.air_log_media_present,
+        last_command: data.air_log_last_command,
+        session_id: data.air_log_session_id,
+        bytes_written: data.air_log_bytes_written,
+        free_bytes: data.air_log_free_bytes,
+        last_change_ms: data.air_log_last_change_ms
+      });
+    }
     setRecorderUi(!!linkStatus.air_recorder_on, !!linkStatus.has_link_meta);
     uiDirty = true;
     linkDirty = true;
@@ -468,11 +583,13 @@ fusion.gain: -
 fusion.accelRej: - deg
 fusion.magRej: - deg
 fusion.recovery: - s / - smp`;
-  fusionStatusEl.textContent =
-`applied gain: -
-applied accel reject: - deg
-applied mag reject: - deg
-applied recovery: - s / - smp`;
+  fusionFlagsLast = {
+    initialising: false,
+    angularRecovery: false,
+    accelerationRecovery: false,
+    magneticRecovery: false
+  };
+  renderFusionLights();
 }
 
 function renderBaroStale() {
@@ -495,6 +612,9 @@ air_rssi: -
 air_scan_age_ms: -
 air_link_age_ms: -
 air_recorder: -
+radio_rtt: -
+radio_rtt_avg: -
+radio_state_fps: -
 ap_clients: ${dash(linkStatus.ap_clients)}
 ctrl_ws: -
 state_ws: -
@@ -504,6 +624,9 @@ source_seq: -
 source_t_us: -
 esp_rx_ms: -
 link_rx: ${dash(linkStatus.link_rx)}
+state_rx: ${dash(linkStatus.state_packets)}
+state_gap: ${dash(linkStatus.state_seq_gap)}
+state_rewind: ${dash(linkStatus.state_seq_rewind)}
 frames_ok: ${dash(linkStatus.ok)}
 len_err: ${dash(linkStatus.len_err)}
 unknown_msg: ${dash(linkStatus.unknown_msg)}
@@ -518,22 +641,38 @@ ping: - ms
 ping_avg: - ms`;
 }
 
+function renderLogsStale() {
+  logsEl.textContent =
+`status: -
+requested: -
+backend_ready: -
+media_present: -
+session_id: -
+bytes_written: -
+free_bytes: -
+last_command: -
+last_change_ms: -`;
+}
+
 function renderStale() {
   renderGpsStale();
   renderAttStale();
   renderBaroStale();
   renderLinkStale();
-  statsEl.textContent = `state_fps: - | seq: - | ctrl: - | state: - | ping: - ms | avg: - ms`;
+  renderLogsStale();
+  statsEl.textContent = `state_fps: - | seq: - | ctrl: - | state: - | ping: - ms | radio: - ms | avg: - ms`;
 }
 
 function renderHeader() {
   const pingTxt = isPongFresh() ? String(pingMs ?? "-") : "-";
   const pingAvgTxt = isPongFresh() ? String(pingAvgMs ?? "-") : "-";
+  const radioRttTxt = linkStatus.air_link_fresh && linkStatus.radio_rtt_ms ? String(linkStatus.radio_rtt_ms) : "-";
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
   const seqTxt = lastSourceSeq > 0 ? String(lastSourceSeq) : "-";
   const ctrlTxt = isCtrlOpen() ? "open" : "closed";
   const stateTxt = isStateOpen() ? "open" : "closed";
-  statsEl.textContent = `state_fps: ${stateFpsTxt} | seq: ${seqTxt} | ctrl: ${ctrlTxt} | state: ${stateTxt} | ping: ${pingTxt} ms | avg: ${pingAvgTxt} ms`;
+  statsEl.textContent =
+    `state_fps: ${stateFpsTxt} | seq: ${seqTxt} | ctrl: ${ctrlTxt} | state: ${stateTxt} | ping: ${pingTxt} ms | radio: ${radioRttTxt} ms | avg: ${pingAvgTxt} ms`;
 }
 
 function renderGpsPanel() {
@@ -559,11 +698,7 @@ fusion.gain: ${fmt(fusion.gain, 3)}
 fusion.accelRej: ${fmt(fusion.accelerationRejection, 1)} deg
 fusion.magRej: ${fmt(fusion.magneticRejection, 1)} deg
 fusion.recovery: ${fusionRecoveryText(fusion.recoveryTriggerPeriod)}`;
-  fusionStatusEl.textContent =
-`applied gain: ${fmt(fusion.gain, 3)}
-applied accel reject: ${fmt(fusion.accelerationRejection, 1)} deg
-applied mag reject: ${fmt(fusion.magneticRejection, 1)} deg
-applied recovery: ${fusionRecoveryText(fusion.recoveryTriggerPeriod)}`;
+  renderFusionLights();
 }
 
 function renderBaroPanel() {
@@ -578,6 +713,10 @@ temp: ${fmt(baro.t, 2)} C`;
 function renderLinkPanel() {
   const pingTxt = isPongFresh() ? String(pingMs ?? "-") : "-";
   const pingAvgTxt = isPongFresh() ? String(pingAvgMs ?? "-") : "-";
+  const radioRttTxt = linkStatus.air_link_fresh && linkStatus.radio_rtt_ms ? String(linkStatus.radio_rtt_ms) : "-";
+  const radioRttAvgTxt =
+    linkStatus.air_link_fresh && linkStatus.radio_rtt_avg_ms ? String(linkStatus.radio_rtt_avg_ms) : "-";
+  const radioStateFpsTxt = linkStatus.air_link_fresh && radioStateFps !== null ? fmt(radioStateFps, 1) : "-";
   const ctrlSocketTxt = isCtrlOpen() ? "open" : "closed";
   const stateSocketTxt = isStateOpen() ? "open" : "closed";
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
@@ -594,12 +733,14 @@ function renderLinkPanel() {
   const airLinkTxt = linkStatus.air_link_fresh ? "up" : "waiting";
   const airRadioTxt = linkStatus.air_radio_ready ? "ready" : "starting";
   const airPeerTxt = linkStatus.air_peer_known ? "known" : "discovering";
+  const radioModeTxt = linkStatus.radio_state_only ? "state-only stress" : "mixed";
   const airRssiTxt = fmtRssi(linkStatus.air_rssi_valid, linkStatus.air_rssi_dbm);
   const airScanAgeTxt = dash(linkStatus.air_scan_age_ms);
   const airLinkAgeTxt = dash(linkStatus.air_link_age_ms);
   const airRecorderTxt = !linkStatus.has_link_meta ? "unknown" : (linkStatus.air_recorder_on ? "on" : "off");
   linkEl.textContent =
 `transport: ${dash(linkStatus.transport)}
+radio_mode: ${radioModeTxt}
 air_link: ${airLinkTxt}
 air_radio: ${airRadioTxt}
 air_peer: ${airPeerTxt}
@@ -609,6 +750,9 @@ air_rssi: ${airRssiTxt}
 air_scan_age_ms: ${airScanAgeTxt}
 air_link_age_ms: ${airLinkAgeTxt}
 air_recorder: ${airRecorderTxt}
+radio_rtt: ${radioRttTxt} ms
+radio_rtt_avg: ${radioRttAvgTxt} ms
+radio_state_fps: ${radioStateFpsTxt}
 ap_clients: ${dash(linkStatus.ap_clients)}
 ctrl_ws: ${ctrlSocketTxt}
 state_ws: ${stateSocketTxt}
@@ -618,6 +762,9 @@ source_seq: ${sourceSeqTxt}
 source_t_us: ${sourceTusTxt}
 esp_rx_ms: ${espRxMsTxt}
 link_rx: ${dash(linkStatus.link_rx)}
+state_rx: ${dash(linkStatus.state_packets)}
+state_gap: ${dash(linkStatus.state_seq_gap)}
+state_rewind: ${dash(linkStatus.state_seq_rewind)}
 frames_ok: ${dash(linkStatus.ok)}
 len_err: ${dash(linkStatus.len_err)}
 unknown_msg: ${dash(linkStatus.unknown_msg)}
@@ -630,6 +777,23 @@ ctrl_last_close: ${ctrlLastCloseTxt}
 state_last_close: ${stateLastCloseTxt}
 ping: ${pingTxt} ms
 ping_avg: ${pingAvgTxt} ms`;
+}
+
+function renderLogsPanel() {
+  const activeTxt = linkStatus.has_log_status ? (linkStatus.air_log_active ? "on" : "off") : "-";
+  const requestedTxt = linkStatus.has_log_status ? (linkStatus.air_log_requested ? "on" : "off") : "-";
+  const backendTxt = linkStatus.has_log_status ? (linkStatus.air_log_backend_ready ? "ready" : "not ready") : "-";
+  const mediaTxt = linkStatus.has_log_status ? (linkStatus.air_log_media_present ? "present" : "missing") : "-";
+  logsEl.textContent =
+`status: ${activeTxt}
+requested: ${requestedTxt}
+backend_ready: ${backendTxt}
+media_present: ${mediaTxt}
+session_id: ${dash(linkStatus.air_log_session_id)}
+bytes_written: ${fmtBytes(linkStatus.air_log_bytes_written)}
+free_bytes: ${fmtBytes(linkStatus.air_log_free_bytes)}
+last_command: ${logCommandText(linkStatus.air_log_last_command)}
+last_change_ms: ${dash(linkStatus.air_log_last_change_ms)}`;
 }
 
 function renderActiveTab() {
@@ -645,14 +809,20 @@ function renderActiveTab() {
     renderBaroPanel();
   } else if (activeTab === "link") {
     renderLinkPanel();
+  } else if (activeTab === "logs") {
+    renderLogsPanel();
   }
 }
 
 function renderNow() {
   updateStatus();
   renderHeader();
-  if (activeTab === "link") {
-    renderLinkPanel();
+  if (activeTab === "link" || activeTab === "logs") {
+    if (activeTab === "link") {
+      renderLinkPanel();
+    } else {
+      linkStatus.has_log_status ? renderLogsPanel() : renderLogsStale();
+    }
     lastLinkRenderAt = Date.now();
     linkDirty = false;
   }
@@ -755,6 +925,13 @@ function handleBinaryStateMessage(buf) {
     magneticRejection: Number(fusion.mr ?? 0),
     recoveryTriggerPeriod: Number(fusion.rp ?? 0)
   };
+  const stateFlags = Number(m.flags ?? 0);
+  fusionFlagsLast = {
+    initialising: (stateFlags & STATE_FLAG_FUSION_INITIALISING) !== 0,
+    angularRecovery: (stateFlags & STATE_FLAG_FUSION_ANGULAR_RECOVERY) !== 0,
+    accelerationRecovery: (stateFlags & STATE_FLAG_FUSION_ACCELERATION_RECOVERY) !== 0,
+    magneticRecovery: (stateFlags & STATE_FLAG_FUSION_MAGNETIC_RECOVERY) !== 0
+  };
   const fusionMatchesDraft = fusionDraft &&
     near(fusionLast.gain, fusionDraft.gain, 0.005) &&
     near(fusionLast.accelerationRejection, fusionDraft.accelerationRejection, 0.15) &&
@@ -806,6 +983,9 @@ function handleCtrlMessage(text) {
     return;
   }
   if (m.type === "ack") {
+    if (m.log_status) {
+      applyLogStatus(m.log_status);
+    }
     if (m.cmd === "get_fusion" && m.fusion) {
       fusionLast = {
         gain: Number(m.fusion.gain ?? FUSION_DEFAULTS.gain),
@@ -832,12 +1012,17 @@ function handleCtrlMessage(text) {
         setTimeout(requestFusionSnapshot, 1200);
       }
     }
+    if (m.cmd === "start_log" || m.cmd === "stop_log" || m.cmd === "get_log_status") {
+      setTimeout(requestLogStatus, 150);
+      setTimeout(fetchStatus, 250);
+    }
     uiDirty = true;
     linkDirty = true;
     return;
   }
   if (m.type === "config") {
     document.getElementById("sourceHz").value = m.source_rate_hz ?? 50;
+    document.getElementById("downloadHz").value = m.download_rate_hz ?? m.log_rate_hz ?? 30;
     document.getElementById("uiHz").value = m.ui_rate_hz ?? 20;
     uiDirty = true;
     linkDirty = true;
@@ -880,6 +1065,7 @@ function connectCtrl() {
     resetPingStats();
     updateStatus();
     requestFusionSnapshot();
+    requestLogStatus();
     connectState();
     uiDirty = true;
   };
@@ -1046,7 +1232,7 @@ setInterval(() => {
     }
   }
   const stale = !isFresh(lastStateAt, STATE_STALE_MS);
-  if (activeTab === "link") {
+  if (activeTab === "link" || activeTab === "logs") {
     const now = Date.now();
     if ((linkDirty || stale) && (now - lastLinkRenderAt >= LINK_RENDER_PERIOD_MS)) {
       renderNow();
@@ -1118,8 +1304,10 @@ document.getElementById("recoverySlider").addEventListener("change", () => {
 
 document.getElementById("applyRate").addEventListener("click", async () => {
   const body = {
-    source_rate_hz: parseInt(document.getElementById("sourceHz").value, 10),
-    ui_rate_hz: Math.min(20, parseInt(document.getElementById("uiHz").value, 10))
+    source_rate_hz: Math.min(400, parseInt(document.getElementById("sourceHz").value, 10)),
+    download_rate_hz: Math.min(30, parseInt(document.getElementById("downloadHz").value, 10)),
+    ui_rate_hz: Math.min(30, parseInt(document.getElementById("uiHz").value, 10)),
+    radio_state_only: false
   };
   await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   try {
@@ -1127,10 +1315,24 @@ document.getElementById("applyRate").addEventListener("click", async () => {
     if (resp.ok) {
       const cfg = await resp.json();
       document.getElementById("sourceHz").value = cfg.source_rate_hz ?? 50;
+      document.getElementById("downloadHz").value = cfg.download_rate_hz ?? cfg.log_rate_hz ?? 30;
       document.getElementById("uiHz").value = cfg.ui_rate_hz ?? 20;
     }
   } catch (_err) {
   }
+});
+
+document.getElementById("refreshLogStatus").addEventListener("click", () => {
+  requestLogStatus();
+  fetchStatus();
+});
+
+document.getElementById("startLog").addEventListener("click", () => {
+  sendLogStart();
+});
+
+document.getElementById("stopLog").addEventListener("click", () => {
+  sendLogStop();
 });
 
 document.getElementById("resetAirNetwork").addEventListener("click", async () => {

@@ -10,20 +10,37 @@ static constexpr uint32_t kWsStateMagic = 0x57535445UL;  // "WSTE"
 static constexpr uint16_t kWsStateVersion = 2;
 static constexpr uint8_t kRadioChannel = 6;
 static constexpr uint16_t kEspNowMaxDataLen = 250;
+static constexpr uint16_t kStateFlagGpsFix3d = 1U << 0;
+static constexpr uint16_t kStateFlagFusionInitialising = 1U << 1;
+static constexpr uint16_t kStateFlagFusionAngularRecovery = 1U << 2;
+static constexpr uint16_t kStateFlagFusionAccelerationRecovery = 1U << 3;
+static constexpr uint16_t kStateFlagFusionMagneticRecovery = 1U << 4;
 static constexpr uint8_t kLinkMetaFlagPeerKnown = 1U << 0;
 static constexpr uint8_t kLinkMetaFlagRadioReady = 1U << 1;
 static constexpr uint8_t kLinkMetaFlagRecorderOn = 1U << 2;
 static constexpr uint8_t kLinkMetaFlagRssiValid = 1U << 3;
+static constexpr uint8_t kLogStatusFlagActive = 1U << 0;
+static constexpr uint8_t kLogStatusFlagRequested = 1U << 1;
+static constexpr uint8_t kLogStatusFlagBackendReady = 1U << 2;
+static constexpr uint8_t kLogStatusFlagMediaPresent = 1U << 3;
+static constexpr uint32_t kLogBytesUnknown = 0xFFFFFFFFUL;
 
 enum MsgType : uint16_t {
   TELEM_FULL_STATE = 1,
   TELEM_EVENT = 2,
   TELEM_META = 3,
   TELEM_FUSION_SETTINGS = 4,
+  TELEM_LOG_STATUS = 5,
+  TELEM_CONTROL_STATUS = 6,
   CMD_SET_FUSION_SETTINGS = 100,
   CMD_GET_FUSION_SETTINGS = 101,
   CMD_SET_STREAM_RATE = 102,
   CMD_RESET_NETWORK = 103,
+  CMD_LOG_START = 104,
+  CMD_LOG_STOP = 105,
+  CMD_GET_LOG_STATUS = 106,
+  CMD_RADIO_PING = 107,
+  CMD_SET_RADIO_MODE = 108,
   LINK_HELLO = 150,
   ACK = 200,
   NACK = 201
@@ -97,6 +114,12 @@ struct CmdSetStreamRateV1 {
   uint16_t log_rate_hz;
 };
 
+struct CmdSetRadioModeV1 {
+  uint8_t state_only;
+  uint8_t control_rate_hz;
+  uint16_t telem_rate_hz;
+};
+
 struct AckPayloadV1 {
   uint16_t command;
   uint16_t ok;
@@ -116,6 +139,32 @@ struct LinkMetaPayloadV1 {
   uint8_t reserved0;
   uint32_t scan_age_ms;
   uint32_t link_age_ms;
+};
+
+struct LogStatusPayloadV1 {
+  uint8_t flags;
+  uint8_t reserved0;
+  uint16_t last_command;
+  uint32_t session_id;
+  uint32_t bytes_written;
+  uint32_t free_bytes;
+  uint32_t last_change_ms;
+};
+
+static constexpr uint8_t kControlStatusFlagHasAck = 1U << 0;
+static constexpr uint8_t kControlStatusFlagAckOk = 1U << 1;
+static constexpr uint8_t kControlStatusFlagHasFusion = 1U << 2;
+static constexpr uint8_t kControlStatusFlagHasLinkMeta = 1U << 3;
+static constexpr uint8_t kControlStatusFlagHasLogStatus = 1U << 4;
+
+struct ControlStatusPayloadV1 {
+  uint8_t flags;
+  uint8_t control_rate_hz;
+  uint16_t ack_command;
+  uint32_t ack_code;
+  FusionSettingsV1 fusion;
+  LinkMetaPayloadV1 link_meta;
+  LogStatusPayloadV1 log_status;
 };
 
 struct WsStateHeaderV1 {

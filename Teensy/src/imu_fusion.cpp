@@ -289,6 +289,14 @@ void getFusionSettings(float& gain, float& accelRejection, float& magRejection, 
   recoveryPeriod = g_settings.recoveryTriggerPeriod;
 }
 
+void getFusionFlags(bool& initialising, bool& angularRecovery, bool& accelerationRecovery, bool& magneticRecovery) {
+  const FusionAhrsFlags flags = FusionAhrsGetFlags(&g_ahrs);
+  initialising = flags.initialising;
+  angularRecovery = flags.angularRateRecovery;
+  accelerationRecovery = flags.accelerationRecovery;
+  magneticRecovery = flags.magneticRecovery;
+}
+
 bool setFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod) {
   if (!g_ready) return false;
   if (!isfinite(gain) || !isfinite(accelRejection) || !isfinite(magRejection)) return false;

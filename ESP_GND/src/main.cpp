@@ -12,15 +12,33 @@ namespace {
 
 uint8_t g_last_station_count = 0xFFU;
 uint32_t g_last_stat_ms = 0;
-uint32_t g_last_air_probe_ms = 0;
+uint32_t g_last_air_config_tx_ms = 0;
 bool g_stats_streaming = false;
 bool g_link_streaming = false;
 bool g_air_ready = false;
 bool g_air_wait_announced = false;
-bool g_air_bootstrap_active = true;
-uint8_t g_air_probe_attempts = 0;
-constexpr uint32_t kAirProbeRetryMs = 1000U;
-constexpr uint8_t kAirProbeMaxAttempts = 12U;
+uint16_t g_last_configured_source_rate_hz = 0U;
+uint16_t g_last_configured_download_rate_hz = 0U;
+uint8_t g_last_configured_radio_state_only = 0U;
+uint32_t g_last_air_ack_seq = 0U;
+bool g_pending_stream_rate_apply = true;
+bool g_pending_radio_mode_apply = true;
+constexpr uint32_t kAirConfigRetryMs = 1000U;
+
+void scheduleAirStreamRateApply() {
+  g_pending_stream_rate_apply = true;
+  g_last_air_config_tx_ms = 0U;
+}
+
+void scheduleAirRadioModeApply() {
+  g_pending_radio_mode_apply = true;
+  g_last_air_config_tx_ms = 0U;
+}
+
+void scheduleAirConfigApply() {
+  scheduleAirRadioModeApply();
+  scheduleAirStreamRateApply();
+}
 
 void logApState() {
   const uint8_t station_count = WiFi.softAPgetStationNum();
@@ -47,8 +65,33 @@ bool sendConfiguredStreamRateToAir() {
   const AppConfig& cfg = config_store::get();
   telem::CmdSetStreamRateV1 cmd = {};
   cmd.ws_rate_hz = cfg.source_rate_hz;
-  cmd.log_rate_hz = cfg.source_rate_hz;
+  cmd.log_rate_hz = cfg.log_rate_hz;
   return radio_link::sendSetStreamRate(cmd);
+}
+
+bool sendConfiguredRadioModeToAir() {
+  telem::CmdSetRadioModeV1 cmd = {};
+  cmd.state_only = config_store::get().radio_state_only ? 1U : 0U;
+  cmd.control_rate_hz = 2U;
+  cmd.telem_rate_hz = config_store::get().log_rate_hz;
+  return radio_link::sendSetRadioMode(cmd);
+}
+
+void syncConfiguredAirTargets() {
+  const AppConfig& cfg = config_store::get();
+  if (cfg.source_rate_hz != g_last_configured_source_rate_hz) {
+    g_last_configured_source_rate_hz = cfg.source_rate_hz;
+    scheduleAirStreamRateApply();
+  }
+  if (cfg.log_rate_hz != g_last_configured_download_rate_hz) {
+    g_last_configured_download_rate_hz = cfg.log_rate_hz;
+    scheduleAirRadioModeApply();
+    scheduleAirStreamRateApply();
+  }
+  if (cfg.radio_state_only != g_last_configured_radio_state_only) {
+    g_last_configured_radio_state_only = cfg.radio_state_only;
+    scheduleAirRadioModeApply();
+  }
 }
 
 void handleConsoleCommands() {
@@ -61,12 +104,16 @@ void handleConsoleCommands() {
         printConsoleHelp();
       } else if (line.equalsIgnoreCase("kickair")) {
         const AppConfig& cfg = config_store::get();
-        const bool ok = sendConfiguredStreamRateToAir();
-        Serial.printf("KICKAIR tx_ok=%u target=%s ws_hz=%u log_hz=%u\n",
-                      ok ? 1U : 0U,
+        scheduleAirConfigApply();
+        const bool mode_ok = sendConfiguredRadioModeToAir();
+        const bool rate_ok = sendConfiguredStreamRateToAir();
+        Serial.printf("KICKAIR mode_ok=%u rate_ok=%u target=%s ws_hz=%u log_hz=%u state_only=%u\n",
+                      mode_ok ? 1U : 0U,
+                      rate_ok ? 1U : 0U,
                       radio_link::targetSenderMac().c_str(),
                       (unsigned)cfg.source_rate_hz,
-                      (unsigned)cfg.source_rate_hz);
+                      (unsigned)cfg.log_rate_hz,
+                      (unsigned)cfg.radio_state_only);
       } else if (line.equalsIgnoreCase("resetair")) {
         const bool ok = radio_link::sendResetNetwork();
         Serial.printf("RESETAIR tx_ok=%u target=%s\n",
@@ -75,6 +122,7 @@ void handleConsoleCommands() {
       } else if (line.equalsIgnoreCase("relink")) {
         const AppConfig& cfg = config_store::get();
         radio_link::restart(cfg);
+        scheduleAirConfigApply();
         Serial.printf("RELINK target=%s\n", radio_link::targetSenderMac().c_str());
       } else if (line.equalsIgnoreCase("stats")) {
         g_stats_streaming = true;
@@ -131,6 +179,19 @@ void updateAirReadiness() {
   const auto snap = radio_link::snapshot();
   const uint32_t now = millis();
   const bool fresh = snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U;
+  if (snap.has_ack && snap.ack_rx_seq != g_last_air_ack_seq) {
+    g_last_air_ack_seq = snap.ack_rx_seq;
+    if (snap.ack_ok) {
+      if (snap.ack_command == telem::CMD_SET_STREAM_RATE) {
+        g_pending_stream_rate_apply = false;
+      } else if (snap.ack_command == telem::CMD_SET_RADIO_MODE) {
+        g_pending_radio_mode_apply = false;
+      }
+      if (!g_pending_radio_mode_apply && !g_pending_stream_rate_apply) {
+        g_last_air_config_tx_ms = 0U;
+      }
+    }
+  }
 
   if (fresh) {
     if (!g_air_ready) {
@@ -141,43 +202,36 @@ void updateAirReadiness() {
       g_air_ready = true;
       g_air_wait_announced = false;
     }
-    g_air_bootstrap_active = false;
-    g_air_probe_attempts = 0U;
-    g_last_air_probe_ms = 0U;
-    return;
-  }
-
-  if (!g_air_wait_announced) {
-    Serial.printf("GND WAIT air_packets target=%s\n", radio_link::targetSenderMac().c_str());
-    g_air_wait_announced = true;
-  }
-
-  if (radio_link::hasLearnedSender()) {
-    g_air_bootstrap_active = true;
   } else {
-    g_air_probe_attempts = 0U;
-    g_last_air_probe_ms = 0U;
-  }
-  if (g_air_bootstrap_active && radio_link::hasLearnedSender() && g_air_probe_attempts < kAirProbeMaxAttempts &&
-      (g_last_air_probe_ms == 0U || (uint32_t)(now - g_last_air_probe_ms) >= kAirProbeRetryMs)) {
-    const AppConfig& cfg = config_store::get();
-    telem::CmdSetStreamRateV1 cmd = {};
-    cmd.ws_rate_hz = cfg.source_rate_hz;
-    cmd.log_rate_hz = cfg.source_rate_hz;
-    if (radio_link::sendSetStreamRate(cmd)) {
-      g_air_probe_attempts++;
-      g_last_air_probe_ms = now;
+    if (!g_air_wait_announced) {
+      Serial.printf("GND WAIT air_packets target=%s\n", radio_link::targetSenderMac().c_str());
+      g_air_wait_announced = true;
     }
+    if (g_air_ready) {
+      scheduleAirConfigApply();
+    }
+    g_air_ready = false;
   }
 
-  g_air_ready = false;
+  if (!radio_link::hasLearnedSender()) return;
+  if (!g_pending_radio_mode_apply && !g_pending_stream_rate_apply) return;
+  if (g_last_air_config_tx_ms != 0U && (uint32_t)(now - g_last_air_config_tx_ms) < kAirConfigRetryMs) return;
+
+  bool sent = false;
+  if (g_pending_radio_mode_apply) {
+    sent = sendConfiguredRadioModeToAir();
+  } else if (g_pending_stream_rate_apply) {
+    sent = sendConfiguredStreamRateToAir();
+  }
+  if (sent) g_last_air_config_tx_ms = now;
 }
 
 void printStats() {
   const auto snap = radio_link::snapshot();
   Serial.printf(
       "STAT unit=GND seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
-      "rx_bytes=%lu ok=%lu crc=%u cobs=%u len=%lu unk=%lu drop=%lu link_tx=%u link_rx=%lu link_drop=%u\n",
+      "rx_bytes=%lu ok=%lu state_rx=%lu state_gap=%lu state_rewind=%lu "
+      "crc=%u cobs=%u len=%lu unk=%lu drop=%lu link_tx=%u link_rx=%lu link_drop=%u rtt=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -187,6 +241,9 @@ void printStats() {
       (unsigned long)snap.ack_code,
       (unsigned long)snap.stats.rx_bytes,
       (unsigned long)snap.stats.frames_ok,
+      (unsigned long)snap.stats.state_packets,
+      (unsigned long)snap.stats.state_seq_gap,
+      (unsigned long)snap.stats.state_seq_rewind,
       0U,
       0U,
       (unsigned long)snap.stats.len_err,
@@ -194,14 +251,15 @@ void printStats() {
       (unsigned long)snap.stats.drop,
       0U,
       (unsigned long)snap.stats.rx_packets,
-      0U);
+      0U,
+      (unsigned long)snap.radio_rtt_ms);
 }
 
 void printLinkMeta() {
   const auto snap = radio_link::snapshot();
   Serial.printf(
       "SEELINK has=%u seq=%lu t_us=%lu ack=%u cmd=%u ack_ok=%u code=%lu fusion=%u sender=%s "
-      "last_rx_ms=%lu packets=%lu ok=%lu rssi=%d recorder=%u\n",
+      "last_rx_ms=%lu packets=%lu ok=%lu state_rx=%lu gap=%lu rewind=%lu rssi=%d recorder=%u rtt=%lu\n",
       snap.has_state ? 1U : 0U,
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
@@ -214,8 +272,12 @@ void printLinkMeta() {
       (unsigned long)snap.stats.last_rx_ms,
       (unsigned long)snap.stats.rx_packets,
       (unsigned long)snap.stats.frames_ok,
+      (unsigned long)snap.stats.state_packets,
+      (unsigned long)snap.stats.state_seq_gap,
+      (unsigned long)snap.stats.state_seq_rewind,
       (snap.link_meta.flags & telem::kLinkMetaFlagRssiValid) ? (int)snap.link_meta.gnd_ap_rssi_dbm : 0,
-      (snap.link_meta.flags & telem::kLinkMetaFlagRecorderOn) ? 1U : 0U);
+      (snap.link_meta.flags & telem::kLinkMetaFlagRecorderOn) ? 1U : 0U,
+      (unsigned long)snap.radio_rtt_ms);
 }
 
 }  // namespace
@@ -255,6 +317,10 @@ void setup() {
   }
 
   radio_link::begin(cfg);
+  g_last_configured_source_rate_hz = cfg.source_rate_hz;
+  g_last_configured_download_rate_hz = cfg.log_rate_hz;
+  g_last_configured_radio_state_only = cfg.radio_state_only;
+  scheduleAirConfigApply();
   Serial.printf("GND READY ap ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
                 WiFi.softAPIP().toString().c_str(),
                 (unsigned)kApChannel);
@@ -267,6 +333,7 @@ void setup() {
 
 void loop() {
   handleConsoleCommands();
+  syncConfiguredAirTargets();
   logApState();
   radio_link::poll();
   updateAirReadiness();

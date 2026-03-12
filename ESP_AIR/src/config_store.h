@@ -10,10 +10,11 @@ struct AppConfig {
   uint8_t uart_rx_pin;
   uint8_t uart_tx_pin;
   uint32_t uart_baud;
-  uint8_t source_rate_hz;
-  uint8_t ui_rate_hz;
-  uint8_t log_rate_hz;  // Mirrors source_rate_hz for protocol compatibility.
-  uint8_t log_mode;     // Always on.
+  uint16_t source_rate_hz;
+  uint16_t ui_rate_hz;
+  uint16_t log_rate_hz;  // AIR->GND telemetry downlink rate in normal mixed mode.
+  uint8_t log_mode;      // Always on.
+  uint8_t radio_state_only;  // Reuses reserved config byte: 0=mixed protocol, 1=state-only stress mode.
   uint32_t max_log_bytes;
 };
 

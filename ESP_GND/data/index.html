@@ -19,6 +19,7 @@
     <button data-tab="att">Attitude</button>
     <button data-tab="baro">Baro</button>
     <button data-tab="link">Radio</button>
+    <button data-tab="logs">Logs</button>
   </nav>
 
   <main>
@@ -26,7 +27,20 @@
     <section id="tab-att" class="tab">
       <pre id="att"></pre>
       <h3>Fusion Settings</h3>
-      <pre id="fusionStatus"></pre>
+      <div class="fusion-indicators">
+        <div class="fusion-indicator">
+          <span id="fusionAngularLight" class="fusion-light off"></span>
+          <span>Angular Recovery</span>
+        </div>
+        <div class="fusion-indicator">
+          <span id="fusionAccelLight" class="fusion-light off"></span>
+          <span>Acceleration Recovery</span>
+        </div>
+        <div class="fusion-indicator">
+          <span id="fusionMagLight" class="fusion-light off"></span>
+          <span>Magnetic Recovery</span>
+        </div>
+      </div>
       <div class="fusion-control">
         <div class="fusion-head"><span>gain</span><span id="gainValue">-</span></div>
         <div class="fusion-row">
@@ -56,18 +70,31 @@
     <section id="tab-link" class="tab">
       <pre id="link"></pre>
       <h3>Stream</h3>
-      <div class="row"><label>Source Hz</label><input id="sourceHz" type="number" min="1" max="50" step="1" value="50" /></div>
-      <div class="row"><label>UI Hz</label><input id="uiHz" type="number" min="5" max="20" step="1" value="20" /></div>
+      <div class="row"><label>Capture Hz</label><input id="sourceHz" type="number" min="1" max="400" step="1" value="50" /></div>
+      <div class="row"><label>Download Hz</label><input id="downloadHz" type="number" min="1" max="30" step="1" value="30" /></div>
+      <div class="row"><label>UI Hz</label><input id="uiHz" type="number" min="1" max="30" step="1" value="20" /></div>
       <div class="row"><label>AIR Recorder</label><span id="airLoggerText">Checking AIR recorder...</span></div>
       <button id="applyRate">Apply Rates</button>
-      <button id="resetAirNetwork">Reset AIR Link</button>
-      <button id="downloadDiag">Download Diag CSV</button>
-      <button id="downloadWsEvents">Download WS Event CSV</button>
-      <button id="downloadClientEvents">Download Client Event CSV</button>
-      <button id="resetCounters">Reset Counters</button>
+    </section>
+    <section id="tab-logs" class="tab">
+      <pre id="logs"></pre>
+      <h3>Recorder</h3>
+      <div class="logs-actions">
+        <button id="refreshLogStatus">Refresh Log Status</button>
+        <button id="startLog">Start Session</button>
+        <button id="stopLog">Stop Session</button>
+      </div>
+      <h3>Diagnostics</h3>
+      <div class="logs-actions">
+        <button id="resetAirNetwork">Reset AIR Link</button>
+        <button id="downloadDiag">Download Diag CSV</button>
+        <button id="downloadWsEvents">Download WS Event CSV</button>
+        <button id="downloadClientEvents">Download Client Event CSV</button>
+        <button id="resetCounters">Reset Counters</button>
+      </div>
     </section>
   </main>
 
-  <script src="/app.js?v=20260311a"></script>
+  <script src="/app.js?v=20260311c"></script>
 </body>
 </html>

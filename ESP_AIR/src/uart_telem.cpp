@@ -400,6 +400,13 @@ bool popPendingState(PendingState& out) {
   return ok;
 }
 
+void clearPendingStates() {
+  portENTER_CRITICAL(&g_mux);
+  g_pending_head = 0U;
+  g_pending_tail = 0U;
+  portEXIT_CRITICAL(&g_mux);
+}
+
 LoopbackResult runLoopbackTest(uint32_t timeout_ms) {
   LoopbackResult r = {};
   if (!g_ser) return r;

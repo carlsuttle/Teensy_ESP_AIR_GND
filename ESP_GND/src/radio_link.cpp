@@ -14,6 +14,9 @@ constexpr uint8_t kUnitGnd = 2U;
 constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
 constexpr size_t kRxQueueCapacity = 8U;
 constexpr uint8_t kSendFailThreshold = 6U;
+constexpr uint32_t kRadioPingIntervalMs = 1000U;
+constexpr uint32_t kRadioPingTimeoutMs = 1000U;
+constexpr uint8_t kRadioRttSampleCount = 8U;
 
 struct RxFrame {
   uint8_t mac[6] = {};
@@ -38,6 +41,21 @@ bool g_espnow_ready = false;
 uint8_t g_consecutive_send_failures = 0U;
 uint32_t g_tx_seq = 0U;
 uint32_t g_session_id = 0U;
+uint32_t g_air_session_id = 0U;
+uint32_t g_last_state_seq = 0U;
+bool g_radio_ping_pending = false;
+bool g_has_air_session_id = false;
+bool g_has_last_state_seq = false;
+uint32_t g_last_radio_ping_tx_ms = 0U;
+uint32_t g_last_radio_ping_attempt_ms = 0U;
+uint32_t g_last_radio_ping_seq = 0U;
+uint16_t g_radio_rtt_samples[kRadioRttSampleCount] = {};
+uint8_t g_radio_rtt_head = 0U;
+uint8_t g_radio_rtt_count = 0U;
+
+bool stateOnlyModeEnabled() {
+  return config_store::get().radio_state_only != 0U;
+}
 
 bool isBroadcastMac(const uint8_t* mac) {
   return mac && memcmp(mac, kBroadcastMac, sizeof(kBroadcastMac)) == 0;
@@ -72,7 +90,61 @@ void clearPeerState() {
   memset(g_last_sender_mac, 0, sizeof(g_last_sender_mac));
   g_has_air_mac = false;
   g_has_last_sender_mac = false;
+  g_air_session_id = 0U;
+  g_last_state_seq = 0U;
   g_consecutive_send_failures = 0U;
+  g_radio_ping_pending = false;
+  g_has_air_session_id = false;
+  g_has_last_state_seq = false;
+  g_last_radio_ping_tx_ms = 0U;
+  g_last_radio_ping_attempt_ms = 0U;
+  g_last_radio_ping_seq = 0U;
+  memset(g_radio_rtt_samples, 0, sizeof(g_radio_rtt_samples));
+  g_radio_rtt_head = 0U;
+  g_radio_rtt_count = 0U;
+  g_snapshot.radio_rtt_ms = 0U;
+  g_snapshot.radio_rtt_avg_ms = 0U;
+  g_snapshot.last_radio_pong_ms = 0U;
+}
+
+void resetStateSequenceTracking(bool preserveCurrentState) {
+  if (preserveCurrentState && g_snapshot.has_state) {
+    g_last_state_seq = g_snapshot.seq;
+    g_has_last_state_seq = true;
+  } else {
+    g_last_state_seq = 0U;
+    g_has_last_state_seq = false;
+  }
+}
+
+void resetStatsInternal() {
+  const uint32_t last_rx_ms = g_snapshot.stats.last_rx_ms;
+  g_snapshot.stats = {};
+  g_snapshot.stats.last_rx_ms = last_rx_ms;
+  g_radio_ping_pending = false;
+  g_last_radio_ping_tx_ms = 0U;
+  g_last_radio_ping_attempt_ms = 0U;
+  g_last_radio_ping_seq = 0U;
+  memset(g_radio_rtt_samples, 0, sizeof(g_radio_rtt_samples));
+  g_radio_rtt_head = 0U;
+  g_radio_rtt_count = 0U;
+  g_snapshot.radio_rtt_ms = 0U;
+  g_snapshot.radio_rtt_avg_ms = 0U;
+  g_snapshot.last_radio_pong_ms = 0U;
+  resetStateSequenceTracking(true);
+}
+
+void resetRadioRttTracking() {
+  g_radio_ping_pending = false;
+  g_last_radio_ping_tx_ms = 0U;
+  g_last_radio_ping_attempt_ms = 0U;
+  g_last_radio_ping_seq = 0U;
+  memset(g_radio_rtt_samples, 0, sizeof(g_radio_rtt_samples));
+  g_radio_rtt_head = 0U;
+  g_radio_rtt_count = 0U;
+  g_snapshot.radio_rtt_ms = 0U;
+  g_snapshot.radio_rtt_avg_ms = 0U;
+  g_snapshot.last_radio_pong_ms = 0U;
 }
 
 bool ensurePeer(const uint8_t* mac) {
@@ -236,6 +308,31 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
   return sendFrameTo(g_air_mac, type, payload, payload_len);
 }
 
+void recordRadioRttSample(uint32_t rtt_ms) {
+  g_snapshot.radio_rtt_ms = rtt_ms;
+  g_snapshot.last_radio_pong_ms = millis();
+  g_radio_rtt_samples[g_radio_rtt_head] = (uint16_t)((rtt_ms > 0xFFFFU) ? 0xFFFFU : rtt_ms);
+  g_radio_rtt_head = (uint8_t)((g_radio_rtt_head + 1U) % kRadioRttSampleCount);
+  if (g_radio_rtt_count < kRadioRttSampleCount) g_radio_rtt_count++;
+
+  uint32_t sum = 0U;
+  for (uint8_t i = 0; i < g_radio_rtt_count; ++i) {
+    sum += g_radio_rtt_samples[i];
+  }
+  g_snapshot.radio_rtt_avg_ms = g_radio_rtt_count ? (sum / g_radio_rtt_count) : 0U;
+}
+
+bool sendRadioPing() {
+  if (!g_has_air_mac) return false;
+  const uint32_t seq = g_tx_seq + 1U;
+  if (!sendFrameTo(g_air_mac, telem::CMD_RADIO_PING, nullptr, 0U)) return false;
+  g_radio_ping_pending = true;
+  g_last_radio_ping_seq = seq;
+  g_last_radio_ping_tx_ms = millis();
+  g_last_radio_ping_attempt_ms = g_last_radio_ping_tx_ms;
+  return true;
+}
+
 void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_t* payload) {
   if (hdr.payload_len != sizeof(telem::LinkHelloPayloadV1)) {
     g_snapshot.stats.len_err++;
@@ -247,6 +344,11 @@ void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_
   if (hello.unit_id != kUnitAir) {
     g_snapshot.stats.unknown_msg++;
     return;
+  }
+  if (!g_has_air_session_id || hello.session_id != g_air_session_id) {
+    g_air_session_id = hello.session_id;
+    g_has_air_session_id = true;
+    resetStateSequenceTracking(false);
   }
 
   if (learnPeer(mac)) {
@@ -261,11 +363,23 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
         g_snapshot.stats.len_err++;
         return;
       }
+      if (g_has_last_state_seq) {
+        if (hdr.seq > g_last_state_seq) {
+          g_snapshot.stats.state_seq_gap += (hdr.seq - g_last_state_seq - 1U);
+          g_last_state_seq = hdr.seq;
+        } else {
+          g_snapshot.stats.state_seq_rewind++;
+        }
+      } else {
+        g_last_state_seq = hdr.seq;
+        g_has_last_state_seq = true;
+      }
       memcpy(&g_snapshot.state, payload, sizeof(g_snapshot.state));
       g_snapshot.has_state = true;
       g_snapshot.seq = hdr.seq;
       g_snapshot.t_us = hdr.t_us;
       g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.state_packets++;
       g_snapshot.stats.last_rx_ms = millis();
       break;
     case telem::TELEM_FUSION_SETTINGS:
@@ -288,6 +402,46 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.last_rx_ms = millis();
       break;
+    case telem::TELEM_LOG_STATUS:
+      if (hdr.payload_len != sizeof(telem::LogStatusPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      memcpy(&g_snapshot.log_status, payload, sizeof(g_snapshot.log_status));
+      g_snapshot.has_log_status = true;
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
+    case telem::TELEM_CONTROL_STATUS: {
+      if (hdr.payload_len != sizeof(telem::ControlStatusPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      telem::ControlStatusPayloadV1 control = {};
+      memcpy(&control, payload, sizeof(control));
+      if ((control.flags & telem::kControlStatusFlagHasAck) != 0U) {
+        g_snapshot.has_ack = true;
+        g_snapshot.ack_command = control.ack_command;
+        g_snapshot.ack_ok = (control.flags & telem::kControlStatusFlagAckOk) != 0U;
+        g_snapshot.ack_code = control.ack_code;
+        g_snapshot.ack_rx_seq = hdr.seq;
+      }
+      if ((control.flags & telem::kControlStatusFlagHasFusion) != 0U) {
+        g_snapshot.fusion_settings = control.fusion;
+        g_snapshot.has_fusion_settings = true;
+      }
+      if ((control.flags & telem::kControlStatusFlagHasLinkMeta) != 0U) {
+        g_snapshot.link_meta = control.link_meta;
+        g_snapshot.has_link_meta = true;
+      }
+      if ((control.flags & telem::kControlStatusFlagHasLogStatus) != 0U) {
+        g_snapshot.log_status = control.log_status;
+        g_snapshot.has_log_status = true;
+      }
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
+    }
     case telem::ACK:
     case telem::NACK: {
       if (hdr.payload_len != sizeof(telem::AckPayloadV1)) {
@@ -296,6 +450,16 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::AckPayloadV1 ack = {};
       memcpy(&ack, payload, sizeof(ack));
+      if (ack.command == telem::CMD_RADIO_PING) {
+        if (g_radio_ping_pending && hdr.seq == g_last_radio_ping_seq && ack.ok != 0U) {
+          const uint32_t rtt_ms = (uint32_t)(millis() - g_last_radio_ping_tx_ms);
+          recordRadioRttSample(rtt_ms);
+        }
+        g_radio_ping_pending = false;
+        g_snapshot.stats.frames_ok++;
+        g_snapshot.stats.last_rx_ms = millis();
+        return;
+      }
       g_snapshot.has_ack = true;
       g_snapshot.ack_command = ack.command;
       g_snapshot.ack_ok = ack.ok != 0U;
@@ -341,6 +505,10 @@ void handleIncomingFrame(const RxFrame& frame) {
   applyFrame(hdr, payload);
 }
 
+void maybeSendRadioPing() {
+  resetRadioRttTracking();
+}
+
 }  // namespace
 
 void begin(const AppConfig& cfg) {
@@ -356,6 +524,9 @@ void begin(const AppConfig& cfg) {
 void reconfigure(const AppConfig& cfg) {
   (void)cfg;
   if (!initEspNow()) return;
+  if (cfg.radio_state_only) {
+    resetRadioRttTracking();
+  }
   (void)ensurePeer(kBroadcastMac);
   if (g_has_air_mac) {
     (void)ensurePeer(g_air_mac);
@@ -374,9 +545,12 @@ void poll() {
   while (popRxFrame(frame)) {
     handleIncomingFrame(frame);
   }
+  maybeSendRadioPing();
 }
 
 Snapshot snapshot() { return g_snapshot; }
+
+void resetStats() { resetStatsInternal(); }
 
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
   return sendFrame(telem::CMD_SET_FUSION_SETTINGS, &cmd, sizeof(cmd));
@@ -388,7 +562,17 @@ bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd) {
   return sendFrame(telem::CMD_SET_STREAM_RATE, &cmd, sizeof(cmd));
 }
 
+bool sendSetRadioMode(const telem::CmdSetRadioModeV1& cmd) {
+  return sendFrame(telem::CMD_SET_RADIO_MODE, &cmd, sizeof(cmd));
+}
+
 bool sendResetNetwork() { return sendFrame(telem::CMD_RESET_NETWORK, nullptr, 0U); }
+
+bool sendLogStart() { return sendFrame(telem::CMD_LOG_START, nullptr, 0U); }
+
+bool sendLogStop() { return sendFrame(telem::CMD_LOG_STOP, nullptr, 0U); }
+
+bool sendGetLogStatus() { return sendFrame(telem::CMD_GET_LOG_STATUS, nullptr, 0U); }
 
 bool hasLearnedSender() { return g_has_air_mac; }
 

@@ -56,6 +56,7 @@ void poll();
 void resync(bool drain_input = true);
 Snapshot snapshot();
 bool popPendingState(PendingState& out);
+void clearPendingStates();
 LoopbackResult runLoopbackTest(uint32_t timeout_ms = 120U);
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd);
 bool sendGetFusionSettings();

@@ -20,17 +20,34 @@ bool g_wait_getfusion_ack = false;
 bool g_wait_stream_rate_ack = false;
 uint32_t g_last_printed_ack_seq = 0;
 uint32_t g_last_stream_rate_tx_ms = 0;
-uint8_t g_last_stream_rate_ui_hz = 0;
-uint8_t g_last_stream_rate_log_hz = 0;
+uint16_t g_last_stream_rate_ui_hz = 0;
+uint16_t g_last_stream_rate_log_hz = 0;
 bool g_radio_ready = false;
 bool g_link_ready = false;
 bool g_link_wait_printed = false;
 bool g_teensy_ready = false;
 bool g_teensy_wait_printed = false;
+uint32_t g_last_radio_tx_packets = 0U;
+uint32_t g_last_radio_rx_packets = 0U;
+uint32_t g_last_source_seq_seen = 0U;
+uint32_t g_last_source_progress_ms = 0U;
+uint32_t g_last_radio_progress_ms = 0U;
+uint32_t g_last_radio_recovery_ms = 0U;
 constexpr bool kEnableAirFileLogging = false;
+constexpr size_t kStateTxReserveSlots = 4U;
+constexpr uint32_t kRadioProgressTimeoutMs = 6000U;
+constexpr uint32_t kRadioRecoveryCooldownMs = 10000U;
 
 void beginWifiStation();
 void restartWifiStation();
+
+void resetRadioWatchdog() {
+  g_last_radio_tx_packets = 0U;
+  g_last_radio_rx_packets = 0U;
+  g_last_source_seq_seen = 0U;
+  g_last_source_progress_ms = millis();
+  g_last_radio_progress_ms = millis();
+}
 
 void resetWifiStatusFlags() {
   g_radio_ready = false;
@@ -40,8 +57,8 @@ void resetWifiStatusFlags() {
 
 void ensureConfiguredStreamRate() {
   const AppConfig& cfg = config_store::get();
-  const uint8_t target_stream_hz = cfg.source_rate_hz;
-  const uint8_t target_log_hz = cfg.source_rate_hz;
+  const uint16_t target_stream_hz = cfg.source_rate_hz;
+  const uint16_t target_log_hz = cfg.log_rate_hz;
   const bool targetChanged =
       (target_stream_hz != g_last_stream_rate_ui_hz) || (target_log_hz != g_last_stream_rate_log_hz);
   const uint32_t now = millis();
@@ -63,7 +80,7 @@ bool sendConfiguredStreamRateNow() {
   const AppConfig& cfg = config_store::get();
   telem::CmdSetStreamRateV1 cmd = {};
   cmd.ws_rate_hz = cfg.source_rate_hz;
-  cmd.log_rate_hz = cfg.source_rate_hz;
+  cmd.log_rate_hz = cfg.log_rate_hz;
   const bool ok = uart_telem::sendSetStreamRate(cmd);
   if (ok) {
     g_last_stream_rate_ui_hz = cmd.ws_rate_hz;
@@ -142,7 +159,7 @@ void handleConsoleCommands() {
         Serial.printf("KICKTEENSY tx_ok=%u ws_hz=%u log_hz=%u\n",
                       ok ? 1U : 0U,
                       (unsigned)cfg.source_rate_hz,
-                      (unsigned)cfg.source_rate_hz);
+                      (unsigned)cfg.log_rate_hz);
       } else if (strcmp(g_console_line, "tx1") == 0 || strcmp(g_console_line, "sendstate") == 0) {
         const auto snap = uart_telem::snapshot();
         if (!snap.has_state) {
@@ -250,6 +267,7 @@ void restartWifiStation() {
   g_last_stream_rate_tx_ms = 0;
   g_last_stream_rate_ui_hz = 0;
   g_last_stream_rate_log_hz = 0;
+  resetRadioWatchdog();
   radio_link::reconfigure(cfg);
 }
 
@@ -329,10 +347,45 @@ void updateTeensyReadiness(const uart_telem::Snapshot& snap) {
 }
 
 void publishPendingTelemetry() {
-  uart_telem::PendingState pending = {};
-  while (uart_telem::popPendingState(pending)) {
-    (void)radio_link::publishState(pending.state, pending.seq, pending.t_us);
+  if (!radio_link::stateOnlyMode()) {
+    uart_telem::clearPendingStates();
+    return;
   }
+  if (!radio_link::hasPeer()) return;
+  uart_telem::PendingState pending = {};
+  while (radio_link::txQueueFree() > kStateTxReserveSlots && uart_telem::popPendingState(pending)) {
+    if (!radio_link::publishState(pending.state, pending.seq, pending.t_us)) {
+      break;
+    }
+  }
+}
+
+void maybeRecoverRadioLink(const uart_telem::Snapshot& snap) {
+  const auto link = radio_link::stats();
+  const uint32_t now = millis();
+  if (link.tx_packets != g_last_radio_tx_packets || link.rx_packets != g_last_radio_rx_packets) {
+    g_last_radio_tx_packets = link.tx_packets;
+    g_last_radio_rx_packets = link.rx_packets;
+    g_last_radio_progress_ms = now;
+  }
+  if (snap.has_state && snap.seq != g_last_source_seq_seen) {
+    g_last_source_seq_seen = snap.seq;
+    g_last_source_progress_ms = now;
+  }
+
+  const bool source_active =
+      g_last_source_progress_ms != 0U && (uint32_t)(now - g_last_source_progress_ms) <= 2000U;
+  if (!source_active) return;
+  if ((uint32_t)(now - g_last_radio_progress_ms) < kRadioProgressTimeoutMs) return;
+  if ((uint32_t)(now - g_last_radio_recovery_ms) < kRadioRecoveryCooldownMs) return;
+
+  Serial.printf("AIR WARN radio_watchdog restart idle_ms=%lu tx=%lu rx=%lu peer=%s\n",
+                (unsigned long)(now - g_last_radio_progress_ms),
+                (unsigned long)link.tx_packets,
+                (unsigned long)link.rx_packets,
+                radio_link::peerMac().c_str());
+  g_last_radio_recovery_ms = now;
+  restartWifiStation();
 }
 
 }  // namespace
@@ -366,6 +419,7 @@ void setup() {
   g_last_stream_rate_log_hz = 0;
   g_last_stream_rate_tx_ms = 0;
   g_wait_stream_rate_ack = true;
+  resetRadioWatchdog();
   printConsoleHelp();
 }
 
@@ -408,6 +462,7 @@ void loop() {
   ensureConfiguredStreamRate();
   publishPendingTelemetry();
   radio_link::publish(snap);
+  maybeRecoverRadioLink(snap);
 
   const uint32_t now = millis();
   if (g_stats_streaming && (uint32_t)(now - g_last_stat_ms) >= 1000U) {

@@ -51,14 +51,29 @@ void sendCtrlJson(AsyncWebSocketClient* client, const JsonDocument& doc) {
   if (client) client->text(text);
 }
 
+void appendLogStatus(JsonDocument& doc, const telem::LogStatusPayloadV1& status) {
+  JsonObject log = doc["log_status"].to<JsonObject>();
+  log["active"] = (status.flags & telem::kLogStatusFlagActive) != 0U;
+  log["requested"] = (status.flags & telem::kLogStatusFlagRequested) != 0U;
+  log["backend_ready"] = (status.flags & telem::kLogStatusFlagBackendReady) != 0U;
+  log["media_present"] = (status.flags & telem::kLogStatusFlagMediaPresent) != 0U;
+  log["last_command"] = status.last_command;
+  log["session_id"] = status.session_id;
+  log["bytes_written"] = status.bytes_written;
+  log["free_bytes"] = status.free_bytes;
+  log["last_change_ms"] = status.last_change_ms;
+}
+
 void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
   const AppConfig& cfg = config_store::get();
   JsonDocument doc;
   doc["type"] = "config";
   doc["source_rate_hz"] = cfg.source_rate_hz;
   doc["ui_rate_hz"] = cfg.ui_rate_hz;
-  doc["log_rate_hz"] = cfg.source_rate_hz;
+  doc["log_rate_hz"] = cfg.log_rate_hz;
+  doc["download_rate_hz"] = cfg.log_rate_hz;
   doc["log_mode"] = 1;
+  doc["radio_state_only"] = cfg.radio_state_only != 0U;
 
   if (client) {
     sendCtrlJson(client, doc);
@@ -74,7 +89,8 @@ void sendAck(AsyncWebSocketClient* client,
              const char* cmd,
              bool ok,
              uint32_t code = 0,
-             const telem::FusionSettingsV1* fusion = nullptr) {
+             const telem::FusionSettingsV1* fusion = nullptr,
+             const telem::LogStatusPayloadV1* log_status = nullptr) {
   JsonDocument doc;
   doc["type"] = "ack";
   doc["cmd"] = cmd ? cmd : "";
@@ -86,6 +102,9 @@ void sendAck(AsyncWebSocketClient* client,
     f["accelerationRejection"] = fusion->accelerationRejection;
     f["magneticRejection"] = fusion->magneticRejection;
     f["recoveryTriggerPeriod"] = fusion->recoveryTriggerPeriod;
+  }
+  if (log_status) {
+    appendLogStatus(doc, *log_status);
   }
   sendCtrlJson(client, doc);
 }
@@ -118,6 +137,18 @@ void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t le
       has_fusion = true;
     }
     sendAck(client, "get_fusion", requested, has_fusion ? 0 : 1, has_fusion ? &fusion : nullptr);
+    return;
+  }
+
+  if (strcmp(type, "get_log_status") == 0) {
+    const bool requested = radio_link::sendGetLogStatus();
+    const auto snap = radio_link::snapshot();
+    sendAck(client,
+            "get_log_status",
+            requested,
+            snap.has_log_status ? 0U : 1U,
+            nullptr,
+            snap.has_log_status ? &snap.log_status : nullptr);
     return;
   }
 
@@ -157,6 +188,24 @@ void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t le
       (void)radio_link::sendGetFusionSettings();
     }
     sendAck(client, "set_fusion", ok, ok ? 0 : 1, nullptr);
+    return;
+  }
+
+  if (strcmp(type, "start_log") == 0) {
+    const bool ok = radio_link::sendLogStart();
+    if (ok) {
+      (void)radio_link::sendGetLogStatus();
+    }
+    sendAck(client, "start_log", ok, ok ? 0U : 1U, nullptr);
+    return;
+  }
+
+  if (strcmp(type, "stop_log") == 0) {
+    const bool ok = radio_link::sendLogStop();
+    if (ok) {
+      (void)radio_link::sendGetLogStatus();
+    }
+    sendAck(client, "stop_log", ok, ok ? 0U : 1U, nullptr);
     return;
   }
 }
@@ -214,6 +263,9 @@ void serveDiagCsv(AsyncWebServerRequest* request) {
   csv += "rx_packets," + String(snap.stats.rx_packets) + "\n";
   csv += "rx_bytes," + String(snap.stats.rx_bytes) + "\n";
   csv += "frames_ok," + String(snap.stats.frames_ok) + "\n";
+  csv += "state_packets," + String(snap.stats.state_packets) + "\n";
+  csv += "state_seq_gap," + String(snap.stats.state_seq_gap) + "\n";
+  csv += "state_seq_rewind," + String(snap.stats.state_seq_rewind) + "\n";
   csv += "len_err," + String(snap.stats.len_err) + "\n";
   csv += "unknown_msg," + String(snap.stats.unknown_msg) + "\n";
   csv += "drop," + String(snap.stats.drop) + "\n";
@@ -229,8 +281,20 @@ void serveDiagCsv(AsyncWebServerRequest* request) {
   csv += "air_rssi_dbm," + String((int)snap.link_meta.gnd_ap_rssi_dbm) + "\n";
   csv += "air_scan_age_ms," + String((unsigned long)snap.link_meta.scan_age_ms) + "\n";
   csv += "air_link_age_ms," + String((unsigned long)snap.link_meta.link_age_ms) + "\n";
+  csv += "radio_rtt_ms," + String((unsigned long)snap.radio_rtt_ms) + "\n";
+  csv += "radio_rtt_avg_ms," + String((unsigned long)snap.radio_rtt_avg_ms) + "\n";
+  csv += "last_radio_pong_ms," + String((unsigned long)snap.last_radio_pong_ms) + "\n";
   csv += "air_sender_mac," + radio_link::lastSenderMac() + "\n";
   csv += "air_target_mac," + radio_link::targetSenderMac() + "\n";
+  csv += "air_log_active," + String((snap.log_status.flags & telem::kLogStatusFlagActive) ? 1 : 0) + "\n";
+  csv += "air_log_requested," + String((snap.log_status.flags & telem::kLogStatusFlagRequested) ? 1 : 0) + "\n";
+  csv += "air_log_backend_ready," + String((snap.log_status.flags & telem::kLogStatusFlagBackendReady) ? 1 : 0) + "\n";
+  csv += "air_log_media_present," + String((snap.log_status.flags & telem::kLogStatusFlagMediaPresent) ? 1 : 0) + "\n";
+  csv += "air_log_last_command," + String((unsigned)snap.log_status.last_command) + "\n";
+  csv += "air_log_session_id," + String((unsigned long)snap.log_status.session_id) + "\n";
+  csv += "air_log_bytes_written," + String((unsigned long)snap.log_status.bytes_written) + "\n";
+  csv += "air_log_free_bytes," + String((unsigned long)snap.log_status.free_bytes) + "\n";
+  csv += "air_log_last_change_ms," + String((unsigned long)snap.log_status.last_change_ms) + "\n";
   request->send(200, "text/csv", csv);
 }
 
@@ -298,6 +362,7 @@ void begin() {
         snap.stats.last_rx_ms != 0U && (uint32_t)(millis() - snap.stats.last_rx_ms) <= 3000U;
     JsonDocument doc;
     doc["transport"] = "ESP-NOW";
+    doc["radio_state_only"] = config_store::get().radio_state_only != 0U;
     doc["air_link_fresh"] = air_link_fresh;
     doc["ap_clients"] = WiFi.softAPgetStationNum();
     doc["has_state"] = snap.has_state;
@@ -306,6 +371,9 @@ void begin() {
     doc["t_us"] = snap.t_us;
     doc["link_rx"] = snap.stats.rx_packets;
     doc["ok"] = snap.stats.frames_ok;
+    doc["state_packets"] = snap.stats.state_packets;
+    doc["state_seq_gap"] = snap.stats.state_seq_gap;
+    doc["state_seq_rewind"] = snap.stats.state_seq_rewind;
     doc["len_err"] = snap.stats.len_err;
     doc["unknown_msg"] = snap.stats.unknown_msg;
     doc["drop"] = snap.stats.drop;
@@ -316,8 +384,21 @@ void begin() {
     doc["air_rssi_dbm"] = snap.link_meta.gnd_ap_rssi_dbm;
     doc["air_scan_age_ms"] = snap.link_meta.scan_age_ms;
     doc["air_link_age_ms"] = snap.link_meta.link_age_ms;
+    doc["radio_rtt_ms"] = snap.radio_rtt_ms;
+    doc["radio_rtt_avg_ms"] = snap.radio_rtt_avg_ms;
+    doc["last_radio_pong_ms"] = snap.last_radio_pong_ms;
     doc["air_sender_mac"] = radio_link::lastSenderMac();
     doc["air_target_mac"] = radio_link::targetSenderMac();
+    doc["has_log_status"] = snap.has_log_status;
+    doc["air_log_active"] = (snap.log_status.flags & telem::kLogStatusFlagActive) != 0U;
+    doc["air_log_requested"] = (snap.log_status.flags & telem::kLogStatusFlagRequested) != 0U;
+    doc["air_log_backend_ready"] = (snap.log_status.flags & telem::kLogStatusFlagBackendReady) != 0U;
+    doc["air_log_media_present"] = (snap.log_status.flags & telem::kLogStatusFlagMediaPresent) != 0U;
+    doc["air_log_last_command"] = snap.log_status.last_command;
+    doc["air_log_session_id"] = snap.log_status.session_id;
+    doc["air_log_bytes_written"] = snap.log_status.bytes_written;
+    doc["air_log_free_bytes"] = snap.log_status.free_bytes;
+    doc["air_log_last_change_ms"] = snap.log_status.last_change_ms;
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -328,8 +409,10 @@ void begin() {
     JsonDocument doc;
     doc["source_rate_hz"] = cfg.source_rate_hz;
     doc["ui_rate_hz"] = cfg.ui_rate_hz;
-    doc["log_rate_hz"] = cfg.source_rate_hz;
+    doc["log_rate_hz"] = cfg.log_rate_hz;
+    doc["download_rate_hz"] = cfg.log_rate_hz;
     doc["log_mode"] = 1;
+    doc["radio_state_only"] = cfg.radio_state_only != 0U;
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -353,16 +436,26 @@ void begin() {
         }
 
         AppConfig cfg = config_store::get();
-        if (!doc["source_rate_hz"].isNull()) cfg.source_rate_hz = doc["source_rate_hz"].as<uint8_t>();
-        if (!doc["ui_rate_hz"].isNull()) cfg.ui_rate_hz = doc["ui_rate_hz"].as<uint8_t>();
-        cfg.log_rate_hz = cfg.source_rate_hz;
+        if (!doc["source_rate_hz"].isNull()) cfg.source_rate_hz = doc["source_rate_hz"].as<uint16_t>();
+        if (!doc["ui_rate_hz"].isNull()) cfg.ui_rate_hz = doc["ui_rate_hz"].as<uint16_t>();
+        if (!doc["download_rate_hz"].isNull()) {
+          cfg.log_rate_hz = doc["download_rate_hz"].as<uint16_t>();
+        } else if (!doc["log_rate_hz"].isNull()) {
+          cfg.log_rate_hz = doc["log_rate_hz"].as<uint16_t>();
+        }
+        if (!doc["radio_state_only"].isNull()) cfg.radio_state_only = doc["radio_state_only"].as<bool>() ? 1U : 0U;
         cfg.log_mode = 1U;
         config_store::update(cfg);
         radio_link::reconfigure(cfg);
 
         telem::CmdSetStreamRateV1 cmd = {};
         cmd.ws_rate_hz = cfg.source_rate_hz;
-        cmd.log_rate_hz = cfg.source_rate_hz;
+        cmd.log_rate_hz = cfg.log_rate_hz;
+        telem::CmdSetRadioModeV1 radio_mode = {};
+        radio_mode.state_only = cfg.radio_state_only ? 1U : 0U;
+        radio_mode.control_rate_hz = 2U;
+        radio_mode.telem_rate_hz = cfg.log_rate_hz;
+        (void)radio_link::sendSetRadioMode(radio_mode);
         (void)radio_link::sendSetStreamRate(cmd);
 
         broadcastConfig();
@@ -409,6 +502,7 @@ void resetCounters() {
   g_ws_state_seq = 0;
   g_ws_event_head = 0;
   g_ws_event_count = 0;
+  radio_link::resetStats();
 }
 
 }  // namespace ws_server
