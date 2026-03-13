@@ -1322,16 +1322,17 @@ function renderStale() {
   renderLinkStale();
   renderLogsStale();
   statsEl.innerHTML =
-    `<span class="stats-line"><span>fps: -</span><span>ping: -</span><span class="dqi-badge dqi-unknown">D:--</span><span class="dqi-badge dqi-unknown">U:--</span></span>`;
+    `<span class="stats-line"><span>fps: -</span><span class="dqi-badge dqi-unknown">DQI:--</span></span>`;
 }
 
 function renderHeader() {
-  const pingAvgTxt = isPongFresh() ? pingAvgMs : null;
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
-  const dqiValueTxt = dqiSmoothed === null ? "--" : String(dqiSmoothed);
-  const uplinkDqiValueTxt = uplinkDqiSmoothed === null ? "--" : String(uplinkDqiSmoothed);
+  const headerDqi = dqiSmoothed === null
+    ? uplinkDqiSmoothed
+    : (uplinkDqiSmoothed === null ? dqiSmoothed : Math.min(dqiSmoothed, uplinkDqiSmoothed));
+  const dqiValueTxt = headerDqi === null ? "--" : String(headerDqi);
   statsEl.innerHTML =
-    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span><span>ping: ${fmtMs(pingAvgTxt)}</span><span class="${dqiBadgeClass(dqiSmoothed)}">D:${dqiValueTxt}</span><span class="${dqiBadgeClass(uplinkDqiSmoothed)}">U:${uplinkDqiValueTxt}</span></span>`;
+    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span><span class="${dqiBadgeClass(headerDqi)}">DQI:${dqiValueTxt}</span></span>`;
 }
 
 function renderGpsPanel() {
