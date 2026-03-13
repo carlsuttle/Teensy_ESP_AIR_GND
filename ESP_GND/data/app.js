@@ -7,6 +7,8 @@ const baroEl = document.getElementById("baro");
 const linkEl = document.getElementById("link");
 const logsEl = document.getElementById("logs");
 const pfdCanvas = document.getElementById("pfdCanvas");
+const appShellFrameEl = document.getElementById("appShellFrame");
+const appShellEl = document.getElementById("appShell");
 const airLoggerTextEl = document.getElementById("airLoggerText");
 const fusionAngularLightEl = document.getElementById("fusionAngularLight");
 const fusionAccelLightEl = document.getElementById("fusionAccelLight");
@@ -768,8 +770,15 @@ fusion.recovery: - s / - smp`;
 function configurePfdCanvas() {
   if (!pfdCanvas) return null;
   const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
-  const cssW = Math.max(320, Math.round(pfdCanvas.clientWidth || 390));
+  const wrap = pfdCanvas.parentElement;
+  const wrapW = Math.round((wrap && wrap.clientWidth) ? wrap.clientWidth : (pfdCanvas.clientWidth || 390));
+  const canvasTop = pfdCanvas.getBoundingClientRect().top;
+  const availableH = Math.max(420, Math.floor(window.innerHeight - canvasTop - 12));
+  const maxWFromHeight = Math.floor(availableH * (390 / 680));
+  const cssW = Math.max(320, Math.min(wrapW, maxWFromHeight));
   const cssH = Math.round(cssW * (680 / 390));
+  pfdCanvas.style.width = `${cssW}px`;
+  pfdCanvas.style.height = `${cssH}px`;
   const pxW = Math.round(cssW * dpr);
   const pxH = Math.round(cssH * dpr);
   if (pfdCanvas.width !== pxW || pfdCanvas.height !== pxH) {
@@ -782,6 +791,20 @@ function configurePfdCanvas() {
   if (!ctx) return null;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { ctx, w: cssW, h: cssH };
+}
+
+function updateUiScale() {
+  if (!appShellEl || !appShellFrameEl) return;
+  const baseW = 430;
+  appShellEl.style.transform = "scale(1)";
+  const naturalH = appShellEl.scrollHeight;
+  const viewportW = window.innerWidth;
+  const viewportH = window.innerHeight;
+  const scaleW = viewportW / baseW;
+  const scaleH = viewportH / Math.max(1, naturalH);
+  const scale = Math.max(0.55, Math.min(scaleW, scaleH));
+  appShellEl.style.transform = `scale(${scale})`;
+  appShellFrameEl.style.height = `${Math.ceil(naturalH * scale)}px`;
 }
 
 function drawRoundedRect(ctx, x, y, w, h, r) {
@@ -884,7 +907,7 @@ function renderPfdPanel() {
   const fixType = Number(gps.fx ?? 0);
   const sats = Number(gps.sv ?? 0);
   const courseDeg = courseSetDeg;
-  const horizonR = Math.min(w * 0.34, 165);
+  const horizonR = Math.max(120, Math.min(w * 0.34, h * 0.28));
   const horizonCx = w * 0.5;
   const horizonCy = horizonR + 46;
   const pitchPxPerDeg = horizonR / 40;
@@ -1101,7 +1124,7 @@ function renderPfdPanel() {
   const hsiAreaH = h - hsiAreaY - 12;
   const hsiCx = hsiAreaX + (hsiAreaW * 0.5);
   const hsiCy = hsiAreaY + (hsiAreaH * 0.5);
-  const hsiR = Math.min(126, Math.max(75, Math.min(hsiAreaW, hsiAreaH) * 0.39));
+  const hsiR = Math.max(75, Math.min(hsiAreaW * 0.34, hsiAreaH * 0.42));
   pfdTapTargets = [];
   ctx.strokeStyle = "#334155";
   ctx.lineWidth = 2;
@@ -1932,6 +1955,7 @@ document.querySelectorAll(".tabs button").forEach((b) => {
 });
 
 window.addEventListener("resize", () => {
+  updateUiScale();
   uiDirty = true;
   renderNow();
 });
@@ -2115,6 +2139,7 @@ setFusionUiValues(
   FUSION_DEFAULTS.magneticRejection,
   FUSION_DEFAULTS.recoveryTriggerPeriod
 );
+updateUiScale();
 connectCtrl();
 connectState();
 setRecorderUi(false, false);

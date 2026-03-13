@@ -38,6 +38,7 @@ uint8_t g_last_sender_mac[6] = {};
 bool g_has_air_mac = false;
 bool g_has_last_sender_mac = false;
 bool g_espnow_ready = false;
+bool g_radio_lr_mode = true;
 uint8_t g_consecutive_send_failures = 0U;
 uint32_t g_tx_seq = 0U;
 uint32_t g_session_id = 0U;
@@ -55,6 +56,14 @@ uint8_t g_radio_rtt_count = 0U;
 
 bool stateOnlyModeEnabled() {
   return config_store::get().radio_state_only != 0U;
+}
+
+uint8_t desiredProtocol() {
+  return (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+}
+
+void applyRadioProtocol() {
+  (void)esp_wifi_set_protocol(WIFI_IF_AP, desiredProtocol());
 }
 
 bool isBroadcastMac(const uint8_t* mac) {
@@ -131,6 +140,11 @@ void resetStatsInternal() {
   g_snapshot.radio_rtt_ms = 0U;
   g_snapshot.radio_rtt_avg_ms = 0U;
   g_snapshot.last_radio_pong_ms = 0U;
+  g_snapshot.uplink_ping_sent = 0U;
+  g_snapshot.uplink_ping_ok = 0U;
+  g_snapshot.uplink_ping_timeout = 0U;
+  g_snapshot.uplink_ping_miss_streak = 0U;
+  g_snapshot.last_uplink_ack_ms = 0U;
   resetStateSequenceTracking(true);
 }
 
@@ -145,6 +159,7 @@ void resetRadioRttTracking() {
   g_snapshot.radio_rtt_ms = 0U;
   g_snapshot.radio_rtt_avg_ms = 0U;
   g_snapshot.last_radio_pong_ms = 0U;
+  g_snapshot.uplink_ping_miss_streak = 0U;
 }
 
 bool ensurePeer(const uint8_t* mac) {
@@ -246,6 +261,7 @@ bool initEspNow() {
     return false;
   }
 
+  applyRadioProtocol();
   g_espnow_ready = true;
   return true;
 }
@@ -311,6 +327,9 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
 void recordRadioRttSample(uint32_t rtt_ms) {
   g_snapshot.radio_rtt_ms = rtt_ms;
   g_snapshot.last_radio_pong_ms = millis();
+  g_snapshot.last_uplink_ack_ms = g_snapshot.last_radio_pong_ms;
+  g_snapshot.uplink_ping_ok++;
+  g_snapshot.uplink_ping_miss_streak = 0U;
   g_radio_rtt_samples[g_radio_rtt_head] = (uint16_t)((rtt_ms > 0xFFFFU) ? 0xFFFFU : rtt_ms);
   g_radio_rtt_head = (uint8_t)((g_radio_rtt_head + 1U) % kRadioRttSampleCount);
   if (g_radio_rtt_count < kRadioRttSampleCount) g_radio_rtt_count++;
@@ -330,6 +349,7 @@ bool sendRadioPing() {
   g_last_radio_ping_seq = seq;
   g_last_radio_ping_tx_ms = millis();
   g_last_radio_ping_attempt_ms = g_last_radio_ping_tx_ms;
+  g_snapshot.uplink_ping_sent++;
   return true;
 }
 
@@ -358,6 +378,17 @@ void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_
 
 void applyControlStatusPayload(const telem::ControlStatusPayloadV1& control, const telem::FrameHeader& hdr) {
   if ((control.flags & telem::kControlStatusFlagHasAck) != 0U) {
+    const bool ack_ok = (control.flags & telem::kControlStatusFlagAckOk) != 0U;
+    if (control.ack_command == telem::CMD_RADIO_PING) {
+      if (g_radio_ping_pending && ack_ok) {
+        const uint32_t rtt_ms = (uint32_t)(millis() - g_last_radio_ping_tx_ms);
+        recordRadioRttSample(rtt_ms);
+      } else if (g_radio_ping_pending && !ack_ok) {
+        g_snapshot.uplink_ping_timeout++;
+        g_snapshot.uplink_ping_miss_streak++;
+      }
+      g_radio_ping_pending = false;
+    }
     g_snapshot.has_ack = true;
     g_snapshot.ack_command = control.ack_command;
     g_snapshot.ack_ok = (control.flags & telem::kControlStatusFlagAckOk) != 0U;
@@ -553,6 +584,9 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
         if (g_radio_ping_pending && hdr.seq == g_last_radio_ping_seq && ack.ok != 0U) {
           const uint32_t rtt_ms = (uint32_t)(millis() - g_last_radio_ping_tx_ms);
           recordRadioRttSample(rtt_ms);
+        } else if (ack.ok == 0U) {
+          g_snapshot.uplink_ping_timeout++;
+          g_snapshot.uplink_ping_miss_streak++;
         }
         g_radio_ping_pending = false;
         g_snapshot.stats.frames_ok++;
@@ -605,23 +639,38 @@ void handleIncomingFrame(const RxFrame& frame) {
 }
 
 void maybeSendRadioPing() {
-  resetRadioRttTracking();
+  const uint32_t now = millis();
+  if (!g_has_air_mac) return;
+  if (g_radio_ping_pending) {
+    if ((uint32_t)(now - g_last_radio_ping_tx_ms) >= kRadioPingTimeoutMs) {
+      g_radio_ping_pending = false;
+      g_snapshot.uplink_ping_timeout++;
+      g_snapshot.uplink_ping_miss_streak++;
+    }
+    return;
+  }
+  if (g_last_radio_ping_attempt_ms != 0U &&
+      (uint32_t)(now - g_last_radio_ping_attempt_ms) < kRadioPingIntervalMs) {
+    return;
+  }
+  (void)sendRadioPing();
 }
 
 }  // namespace
 
 void begin(const AppConfig& cfg) {
-  (void)cfg;
   memset(&g_snapshot, 0, sizeof(g_snapshot));
   clearPeerState();
   g_espnow_ready = false;
+  g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_tx_seq = 0U;
   g_session_id = esp_random();
   (void)initEspNow();
 }
 
 void reconfigure(const AppConfig& cfg) {
-  (void)cfg;
+  g_radio_lr_mode = cfg.radio_lr_mode != 0U;
+  applyRadioProtocol();
   if (!initEspNow()) return;
   if (cfg.radio_state_only) {
     resetRadioRttTracking();

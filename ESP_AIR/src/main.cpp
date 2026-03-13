@@ -250,9 +250,10 @@ void beginWifiStation() {
   (void)esp_wifi_set_max_tx_power(78);
   (void)esp_wifi_set_channel(telem::kRadioChannel, WIFI_SECOND_CHAN_NONE);
 
-  Serial.printf("AIR RADIO channel=%u ap=%s\n",
+  Serial.printf("AIR RADIO channel=%u ap=%s lr=%u\n",
                 (unsigned)telem::kRadioChannel,
-                cfg.ap_ssid);
+                cfg.ap_ssid,
+                (unsigned)(cfg.radio_lr_mode != 0U));
 }
 
 void restartWifiStation() {

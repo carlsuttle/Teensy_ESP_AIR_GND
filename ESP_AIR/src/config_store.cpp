@@ -71,6 +71,7 @@ void setDefaults(AppConfig& c) {
   c.log_rate_hz = 50;
   c.log_mode = 1;
   c.radio_state_only = 0;
+  c.radio_lr_mode = 1;
   c.max_log_bytes = 4UL * 1024UL * 1024UL;
 }
 
@@ -86,6 +87,7 @@ void sanitize(AppConfig& c) {
   c.ap_pass[sizeof(c.ap_pass) - 1] = '\0';
   c.log_mode = 1;
   c.radio_state_only = c.radio_state_only ? 1U : 0U;
+  c.radio_lr_mode = c.radio_lr_mode ? 1U : 0U;
 }
 
 void saveInternal() {

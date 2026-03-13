@@ -62,6 +62,7 @@ bool g_log_media_present = false;
 bool g_rssi_valid = false;
 bool g_control_has_ack = false;
 bool g_control_ack_ok = false;
+bool g_radio_lr_mode = true;
 uint8_t g_consecutive_send_failures = 0U;
 uint8_t g_radio_control_rate_hz = kDefaultRadioControlRateHz;
 uint32_t g_last_hello_tx_ms = 0U;
@@ -126,6 +127,15 @@ String macToString(const uint8_t* mac) {
 bool initEspNow();
 void clearPeerState();
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us);
+
+uint8_t desiredProtocol() {
+  const uint8_t kNormalMask = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  return g_radio_lr_mode ? (uint8_t)(kNormalMask | WIFI_PROTOCOL_LR) : kNormalMask;
+}
+
+void applyRadioProtocol() {
+  (void)esp_wifi_set_protocol(WIFI_IF_STA, desiredProtocol());
+}
 
 size_t txQueueCountLocked() {
   if (g_tx_head >= g_tx_tail) return (size_t)(g_tx_head - g_tx_tail);
@@ -359,6 +369,7 @@ bool initEspNow() {
     return false;
   }
 
+  applyRadioProtocol();
   g_espnow_ready = true;
   return true;
 }
@@ -468,6 +479,8 @@ void markLogStatusDirty() {
 void sampleGroundRssi() {
   const uint32_t now = millis();
   if (!g_espnow_ready) return;
+  if (g_radio_lr_mode) return;
+  if (g_tx_in_flight) return;
   if ((uint32_t)(now - g_last_rssi_sample_ms) < kRssiSampleIntervalMs) return;
 
   const AppConfig& cfg = config_store::get();
@@ -702,11 +715,14 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
           constrain((uint8_t)(cmd.control_rate_hz == 0U ? kDefaultRadioControlRateHz : cmd.control_rate_hz), 1U, 10U);
       const uint16_t new_telem_rate_hz =
           new_state_only ? constrain((uint16_t)cmd.telem_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
+      const bool new_radio_lr_mode = cmd.radio_lr_mode != 0U;
       const bool changed = new_state_only != g_state_only_mode || new_control_rate_hz != g_radio_control_rate_hz ||
-                           new_telem_rate_hz != g_radio_telem_rate_hz;
+                           new_telem_rate_hz != g_radio_telem_rate_hz || new_radio_lr_mode != g_radio_lr_mode;
       g_state_only_mode = new_state_only;
       g_radio_control_rate_hz = new_control_rate_hz;
       g_radio_telem_rate_hz = new_telem_rate_hz;
+      g_radio_lr_mode = new_radio_lr_mode;
+      applyRadioProtocol();
       if (changed) {
         g_last_hello_tx_ms = 0U;
         g_last_telem_tx_ms = 0U;
@@ -835,6 +851,7 @@ void begin(const AppConfig& cfg) {
   g_espnow_ready = false;
   g_network_reset_requested = false;
   g_state_only_mode = cfg.radio_state_only != 0U;
+  g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_radio_control_rate_hz = kDefaultRadioControlRateHz;
   g_radio_telem_rate_hz = g_state_only_mode ? constrain((uint16_t)cfg.log_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
   g_control_has_ack = false;
@@ -850,8 +867,10 @@ void begin(const AppConfig& cfg) {
 
 void reconfigure(const AppConfig& cfg) {
   g_state_only_mode = cfg.radio_state_only != 0U;
+  g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_radio_control_rate_hz = kDefaultRadioControlRateHz;
   g_radio_telem_rate_hz = g_state_only_mode ? constrain((uint16_t)cfg.log_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
+  applyRadioProtocol();
   if (!initEspNow()) return;
   (void)ensurePeer(kBroadcastMac);
   if (g_has_gnd_mac) {
@@ -900,6 +919,8 @@ size_t txQueueFree() {
 }
 
 bool stateOnlyMode() { return g_state_only_mode; }
+
+bool longRangeMode() { return g_radio_lr_mode; }
 
 bool hasPeer() { return g_has_gnd_mac; }
 

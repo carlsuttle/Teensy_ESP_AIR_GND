@@ -41,6 +41,11 @@ struct Snapshot {
   uint32_t radio_rtt_ms = 0;
   uint32_t radio_rtt_avg_ms = 0;
   uint32_t last_radio_pong_ms = 0;
+  uint32_t uplink_ping_sent = 0;
+  uint32_t uplink_ping_ok = 0;
+  uint32_t uplink_ping_timeout = 0;
+  uint32_t uplink_ping_miss_streak = 0;
+  uint32_t last_uplink_ack_ms = 0;
   Stats stats = {};
 };
 

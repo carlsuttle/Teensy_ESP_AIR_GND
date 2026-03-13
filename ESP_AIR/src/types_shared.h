@@ -157,7 +157,10 @@ struct CmdSetStreamRateV1 {
 struct CmdSetRadioModeV1 {
   uint8_t state_only;
   uint8_t control_rate_hz;
+  uint8_t radio_lr_mode;
+  uint8_t reserved0;
   uint16_t telem_rate_hz;
+  uint16_t reserved1;
 };
 
 struct AckPayloadV1 {

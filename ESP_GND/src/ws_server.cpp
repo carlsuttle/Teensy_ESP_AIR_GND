@@ -20,6 +20,10 @@ constexpr uint16_t kFixedUiRateHz = 30U;
 
 uint32_t g_ws_state_seq = 0;
 uint32_t g_last_state_broadcast_ms = 0;
+uint32_t g_last_state_seq_sent = 0;
+uint32_t g_last_ui_tx_ms = 0;
+uint32_t g_last_ui_tx_latency_ms = 0;
+uint32_t g_max_ui_tx_latency_ms = 0;
 
 struct EventRow {
   uint32_t ms = 0;
@@ -77,6 +81,7 @@ void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
   doc["download_rate_hz"] = kFixedDownlinkRateHz;
   doc["log_mode"] = 1;
   doc["radio_state_only"] = cfg.radio_state_only != 0U;
+  doc["radio_lr_mode"] = cfg.radio_lr_mode != 0U;
 
   if (client) {
     sendCtrlJson(client, doc);
@@ -287,6 +292,14 @@ void serveDiagCsv(AsyncWebServerRequest* request) {
   csv += "radio_rtt_ms," + String((unsigned long)snap.radio_rtt_ms) + "\n";
   csv += "radio_rtt_avg_ms," + String((unsigned long)snap.radio_rtt_avg_ms) + "\n";
   csv += "last_radio_pong_ms," + String((unsigned long)snap.last_radio_pong_ms) + "\n";
+  csv += "uplink_ping_sent," + String((unsigned long)snap.uplink_ping_sent) + "\n";
+  csv += "uplink_ping_ok," + String((unsigned long)snap.uplink_ping_ok) + "\n";
+  csv += "uplink_ping_timeout," + String((unsigned long)snap.uplink_ping_timeout) + "\n";
+  csv += "uplink_ping_miss_streak," + String((unsigned long)snap.uplink_ping_miss_streak) + "\n";
+  csv += "last_uplink_ack_ms," + String((unsigned long)snap.last_uplink_ack_ms) + "\n";
+  csv += "ui_tx_ms," + String((unsigned long)g_last_ui_tx_ms) + "\n";
+  csv += "ui_tx_latency_ms," + String((unsigned long)g_last_ui_tx_latency_ms) + "\n";
+  csv += "ui_tx_latency_max_ms," + String((unsigned long)g_max_ui_tx_latency_ms) + "\n";
   csv += "air_sender_mac," + radio_link::lastSenderMac() + "\n";
   csv += "air_target_mac," + radio_link::targetSenderMac() + "\n";
   csv += "air_log_active," + String((snap.log_status.flags & telem::kLogStatusFlagActive) ? 1 : 0) + "\n";
@@ -326,10 +339,18 @@ void broadcastState() {
   const uint32_t now = millis();
   const uint32_t interval_ms = 1000UL / (uint32_t)kFixedUiRateHz;
   if ((now - g_last_state_broadcast_ms) < interval_ms) return;
-  g_last_state_broadcast_ms = now;
 
   const auto snap = radio_link::snapshot();
   if (!snap.has_state) return;
+  if (snap.seq == 0U || snap.seq == g_last_state_seq_sent) return;
+
+  g_last_state_broadcast_ms = now;
+  g_last_state_seq_sent = snap.seq;
+  g_last_ui_tx_ms = now;
+  g_last_ui_tx_latency_ms = snap.stats.last_rx_ms ? (uint32_t)(now - snap.stats.last_rx_ms) : 0U;
+  if (g_last_ui_tx_latency_ms > g_max_ui_tx_latency_ms) {
+    g_max_ui_tx_latency_ms = g_last_ui_tx_latency_ms;
+  }
 
   telem::WsStateHeaderV2 hdr = {};
   hdr.magic = telem::kWsStateMagic;
@@ -363,6 +384,7 @@ void begin() {
     JsonDocument doc;
     doc["transport"] = "ESP-NOW";
     doc["radio_state_only"] = config_store::get().radio_state_only != 0U;
+    doc["radio_lr_mode"] = config_store::get().radio_lr_mode != 0U;
     doc["air_link_fresh"] = air_link_fresh;
     doc["ap_clients"] = WiFi.softAPgetStationNum();
     doc["has_state"] = snap.has_state;
@@ -387,6 +409,14 @@ void begin() {
     doc["radio_rtt_ms"] = snap.radio_rtt_ms;
     doc["radio_rtt_avg_ms"] = snap.radio_rtt_avg_ms;
     doc["last_radio_pong_ms"] = snap.last_radio_pong_ms;
+    doc["uplink_ping_sent"] = snap.uplink_ping_sent;
+    doc["uplink_ping_ok"] = snap.uplink_ping_ok;
+    doc["uplink_ping_timeout"] = snap.uplink_ping_timeout;
+    doc["uplink_ping_miss_streak"] = snap.uplink_ping_miss_streak;
+    doc["last_uplink_ack_ms"] = snap.last_uplink_ack_ms;
+    doc["ui_tx_ms"] = g_last_ui_tx_ms;
+    doc["ui_tx_latency_ms"] = g_last_ui_tx_latency_ms;
+    doc["ui_tx_latency_max_ms"] = g_max_ui_tx_latency_ms;
     doc["air_sender_mac"] = radio_link::lastSenderMac();
     doc["air_target_mac"] = radio_link::targetSenderMac();
     doc["has_log_status"] = snap.has_log_status;
@@ -414,6 +444,7 @@ void begin() {
     doc["download_rate_hz"] = kFixedDownlinkRateHz;
     doc["log_mode"] = 1;
     doc["radio_state_only"] = cfg.radio_state_only != 0U;
+    doc["radio_lr_mode"] = cfg.radio_lr_mode != 0U;
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -439,6 +470,7 @@ void begin() {
         AppConfig cfg = config_store::get();
         if (!doc["source_rate_hz"].isNull()) cfg.source_rate_hz = doc["source_rate_hz"].as<uint16_t>();
         if (!doc["radio_state_only"].isNull()) cfg.radio_state_only = doc["radio_state_only"].as<bool>() ? 1U : 0U;
+        if (!doc["radio_lr_mode"].isNull()) cfg.radio_lr_mode = doc["radio_lr_mode"].as<bool>() ? 1U : 0U;
         cfg.log_mode = 1U;
         config_store::update(cfg);
         radio_link::reconfigure(cfg);
@@ -449,6 +481,7 @@ void begin() {
         telem::CmdSetRadioModeV1 radio_mode = {};
         radio_mode.state_only = cfg.radio_state_only ? 1U : 0U;
         radio_mode.control_rate_hz = 2U;
+        radio_mode.radio_lr_mode = cfg.radio_lr_mode ? 1U : 0U;
         radio_mode.telem_rate_hz = kFixedDownlinkRateHz;
         (void)radio_link::sendSetRadioMode(radio_mode);
         (void)radio_link::sendSetStreamRate(cmd);
@@ -495,6 +528,10 @@ uint32_t clientCount() {
 
 void resetCounters() {
   g_ws_state_seq = 0;
+  g_last_state_seq_sent = 0;
+  g_last_ui_tx_ms = 0;
+  g_last_ui_tx_latency_ms = 0;
+  g_max_ui_tx_latency_ms = 0;
   g_ws_event_head = 0;
   g_ws_event_count = 0;
   radio_link::resetStats();

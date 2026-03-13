@@ -29,6 +29,7 @@ bool publishStressState(const telem::TelemetryFullStateV1& state, uint32_t seq, 
 Stats stats();
 size_t txQueueFree();
 bool stateOnlyMode();
+bool longRangeMode();
 bool hasPeer();
 String peerMac();
 bool radioReady();

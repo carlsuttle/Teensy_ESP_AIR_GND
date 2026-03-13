@@ -7,98 +7,102 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <header class="top">
-    <div class="title-row"><span class="title">Telemetry GND Unit</span><span id="status">Loading</span><span id="rec" class="rec unknown">REC --</span></div>
-    <div id="stats">web_fps: -- | dqi: -- | avg ping: -- ms</div>
-  </header>
+  <div id="appShellFrame" class="app-shell-frame">
+    <div id="appShell" class="app-shell">
+      <header class="top">
+        <div class="title-row"><span class="title">Telemetry GND Unit</span><span id="status">Loading</span><span id="rec" class="rec unknown">REC --</span></div>
+        <div id="stats">web_fps: -- | dqi: -- | avg ping: -- ms</div>
+      </header>
 
-  <nav class="tabs">
-    <button data-tab="pfd">PFD</button>
-    <button data-tab="gps" class="active">GPS</button>
-    <button data-tab="att">Attitude</button>
-    <button data-tab="baro">Baro</button>
-    <button data-tab="link">Radio</button>
-    <button data-tab="logs">Logs</button>
-  </nav>
+      <nav class="tabs">
+        <button data-tab="pfd">PFD</button>
+        <button data-tab="gps" class="active">GPS</button>
+        <button data-tab="att">Attitude</button>
+        <button data-tab="baro">Baro</button>
+        <button data-tab="link">Radio</button>
+        <button data-tab="logs">Logs</button>
+      </nav>
 
-  <main>
-    <section id="tab-pfd" class="tab">
-      <div class="pfd-wrap">
-        <canvas id="pfdCanvas" class="pfd-canvas" width="390" height="680"></canvas>
-      </div>
-    </section>
-    <section id="tab-gps" class="tab active"><pre id="gps"></pre></section>
-    <section id="tab-att" class="tab">
-      <pre id="att"></pre>
-      <h3>Fusion Settings</h3>
-      <div class="fusion-indicators">
-        <div class="fusion-indicator">
-          <span id="fusionAngularLight" class="fusion-light off"></span>
-          <span>Angular Recovery</span>
-        </div>
-        <div class="fusion-indicator">
-          <span id="fusionAccelLight" class="fusion-light off"></span>
-          <span>Acceleration Recovery</span>
-        </div>
-        <div class="fusion-indicator">
-          <span id="fusionMagLight" class="fusion-light off"></span>
-          <span>Magnetic Recovery</span>
-        </div>
-      </div>
-      <div class="fusion-control">
-        <div class="fusion-head"><span>gain</span><span id="gainValue">-</span></div>
-        <div class="fusion-row">
-          <input id="gainSlider" type="range" min="0.02" max="0.20" step="0.01" value="0.06" />
-        </div>
-      </div>
-      <div class="fusion-control">
-        <div class="fusion-head"><span>accelerationRejection (deg)</span><span id="accelRejValue">-</span></div>
-        <div class="fusion-row">
-          <input id="accelRejSlider" type="range" min="10" max="45" step="1" value="20" />
-        </div>
-      </div>
-      <div class="fusion-control">
-        <div class="fusion-head"><span>magneticRejection (deg)</span><span id="magRejValue">-</span></div>
-        <div class="fusion-row">
-          <input id="magRejSlider" type="range" min="20" max="120" step="5" value="60" />
-        </div>
-      </div>
-      <div class="fusion-control">
-        <div class="fusion-head"><span>recoveryTriggerPeriod (s / samples)</span><span id="recoveryValue">-</span></div>
-        <div class="fusion-row">
-          <input id="recoverySlider" type="range" min="1.0" max="8.0" step="0.1" value="3.0" />
-        </div>
-      </div>
-    </section>
-    <section id="tab-baro" class="tab"><pre id="baro"></pre></section>
-    <section id="tab-link" class="tab">
-      <pre id="link"></pre>
-      <h3>Stream</h3>
-      <div class="row"><label>Capture / Log Hz</label><input id="sourceHz" type="number" min="1" max="400" step="1" value="50" /></div>
-      <div class="row"><label>Download Hz</label><span>30 (fixed)</span></div>
-      <div class="row"><label>UI Hz</label><span>30 (fixed)</span></div>
-      <div class="row"><label>AIR Recorder</label><span id="airLoggerText">Checking AIR recorder...</span></div>
-      <button id="applyRate">Apply Capture Hz</button>
-    </section>
-    <section id="tab-logs" class="tab">
-      <pre id="logs"></pre>
-      <h3>Recorder</h3>
-      <div class="logs-actions">
-        <button id="refreshLogStatus">Refresh Log Status</button>
-        <button id="startLog">Start Session</button>
-        <button id="stopLog">Stop Session</button>
-      </div>
-      <h3>Diagnostics</h3>
-      <div class="logs-actions">
-        <button id="resetAirNetwork">Reset AIR Link</button>
-        <button id="downloadDiag">Download Diag CSV</button>
-        <button id="downloadWsEvents">Download WS Event CSV</button>
-        <button id="downloadClientEvents">Download Client Event CSV</button>
-        <button id="resetCounters">Reset Counters</button>
-      </div>
-    </section>
-  </main>
+      <main>
+        <section id="tab-pfd" class="tab">
+          <div class="pfd-wrap">
+            <canvas id="pfdCanvas" class="pfd-canvas" width="390" height="680"></canvas>
+          </div>
+        </section>
+        <section id="tab-gps" class="tab active"><pre id="gps"></pre></section>
+        <section id="tab-att" class="tab">
+          <pre id="att"></pre>
+          <h3>Fusion Settings</h3>
+          <div class="fusion-indicators">
+            <div class="fusion-indicator">
+              <span id="fusionAngularLight" class="fusion-light off"></span>
+              <span>Angular Recovery</span>
+            </div>
+            <div class="fusion-indicator">
+              <span id="fusionAccelLight" class="fusion-light off"></span>
+              <span>Acceleration Recovery</span>
+            </div>
+            <div class="fusion-indicator">
+              <span id="fusionMagLight" class="fusion-light off"></span>
+              <span>Magnetic Recovery</span>
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>gain</span><span id="gainValue">-</span></div>
+            <div class="fusion-row">
+              <input id="gainSlider" type="range" min="0.02" max="0.20" step="0.01" value="0.06" />
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>accelerationRejection (deg)</span><span id="accelRejValue">-</span></div>
+            <div class="fusion-row">
+              <input id="accelRejSlider" type="range" min="10" max="45" step="1" value="20" />
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>magneticRejection (deg)</span><span id="magRejValue">-</span></div>
+            <div class="fusion-row">
+              <input id="magRejSlider" type="range" min="20" max="120" step="5" value="60" />
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>recoveryTriggerPeriod (s / samples)</span><span id="recoveryValue">-</span></div>
+            <div class="fusion-row">
+              <input id="recoverySlider" type="range" min="1.0" max="8.0" step="0.1" value="3.0" />
+            </div>
+          </div>
+        </section>
+        <section id="tab-baro" class="tab"><pre id="baro"></pre></section>
+        <section id="tab-link" class="tab">
+          <pre id="link"></pre>
+          <h3>Stream</h3>
+          <div class="row"><label>Capture / Log Hz</label><input id="sourceHz" type="number" min="1" max="400" step="1" value="50" /></div>
+          <div class="row"><label>Download Hz</label><span>30 (fixed)</span></div>
+          <div class="row"><label>UI Hz</label><span>30 (fixed)</span></div>
+          <div class="row"><label>AIR Recorder</label><span id="airLoggerText">Checking AIR recorder...</span></div>
+          <button id="applyRate">Apply Capture Hz</button>
+        </section>
+        <section id="tab-logs" class="tab">
+          <pre id="logs"></pre>
+          <h3>Recorder</h3>
+          <div class="logs-actions">
+            <button id="refreshLogStatus">Refresh Log Status</button>
+            <button id="startLog">Start Session</button>
+            <button id="stopLog">Stop Session</button>
+          </div>
+          <h3>Diagnostics</h3>
+          <div class="logs-actions">
+            <button id="resetAirNetwork">Reset AIR Link</button>
+            <button id="downloadDiag">Download Diag CSV</button>
+            <button id="downloadWsEvents">Download WS Event CSV</button>
+            <button id="downloadClientEvents">Download Client Event CSV</button>
+            <button id="resetCounters">Reset Counters</button>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
 
-  <script src="/app.js?v=20260312ap"></script>
+  <script src="/app.js?v=20260312aw"></script>
 </body>
 </html>

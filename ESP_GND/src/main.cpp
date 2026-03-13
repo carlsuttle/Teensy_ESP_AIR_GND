@@ -19,6 +19,7 @@ bool g_air_ready = false;
 bool g_air_wait_announced = false;
 uint16_t g_last_configured_source_rate_hz = 0U;
 uint8_t g_last_configured_radio_state_only = 0U;
+uint8_t g_last_configured_radio_lr_mode = 0U;
 uint32_t g_last_air_ack_seq = 0U;
 bool g_pending_stream_rate_apply = true;
 bool g_pending_radio_mode_apply = true;
@@ -74,6 +75,7 @@ bool sendConfiguredRadioModeToAir() {
   telem::CmdSetRadioModeV1 cmd = {};
   cmd.state_only = config_store::get().radio_state_only ? 1U : 0U;
   cmd.control_rate_hz = 2U;
+  cmd.radio_lr_mode = config_store::get().radio_lr_mode ? 1U : 0U;
   cmd.telem_rate_hz = kNormalDownlinkRateHz;
   return radio_link::sendSetRadioMode(cmd);
 }
@@ -86,6 +88,10 @@ void syncConfiguredAirTargets() {
   }
   if (cfg.radio_state_only != g_last_configured_radio_state_only) {
     g_last_configured_radio_state_only = cfg.radio_state_only;
+    scheduleAirRadioModeApply();
+  }
+  if (cfg.radio_lr_mode != g_last_configured_radio_lr_mode) {
+    g_last_configured_radio_lr_mode = cfg.radio_lr_mode;
     scheduleAirRadioModeApply();
   }
 }
@@ -103,7 +109,7 @@ void handleConsoleCommands() {
         scheduleAirConfigApply();
         const bool mode_ok = sendConfiguredRadioModeToAir();
         const bool rate_ok = sendConfiguredStreamRateToAir();
-        Serial.printf("KICKAIR mode_ok=%u rate_ok=%u target=%s capture_hz=%u log_hz=%u downlink_hz=%u ui_hz=%u state_only=%u\n",
+        Serial.printf("KICKAIR mode_ok=%u rate_ok=%u target=%s capture_hz=%u log_hz=%u downlink_hz=%u ui_hz=%u state_only=%u lr=%u\n",
                       mode_ok ? 1U : 0U,
                       rate_ok ? 1U : 0U,
                       radio_link::targetSenderMac().c_str(),
@@ -111,7 +117,8 @@ void handleConsoleCommands() {
                       (unsigned)cfg.log_rate_hz,
                       (unsigned)kNormalDownlinkRateHz,
                       (unsigned)kNormalUiRateHz,
-                      (unsigned)cfg.radio_state_only);
+                      (unsigned)cfg.radio_state_only,
+                      (unsigned)cfg.radio_lr_mode);
       } else if (line.equalsIgnoreCase("resetair")) {
         const bool ok = radio_link::sendResetNetwork();
         Serial.printf("RESETAIR tx_ok=%u target=%s\n",
@@ -305,10 +312,11 @@ void setup() {
   }
   configureDhcpLeaseRange();
 
-  Serial.printf("AP ssid=%s ip=%s channel=%d\n",
+  Serial.printf("AP ssid=%s ip=%s channel=%d lr=%u\n",
                 cfg.ap_ssid,
                 WiFi.softAPIP().toString().c_str(),
-                kApChannel);
+                kApChannel,
+                (unsigned)(cfg.radio_lr_mode != 0U));
 
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
@@ -317,6 +325,7 @@ void setup() {
   radio_link::begin(cfg);
   g_last_configured_source_rate_hz = cfg.source_rate_hz;
   g_last_configured_radio_state_only = cfg.radio_state_only;
+  g_last_configured_radio_lr_mode = cfg.radio_lr_mode;
   scheduleAirConfigApply();
   Serial.printf("GND READY ap ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
                 WiFi.softAPIP().toString().c_str(),
