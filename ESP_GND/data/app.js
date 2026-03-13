@@ -6,6 +6,7 @@ const attEl = document.getElementById("att");
 const baroEl = document.getElementById("baro");
 const linkEl = document.getElementById("link");
 const logsEl = document.getElementById("logs");
+const pfdCanvas = document.getElementById("pfdCanvas");
 const airLoggerTextEl = document.getElementById("airLoggerText");
 const fusionAngularLightEl = document.getElementById("fusionAngularLight");
 const fusionAccelLightEl = document.getElementById("fusionAccelLight");
@@ -35,9 +36,19 @@ let lastBinarySeq = 0;
 let lastSourceSeq = 0;
 let lastSourceTus = 0;
 let lastEspRxMs = 0;
+let lastStateGapTotal = 0;
+let lastStateDropTotal = 0;
+let dqiScore = null;
+let dqiSmoothed = null;
+let dqiDetail = null;
+let uplinkDqiScore = null;
+let uplinkDqiSmoothed = null;
+let uplinkDqiDetail = null;
+let lastUplinkPingTimeout = 0;
 const STATE_STALE_MS = 1500;
 const PONG_FRESH_MS = 3000;
 const LOSS_WINDOW_MS = 10000;
+const TARGET_STATE_FPS = 30;
 let lossWinStart = 0;
 let lossWinSeen = 0;
 let lossWinLost = 0;
@@ -79,12 +90,19 @@ let lastForcedStateResetAt = 0;
 let uiDirty = true;
 let linkDirty = true;
 let lastLinkRenderAt = 0;
+let pfdLastW = 0;
+let pfdLastH = 0;
+let courseSetDeg = 0;
+let courseEditOpen = false;
+let courseEditBuffer = "";
+let pfdTapTargets = [];
 let nextCtrlReqId = 1;
 let clientEventLog = [];
 let statusFetchInFlight = false;
 let linkStatus = {
   transport: "ESP-NOW",
   radio_state_only: false,
+  radio_lr_mode: true,
   air_link_fresh: false,
   has_link_meta: false,
   ap_clients: 0,
@@ -100,6 +118,11 @@ let linkStatus = {
   radio_rtt_ms: null,
   radio_rtt_avg_ms: null,
   last_radio_pong_ms: 0,
+  uplink_ping_sent: 0,
+  uplink_ping_ok: 0,
+  uplink_ping_timeout: 0,
+  uplink_ping_miss_streak: 0,
+  last_uplink_ack_ms: 0,
   has_log_status: false,
   air_log_active: false,
   air_log_requested: false,
@@ -342,6 +365,140 @@ function fmtMs(v) {
   return `${Math.round(Number(v))} ms`;
 }
 
+function clamp(v, lo, hi) {
+  return Math.min(Math.max(Number(v), lo), hi);
+}
+
+function fmtPct(v, digits = 0) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "-";
+  return `${Number(v).toFixed(digits)}%`;
+}
+
+function dqiBand(score) {
+  if (score === null || score === undefined || Number.isNaN(score)) return "unknown";
+  if (score >= 90) return "excellent";
+  if (score >= 75) return "good";
+  if (score >= 55) return "fair";
+  if (score >= 35) return "poor";
+  return "critical";
+}
+
+function dqiBadgeClass(score) {
+  const band = dqiBand(score);
+  return `dqi-badge dqi-${band}`;
+}
+
+function updateDataQuality() {
+  const staleMs = lastStateAt ? (Date.now() - lastStateAt) : Infinity;
+  const stateFresh = isFresh(lastStateAt, STATE_STALE_MS);
+  const radioFresh = !!linkStatus.air_link_fresh;
+  const rateNow = stateFresh ? clientStateFps : 0;
+  const rateRatio = clamp(rateNow / TARGET_STATE_FPS, 0, 1);
+  const radioRateRatio = (radioStateFps === null || !radioFresh) ? 0 : clamp(radioStateFps / TARGET_STATE_FPS, 0, 1);
+  const radioRtt = Number(linkStatus.radio_rtt_ms ?? 0);
+  const radioRttPenalty = !radioFresh ? 0 : clamp((radioRtt - 80) / 220, 0, 1);
+  const stalePenalty = !stateFresh ? 1 : clamp((staleMs - 300) / 1200, 0, 1);
+  const gapTotal = Number(linkStatus.state_seq_gap ?? 0);
+  const dropTotal = Number(linkStatus.drop ?? 0);
+  const gapDelta = Math.max(0, gapTotal - lastStateGapTotal);
+  const dropDelta = Math.max(0, dropTotal - lastStateDropTotal);
+  const deliveredPackets = Math.max(0, Number(linkStatus.state_packets ?? 0) - Number(lastRadioStatePackets ?? 0));
+  const radioLossRatio = clamp((gapDelta + dropDelta) / Math.max(1, deliveredPackets + gapDelta + dropDelta), 0, 1);
+  const wsLossRatio = clamp(Number(lossWinLost) / Math.max(1, Number(lossWinSeen) + Number(lossWinLost)), 0, 1);
+
+  let score = 100;
+  const penaltyRadioFresh = !radioFresh ? 30 : 0;
+  const penaltyStateFresh = !stateFresh ? 30 : 0;
+  const penaltyRate = (1 - rateRatio) * 20;
+  const penaltyRadioRate = (1 - Math.max(rateRatio, radioRateRatio)) * 10;
+  const penaltyRadioLoss = radioLossRatio * 35;
+  const penaltyWsLoss = wsLossRatio * 15;
+  const penaltyRtt = radioRttPenalty * 8;
+  const penaltyStale = stalePenalty * 12;
+  score -= penaltyRadioFresh;
+  score -= penaltyStateFresh;
+  score -= penaltyRate;
+  score -= penaltyRadioRate;
+  score -= penaltyRadioLoss;
+  score -= penaltyWsLoss;
+  score -= penaltyRtt;
+  score -= penaltyStale;
+  score = Math.round(clamp(score, 0, 100));
+
+  dqiScore = score;
+  dqiSmoothed = dqiSmoothed === null ? score : Math.round((dqiSmoothed * 0.7) + (score * 0.3));
+  dqiDetail = {
+    band: dqiBand(dqiSmoothed),
+    rateRatio,
+    radioRateRatio,
+    radioLossRatio,
+    wsLossRatio,
+    staleMs: Number.isFinite(staleMs) ? staleMs : null,
+    gapDelta,
+    dropDelta,
+    penalties: {
+      radioFresh: Math.round(penaltyRadioFresh * 10) / 10,
+      stateFresh: Math.round(penaltyStateFresh * 10) / 10,
+      rate: Math.round(penaltyRate * 10) / 10,
+      radioRate: Math.round(penaltyRadioRate * 10) / 10,
+      radioLoss: Math.round(penaltyRadioLoss * 10) / 10,
+      wsLoss: Math.round(penaltyWsLoss * 10) / 10,
+      rtt: Math.round(penaltyRtt * 10) / 10,
+      stale: Math.round(penaltyStale * 10) / 10
+    }
+  };
+  lastStateGapTotal = gapTotal;
+  lastStateDropTotal = dropTotal;
+}
+
+function updateUplinkDataQuality() {
+  const airLinkAgeMs = Number(linkStatus.air_link_age_ms ?? Infinity);
+  const airLinkFresh = !!linkStatus.air_link_fresh;
+  const missStreak = Number(linkStatus.uplink_ping_miss_streak ?? 0);
+  const timeoutTotal = Number(linkStatus.uplink_ping_timeout ?? 0);
+  const timeoutBaselineUnset = uplinkDqiSmoothed === null && lastUplinkPingTimeout === 0;
+  const timeoutDelta = timeoutBaselineUnset ? 0 : Math.max(0, timeoutTotal - lastUplinkPingTimeout);
+  const rttMs = Number(linkStatus.radio_rtt_avg_ms ?? linkStatus.radio_rtt_ms ?? 0);
+  const freshRatio = airLinkFresh ? 1 : clamp(1 - ((airLinkAgeMs - 2500) / 4000), 0, 1);
+  const agePenalty = Number.isFinite(airLinkAgeMs) ? clamp((airLinkAgeMs - 2000) / 3000, 0, 1) : 1;
+  const rttPenalty = clamp((rttMs - 120) / 200, 0, 1);
+  const timeoutPenalty = clamp(timeoutDelta / 2, 0, 1);
+  const missPenaltyBase = clamp(missStreak / 8, 0, 1);
+  const missPenalty = (1 - freshRatio) > 0.05 ? missPenaltyBase : (missPenaltyBase * 0.15);
+
+  let score = 100;
+  const penaltyFresh = (1 - freshRatio) * 55;
+  const penaltyAge = agePenalty * 8;
+  const penaltyMiss = missPenalty * 12;
+  const penaltyTimeout = timeoutPenalty * 12;
+  const penaltyRtt = rttPenalty * 4;
+  score -= penaltyFresh;
+  score -= penaltyAge;
+  score -= penaltyMiss;
+  score -= penaltyTimeout;
+  score -= penaltyRtt;
+  score = Math.round(clamp(score, 0, 100));
+
+  uplinkDqiScore = score;
+  uplinkDqiSmoothed = uplinkDqiSmoothed === null ? score : Math.round((uplinkDqiSmoothed * 0.7) + (score * 0.3));
+  uplinkDqiDetail = {
+    band: dqiBand(uplinkDqiSmoothed),
+    freshRatio,
+    airLinkAgeMs: Number.isFinite(airLinkAgeMs) ? airLinkAgeMs : null,
+    missStreak,
+    rttMs: rttMs > 0 ? rttMs : null,
+    timeoutDelta,
+    penalties: {
+      fresh: Math.round(penaltyFresh * 10) / 10,
+      age: Math.round(penaltyAge * 10) / 10,
+      miss: Math.round(penaltyMiss * 10) / 10,
+      timeout: Math.round(penaltyTimeout * 10) / 10,
+      rtt: Math.round(penaltyRtt * 10) / 10
+    }
+  };
+  lastUplinkPingTimeout = timeoutTotal;
+}
+
 function dash(v) {
   return (v === null || v === undefined || Number.isNaN(v)) ? "-" : String(v);
 }
@@ -438,6 +595,15 @@ function resetLocalCounters() {
   lastSourceSeq = 0;
   lastSourceTus = 0;
   lastEspRxMs = 0;
+  lastStateGapTotal = 0;
+  lastStateDropTotal = 0;
+  dqiScore = null;
+  dqiSmoothed = null;
+  dqiDetail = null;
+  uplinkDqiScore = null;
+  uplinkDqiSmoothed = null;
+  uplinkDqiDetail = null;
+  lastUplinkPingTimeout = 0;
   lossWinStart = 0;
   lossWinSeen = 0;
   lossWinLost = 0;
@@ -522,7 +688,7 @@ function updateStatus() {
     setStatus("Connected / waiting for AIR");
     return;
   }
-  setStatus(telemetryLooksStale() ? "Connected / stale telemetry" : "Connected");
+  setStatus(telemetryLooksStale() ? "Con/Stale" : "Connected");
 }
 
 async function fetchStatus() {
@@ -546,6 +712,8 @@ async function fetchStatus() {
     } else if (lastRadioStatePackets !== null && statePackets < lastRadioStatePackets) {
       radioStateFps = null;
     }
+    updateDataQuality();
+    updateUplinkDataQuality();
     lastRadioStatePackets = statePackets;
     lastRadioStatusAt = now;
     if (data.has_log_status) {
@@ -595,6 +763,470 @@ fusion.recovery: - s / - smp`;
     magneticRecovery: false
   };
   renderFusionLights();
+}
+
+function configurePfdCanvas() {
+  if (!pfdCanvas) return null;
+  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+  const cssW = Math.max(320, Math.round(pfdCanvas.clientWidth || 390));
+  const cssH = Math.round(cssW * (680 / 390));
+  const pxW = Math.round(cssW * dpr);
+  const pxH = Math.round(cssH * dpr);
+  if (pfdCanvas.width !== pxW || pfdCanvas.height !== pxH) {
+    pfdCanvas.width = pxW;
+    pfdCanvas.height = pxH;
+  }
+  pfdLastW = cssW;
+  pfdLastH = cssH;
+  const ctx = pfdCanvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: cssW, h: cssH };
+}
+
+function drawRoundedRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+function pfdText(ctx, text, x, y, size, color, align = "center") {
+  ctx.font = `600 ${size}px Arial`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+function pfdPad(value, width) {
+  const n = Math.max(0, Math.abs(Math.round(Number(value) || 0)));
+  return String(n).padStart(width, "0");
+}
+
+function norm360(value) {
+  return ((Number(value) % 360) + 360) % 360;
+}
+
+function updateCourseSetUi() {
+}
+
+function setCourseSetDeg(value) {
+  courseSetDeg = norm360(value);
+  try {
+    localStorage.setItem("pfd_course_deg", String(courseSetDeg));
+  } catch (_err) {
+  }
+  updateCourseSetUi();
+  if (activeTab === "pfd") {
+    uiDirty = true;
+    renderNow();
+  }
+}
+
+function setCourseEditOpen(open) {
+  courseEditOpen = !!open;
+  courseEditBuffer = courseEditOpen ? pfdPad(courseSetDeg, 3) : "";
+  if (activeTab === "pfd") {
+    uiDirty = true;
+    renderNow();
+  }
+}
+
+function appendCourseDigit(digit) {
+  courseEditBuffer = `${courseEditBuffer}${digit}`.replace(/\D/g, "").slice(-3);
+}
+
+function commitCourseEdit() {
+  if (!courseEditBuffer) return;
+  setCourseSetDeg(Number(courseEditBuffer));
+  setCourseEditOpen(false);
+}
+
+function setPfdTapTarget(id, x, y, w, h) {
+  pfdTapTargets.push({ id, x, y, w, h });
+}
+
+function renderPfdStale() {
+  const view = configurePfdCanvas();
+  if (!view) return;
+  const { ctx, w, h } = view;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#020817";
+  ctx.fillRect(0, 0, w, h);
+  drawRoundedRect(ctx, 10, 10, w - 20, h - 20, 18);
+  ctx.strokeStyle = "#334155";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  pfdText(ctx, "PFD", w / 2, h * 0.12, 30, "#e2e8f0");
+  pfdText(ctx, "NO TELEMETRY", w / 2, h * 0.48, 26, "#f59e0b");
+  pfdText(ctx, "Waiting for AIR", w / 2, h * 0.54, 18, "#94a3b8");
+}
+
+function renderPfdPanel() {
+  const view = configurePfdCanvas();
+  if (!view) return;
+  const { ctx, w, h } = view;
+  const att = latestAtt || {};
+  const gps = latestGps || {};
+  const baro = latestBaro || {};
+  const rollDeg = Number(att.r ?? 0);
+  const pitchDeg = Number(att.p ?? 0);
+  const yawDeg = Number(att.y ?? 0);
+  const headingDeg = ((yawDeg % 360) + 360) % 360;
+  const altM = Number(baro.a ?? gps.hm ?? 0);
+  const vsiMps = Number(baro.v ?? 0);
+  const gsMps = Number(gps.gs ?? 0);
+  const fixType = Number(gps.fx ?? 0);
+  const sats = Number(gps.sv ?? 0);
+  const courseDeg = courseSetDeg;
+  const horizonR = Math.min(w * 0.34, 165);
+  const horizonCx = w * 0.5;
+  const horizonCy = horizonR + 46;
+  const pitchPxPerDeg = horizonR / 40;
+  const speedKmh = gsMps * 3.6;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#020817";
+  ctx.fillRect(0, 0, w, h);
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(horizonCx, horizonCy, horizonR, 0, Math.PI * 2);
+  ctx.clip();
+  ctx.translate(horizonCx, horizonCy + pitchDeg * pitchPxPerDeg);
+  ctx.rotate((rollDeg * Math.PI) / 180);
+
+  ctx.fillStyle = "#4da7e8";
+  ctx.fillRect(-w, -h * 1.2, w * 2, h * 1.2);
+  ctx.fillStyle = "#7b5a42";
+  ctx.fillRect(-w, 0, w * 2, h * 1.2);
+  ctx.strokeStyle = "#f8fafc";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(-w, 0);
+  ctx.lineTo(w, 0);
+  ctx.stroke();
+
+  for (let deg = -80; deg <= 80; deg += 5) {
+    if (deg === 0) continue;
+    const y = -deg * pitchPxPerDeg;
+    const longMark = deg % 10 === 0;
+    const markW = longMark ? 52 : 26;
+    ctx.strokeStyle = "#f8fafc";
+    ctx.lineWidth = longMark ? 3 : 2;
+    ctx.beginPath();
+    ctx.moveTo(-markW, y);
+    ctx.lineTo(markW, y);
+    ctx.stroke();
+    if (longMark) {
+      pfdText(ctx, String(Math.abs(deg)), -markW - 18, y, 14, "#f8fafc", "right");
+      pfdText(ctx, String(Math.abs(deg)), markW + 18, y, 14, "#f8fafc", "left");
+    }
+  }
+  ctx.restore();
+
+  ctx.strokeStyle = "#cbd5e1";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(horizonCx, horizonCy, horizonR, Math.PI * 1.08, Math.PI * 1.92);
+  ctx.stroke();
+  for (let bank = -60; bank <= 60; bank += 10) {
+    const a = ((bank - 90) * Math.PI) / 180;
+    const r1 = horizonR + 6;
+    const r2 = horizonR + (bank % 30 === 0 ? 24 : 16);
+    ctx.beginPath();
+    ctx.moveTo(horizonCx + Math.cos(a) * r1, horizonCy + Math.sin(a) * r1);
+    ctx.lineTo(horizonCx + Math.cos(a) * r2, horizonCy + Math.sin(a) * r2);
+    ctx.stroke();
+  }
+  const bankPointerDeg = clamp(rollDeg, -60, 60);
+  const bankPointerAngle = ((bankPointerDeg - 90) * Math.PI) / 180;
+  const bankPointerR = horizonR;
+  const bankPointerCx = horizonCx + Math.cos(bankPointerAngle) * bankPointerR;
+  const bankPointerCy = horizonCy + Math.sin(bankPointerAngle) * bankPointerR;
+  ctx.fillStyle = "#facc15";
+  ctx.save();
+  ctx.translate(bankPointerCx, bankPointerCy);
+  ctx.rotate(bankPointerAngle + (Math.PI * 0.5));
+  ctx.beginPath();
+  ctx.moveTo(0, -10);
+  ctx.lineTo(-12, 14);
+  ctx.lineTo(12, 14);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  ctx.strokeStyle = "#f59e0b";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(horizonCx - 58, horizonCy + 4);
+  ctx.lineTo(horizonCx - 20, horizonCy + 4);
+  ctx.lineTo(horizonCx - 8, horizonCy + 14);
+  ctx.lineTo(horizonCx + 8, horizonCy + 14);
+  ctx.lineTo(horizonCx + 20, horizonCy + 4);
+  ctx.lineTo(horizonCx + 58, horizonCy + 4);
+  ctx.stroke();
+
+  const tapeTop = horizonCy - horizonR;
+  const tapeBottom = horizonCy + horizonR;
+  const tapeH = tapeBottom - tapeTop;
+  const tapeW = 32;
+  const speedX = 44;
+  const altX = w - tapeW - 44;
+  const valueBoxInset = 24;
+  const speedOuterLeft = speedX;
+  const speedOuterRight = speedX + tapeW + valueBoxInset;
+  const altOuterLeft = altX - valueBoxInset;
+  const altOuterRight = altX + tapeW;
+  const valueBoxH = 42;
+  const valueBoxY = horizonCy - valueBoxH / 2;
+  const valueTextY = valueBoxY + 21;
+  const tapeCenterY = horizonCy;
+  ctx.fillStyle = "#0b1220";
+  drawRoundedRect(ctx, speedX, tapeTop, tapeW, tapeH, 10);
+  ctx.fill();
+  ctx.strokeStyle = "#334155";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  drawRoundedRect(ctx, altX, tapeTop, tapeW, tapeH, 10);
+  ctx.fill();
+  ctx.stroke();
+
+  const tapeScale = 2.6;
+  const drawTape = (x, currentValue, colorAccent, outerLeft, outerRight) => {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, tapeTop, tapeW, tapeH);
+    ctx.clip();
+    for (let i = -6; i <= 6; i++) {
+      const markValue = Math.round(currentValue / 10) * 10 + (i * 10);
+      const y = tapeCenterY + ((currentValue - markValue) * tapeScale);
+      pfdText(ctx, String(markValue), x + tapeW - 6, y, 14, "#cbd5e1", "right");
+    }
+    ctx.restore();
+    ctx.fillStyle = "#020617";
+    drawRoundedRect(ctx, outerLeft, valueBoxY, outerRight - outerLeft, valueBoxH, 10);
+    ctx.fill();
+    ctx.strokeStyle = colorAccent;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    const valueTxt = pfdPad(currentValue, colorAccent === "#f59e0b" ? 3 : 2);
+    const valueColor = currentValue < 0 ? "#ef4444" : "#f8fafc";
+    pfdText(ctx, valueTxt, outerRight - 10, valueTextY, 24, valueColor, "right");
+  };
+  drawTape(speedX, speedKmh, "#38bdf8", speedOuterLeft, speedOuterRight);
+  drawTape(altX, altM, "#f59e0b", altOuterLeft, altOuterRight);
+
+  const vsiX = w - 18;
+  const vsiTop = horizonCy - 112;
+  const vsiBottom = horizonCy + 112;
+  ctx.strokeStyle = "#64748b";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(vsiX, vsiTop);
+  ctx.lineTo(vsiX, vsiBottom);
+  ctx.stroke();
+  pfdText(ctx, "1000", vsiX, vsiTop - 12, 12, "#f8fafc");
+  pfdText(ctx, "-1000", vsiX, vsiBottom + 12, 12, "#f8fafc");
+  for (const tick of [-4, -2, 0, 2, 4]) {
+    const y = horizonCy - (tick * 24);
+    ctx.beginPath();
+    ctx.moveTo(vsiX - (tick === 0 ? 20 : 12), y);
+    ctx.lineTo(vsiX, y);
+    ctx.stroke();
+  }
+  const vsiY = horizonCy - clamp(vsiMps, -5, 5) * 24;
+  const vsiBoxW = 42;
+  const vsiBoxH = 24;
+  const vsiBoxX = altX + tapeW;
+  const vsiBoxY = vsiY - (vsiBoxH * 0.5);
+  ctx.fillStyle = "#020617";
+  drawRoundedRect(ctx, vsiBoxX, vsiBoxY, vsiBoxW, vsiBoxH, 6);
+  ctx.fill();
+  ctx.strokeStyle = "#f8fafc";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  pfdText(ctx, String(Math.abs(Math.round(vsiMps))), vsiBoxX + vsiBoxW - 6, vsiBoxY + 12, 14, "#f8fafc", "right");
+
+  const hdgBoxY = 0;
+  const hdgBoxW = 68;
+  const hdgBoxH = 28;
+  const hdgY = 10;
+  const fixBoxX = 12;
+  const fixBoxY = 8;
+  const fixBoxW = 88;
+  const fixBoxH = 24;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(12, 0, w - 24, 22);
+  ctx.clip();
+  for (let i = -6; i <= 6; i++) {
+    const mark = (Math.round(headingDeg / 10) * 10) + (i * 10);
+    const wrapped = ((mark % 360) + 360) % 360;
+    let delta = wrapped - headingDeg;
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    const x = horizonCx + (delta * 5.5);
+    ctx.strokeStyle = "#94a3b8";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, 6);
+    ctx.stroke();
+    pfdText(ctx, String(wrapped).padStart(3, "0"), x, 14, 10, "#cbd5e1");
+  }
+  ctx.restore();
+  ctx.fillStyle = "#020617";
+  drawRoundedRect(ctx, fixBoxX, fixBoxY, fixBoxW, fixBoxH, 8);
+  ctx.fill();
+  ctx.strokeStyle = "#475569";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  pfdText(ctx, `FIX ${fixType}/${sats}`, fixBoxX + 8, fixBoxY + 12, 13, "#cbd5e1", "left");
+  ctx.fillStyle = "#020617";
+  drawRoundedRect(ctx, horizonCx - (hdgBoxW * 0.5), hdgBoxY, hdgBoxW, hdgBoxH, 10);
+  ctx.fill();
+  ctx.strokeStyle = "#f8fafc";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  pfdText(ctx, pfdPad(headingDeg, 3), horizonCx, hdgBoxY + 14, 20, "#f8fafc");
+
+  const hsiAreaX = 12;
+  const hsiAreaY = tapeBottom + 18;
+  const hsiAreaW = w - 24;
+  const hsiAreaH = h - hsiAreaY - 12;
+  const hsiCx = hsiAreaX + (hsiAreaW * 0.5);
+  const hsiCy = hsiAreaY + (hsiAreaH * 0.5);
+  const hsiR = Math.min(126, Math.max(75, Math.min(hsiAreaW, hsiAreaH) * 0.39));
+  pfdTapTargets = [];
+  ctx.strokeStyle = "#334155";
+  ctx.lineWidth = 2;
+  drawRoundedRect(ctx, hsiAreaX, hsiAreaY, hsiAreaW, hsiAreaH, 16);
+  ctx.stroke();
+  ctx.strokeStyle = "#475569";
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(hsiCx, hsiCy, hsiR, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.strokeStyle = "#f8fafc";
+  ctx.lineWidth = 2;
+  for (let deg = 0; deg < 360; deg += 45) {
+    const a = ((deg - 90) * Math.PI) / 180;
+    const tickInner = hsiR + 1;
+    const tickOuter = hsiR + (deg % 90 === 0 ? 13 : 9);
+    ctx.beginPath();
+    ctx.moveTo(hsiCx + Math.cos(a) * tickInner, hsiCy + Math.sin(a) * tickInner);
+    ctx.lineTo(hsiCx + Math.cos(a) * tickOuter, hsiCy + Math.sin(a) * tickOuter);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.translate(hsiCx, hsiCy);
+  ctx.rotate((-headingDeg * Math.PI) / 180);
+  for (let deg = 0; deg < 360; deg += 10) {
+    const a = ((deg - 90) * Math.PI) / 180;
+    const r1 = hsiR - (deg % 30 === 0 ? 12 : 7);
+    const r2 = hsiR;
+    ctx.strokeStyle = "#94a3b8";
+    ctx.lineWidth = deg % 30 === 0 ? 2 : 1;
+    ctx.beginPath();
+    ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1);
+    ctx.lineTo(Math.cos(a) * r2, Math.sin(a) * r2);
+    ctx.stroke();
+  }
+  ctx.rotate((courseDeg * Math.PI) / 180);
+  ctx.strokeStyle = "#d946ef";
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.moveTo(0, -hsiR + 12);
+  ctx.lineTo(0, -14);
+  ctx.moveTo(0, 14);
+  ctx.lineTo(0, hsiR - 12);
+  ctx.stroke();
+  ctx.fillStyle = "#d946ef";
+  ctx.beginPath();
+  ctx.moveTo(0, -hsiR);
+  ctx.lineTo(-9, -hsiR + 20);
+  ctx.lineTo(9, -hsiR + 20);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  for (let deg = 0; deg < 360; deg += 30) {
+    const relDeg = deg - headingDeg;
+    const a = ((relDeg - 90) * Math.PI) / 180;
+    const tx = hsiCx + Math.cos(a) * (hsiR - 24);
+    const ty = hsiCy + Math.sin(a) * (hsiR - 24);
+    if (deg === 0) {
+      pfdText(ctx, "N", tx, ty, 18, "#f8fafc");
+    } else if (deg === 90) {
+      pfdText(ctx, "E", tx, ty, 18, "#f8fafc");
+    } else if (deg === 180) {
+      pfdText(ctx, "S", tx, ty, 18, "#f8fafc");
+    } else if (deg === 270) {
+      pfdText(ctx, "W", tx, ty, 18, "#f8fafc");
+    } else {
+      pfdText(ctx, String(deg).padStart(3, "0"), tx, ty, 15, "#cbd5e1");
+    }
+  }
+  const crsBoxX = hsiAreaX + 10;
+  const crsBoxY = hsiAreaY + 10;
+  drawRoundedRect(ctx, crsBoxX, crsBoxY, 82, 24, 8);
+  ctx.fillStyle = "#08111d";
+  ctx.fill();
+  ctx.strokeStyle = "#334155";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  pfdText(ctx, `CRS ${(courseEditOpen ? courseEditBuffer : pfdPad(courseDeg, 3)).padStart(3, "0")}`, crsBoxX + 10, crsBoxY + 12, 13, "#f8fafc", "left");
+  setPfdTapTarget("course_toggle", crsBoxX, crsBoxY, 82, 24);
+
+  if (courseEditOpen) {
+    const btnY = crsBoxY + 32;
+    const btnW = 44;
+    const btnH = 36;
+    const btnGap = 8;
+    const buttons = [
+      { id: "course_1", x: crsBoxX, y: btnY, label: "1" },
+      { id: "course_2", x: crsBoxX + btnW + btnGap, y: btnY, label: "2" },
+      { id: "course_3", x: crsBoxX + (btnW + btnGap) * 2, y: btnY, label: "3" },
+      { id: "course_4", x: crsBoxX, y: btnY + btnH + btnGap, label: "4" },
+      { id: "course_5", x: crsBoxX + btnW + btnGap, y: btnY + btnH + btnGap, label: "5" },
+      { id: "course_6", x: crsBoxX + (btnW + btnGap) * 2, y: btnY + btnH + btnGap, label: "6" },
+      { id: "course_7", x: crsBoxX, y: btnY + (btnH + btnGap) * 2, label: "7" },
+      { id: "course_8", x: crsBoxX + btnW + btnGap, y: btnY + (btnH + btnGap) * 2, label: "8" },
+      { id: "course_9", x: crsBoxX + (btnW + btnGap) * 2, y: btnY + (btnH + btnGap) * 2, label: "9" },
+      { id: "course_clr", x: crsBoxX, y: btnY + (btnH + btnGap) * 3, label: "C" },
+      { id: "course_0", x: crsBoxX + btnW + btnGap, y: btnY + (btnH + btnGap) * 3, label: "0" },
+      { id: "course_ent", x: crsBoxX + (btnW + btnGap) * 2, y: btnY + (btnH + btnGap) * 3, label: "OK" }
+    ];
+    buttons.forEach((btn) => {
+      drawRoundedRect(ctx, btn.x, btn.y, btnW, btnH, 8);
+      ctx.fillStyle = "#08111d";
+      ctx.fill();
+      ctx.strokeStyle = "#475569";
+      ctx.stroke();
+      pfdText(ctx, btn.label, btn.x + (btnW * 0.5), btn.y + 18, 16, "#f8fafc");
+      setPfdTapTarget(btn.id, btn.x, btn.y, btnW, btnH);
+    });
+  }
+
+  const hsiFooterY = hsiAreaY + hsiAreaH - 18;
+  drawRoundedRect(ctx, hsiAreaX + 10, hsiFooterY - 12, 120, 24, 8);
+  ctx.fillStyle = "#08111d";
+  ctx.fill();
+  ctx.strokeStyle = "#334155";
+  ctx.stroke();
+  pfdText(ctx, `LAT ${fmt(gps.la, 5)}`, hsiAreaX + 18, hsiFooterY, 13, "#f8fafc", "left");
+  drawRoundedRect(ctx, w - hsiAreaX - 120 - 10, hsiFooterY - 12, 120, 24, 8);
+  ctx.fillStyle = "#08111d";
+  ctx.fill();
+  ctx.strokeStyle = "#334155";
+  ctx.stroke();
+  pfdText(ctx, `LON ${fmt(gps.lo, 5)}`, w - hsiAreaX - 18, hsiFooterY, 13, "#f8fafc", "right");
 }
 
 function renderBaroStale() {
@@ -660,24 +1292,23 @@ last_change_ms: -`;
 }
 
 function renderStale() {
+  renderPfdStale();
   renderGpsStale();
   renderAttStale();
   renderBaroStale();
   renderLinkStale();
   renderLogsStale();
-  statsEl.textContent = `state_fps: - | seq: - | ctrl: - | state: - | ping: - | radio: - | avg: -`;
+  statsEl.innerHTML =
+    `<span class="stats-line"><span>fps: -</span><span>ping: -</span><span class="dqi-badge dqi-unknown">D:--</span><span class="dqi-badge dqi-unknown">U:--</span></span>`;
 }
 
 function renderHeader() {
-  const pingTxt = isPongFresh() ? pingMs : null;
   const pingAvgTxt = isPongFresh() ? pingAvgMs : null;
-  const radioRttTxt = linkStatus.air_link_fresh ? linkStatus.radio_rtt_ms : null;
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
-  const seqTxt = lastSourceSeq > 0 ? String(lastSourceSeq) : "-";
-  const ctrlTxt = isCtrlOpen() ? "open" : "closed";
-  const stateTxt = isStateOpen() ? "open" : "closed";
-  statsEl.textContent =
-    `state_fps: ${stateFpsTxt} | seq: ${seqTxt} | ctrl: ${ctrlTxt} | state: ${stateTxt} | ping: ${fmtMs(pingTxt)} | radio: ${fmtMs(radioRttTxt)} | avg: ${fmtMs(pingAvgTxt)}`;
+  const dqiValueTxt = dqiSmoothed === null ? "--" : String(dqiSmoothed);
+  const uplinkDqiValueTxt = uplinkDqiSmoothed === null ? "--" : String(uplinkDqiSmoothed);
+  statsEl.innerHTML =
+    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span><span>ping: ${fmtMs(pingAvgTxt)}</span><span class="${dqiBadgeClass(dqiSmoothed)}">D:${dqiValueTxt}</span><span class="${dqiBadgeClass(uplinkDqiSmoothed)}">U:${uplinkDqiValueTxt}</span></span>`;
 }
 
 function renderGpsPanel() {
@@ -725,19 +1356,35 @@ function renderLinkPanel() {
   const stateSocketTxt = isStateOpen() ? "open" : "closed";
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
   const stateAgeTxt = lastStateAt ? String(Date.now() - lastStateAt) : (waitingForTelemetry() ? "waiting" : "-");
-  const sourceSeqTxt = lastSourceSeq > 0 ? String(lastSourceSeq) : "-";
-  const sourceTusTxt = lastSourceTus > 0 ? String(lastSourceTus) : "-";
-  const espRxMsTxt = lastEspRxMs > 0 ? String(lastEspRxMs) : "-";
-  const wsLossTxt = String(wsLoss);
-  const parseFailTxt = String(binaryParseFailCount);
-  const ctrlReconnectTxt = String(ctrlReconnects);
-  const stateReconnectTxt = String(stateReconnects);
-  const ctrlLastCloseTxt = `${ctrlCloseCode}/${ctrlCloseClean}`;
-  const stateLastCloseTxt = `${stateCloseCode}/${stateCloseClean}`;
   const airLinkTxt = linkStatus.air_link_fresh ? "up" : "waiting";
   const airRadioTxt = linkStatus.air_radio_ready ? "ready" : "starting";
   const airPeerTxt = linkStatus.air_peer_known ? "known" : "discovering";
   const radioModeTxt = linkStatus.radio_state_only ? "state-only stress" : "normal unified";
+  const dqiScoreTxt = dqiSmoothed === null ? "-" : String(dqiSmoothed);
+  const dqiBandTxt = dqiDetail ? dqiDetail.band : "unknown";
+  const dqiRadioLossTxt = dqiDetail ? fmtPct(dqiDetail.radioLossRatio * 100, 1) : "-";
+  const dqiWsLossTxt = dqiDetail ? fmtPct(dqiDetail.wsLossRatio * 100, 1) : "-";
+  const dqiRateTxt = dqiDetail ? fmtPct(dqiDetail.rateRatio * 100, 0) : "-";
+  const dqiAgeTxt = dqiDetail && dqiDetail.staleMs !== null ? String(Math.round(dqiDetail.staleMs)) : "-";
+  const dqiPenaltyRadioFreshTxt = dqiDetail ? fmt(dqiDetail.penalties.radioFresh, 1) : "-";
+  const dqiPenaltyStateFreshTxt = dqiDetail ? fmt(dqiDetail.penalties.stateFresh, 1) : "-";
+  const dqiPenaltyRateTxt = dqiDetail ? fmt(dqiDetail.penalties.rate, 1) : "-";
+  const dqiPenaltyRadioRateTxt = dqiDetail ? fmt(dqiDetail.penalties.radioRate, 1) : "-";
+  const dqiPenaltyRadioLossTxt = dqiDetail ? fmt(dqiDetail.penalties.radioLoss, 1) : "-";
+  const dqiPenaltyWsLossTxt = dqiDetail ? fmt(dqiDetail.penalties.wsLoss, 1) : "-";
+  const dqiPenaltyRttTxt = dqiDetail ? fmt(dqiDetail.penalties.rtt, 1) : "-";
+  const dqiPenaltyStaleTxt = dqiDetail ? fmt(dqiDetail.penalties.stale, 1) : "-";
+  const uplinkDqiScoreTxt = uplinkDqiSmoothed === null ? "-" : String(uplinkDqiSmoothed);
+  const uplinkDqiBandTxt = uplinkDqiDetail ? uplinkDqiDetail.band : "unknown";
+  const uplinkFreshTxt = uplinkDqiDetail ? fmtPct(uplinkDqiDetail.freshRatio * 100, 0) : "-";
+  const uplinkMissStreakTxt = uplinkDqiDetail ? String(uplinkDqiDetail.missStreak) : "-";
+  const uplinkAirAgeTxt = uplinkDqiDetail && uplinkDqiDetail.airLinkAgeMs !== null ? String(Math.round(uplinkDqiDetail.airLinkAgeMs)) : "-";
+  const uplinkRttTxt = uplinkDqiDetail && uplinkDqiDetail.rttMs !== null ? String(Math.round(uplinkDqiDetail.rttMs)) : "-";
+  const uplinkPenaltyFreshTxt = uplinkDqiDetail ? fmt(uplinkDqiDetail.penalties.fresh, 1) : "-";
+  const uplinkPenaltyAgeTxt = uplinkDqiDetail ? fmt(uplinkDqiDetail.penalties.age, 1) : "-";
+  const uplinkPenaltyMissTxt = uplinkDqiDetail ? fmt(uplinkDqiDetail.penalties.miss, 1) : "-";
+  const uplinkPenaltyTimeoutTxt = uplinkDqiDetail ? fmt(uplinkDqiDetail.penalties.timeout, 1) : "-";
+  const uplinkPenaltyRttTxt = uplinkDqiDetail ? fmt(uplinkDqiDetail.penalties.rtt, 1) : "-";
   const airRssiTxt = fmtRssi(linkStatus.air_rssi_valid, linkStatus.air_rssi_dbm);
   const airScanAgeTxt = dash(linkStatus.air_scan_age_ms);
   const airLinkAgeTxt = dash(linkStatus.air_link_age_ms);
@@ -745,6 +1392,31 @@ function renderLinkPanel() {
   linkEl.textContent =
 `transport: ${dash(linkStatus.transport)}
 radio_mode: ${radioModeTxt}
+dqi: ${dqiScoreTxt} / 100
+dqi_band: ${dqiBandTxt}
+dqi_uplink: ${uplinkDqiScoreTxt} / 100
+dqi_uplink_band: ${uplinkDqiBandTxt}
+dqi_rate: ${dqiRateTxt}
+dqi_radio_loss: ${dqiRadioLossTxt}
+dqi_ws_loss: ${dqiWsLossTxt}
+dqi_state_age_ms: ${dqiAgeTxt}
+dqi_penalty_radio_fresh: ${dqiPenaltyRadioFreshTxt}
+dqi_penalty_state_fresh: ${dqiPenaltyStateFreshTxt}
+dqi_penalty_rate: ${dqiPenaltyRateTxt}
+dqi_penalty_radio_rate: ${dqiPenaltyRadioRateTxt}
+dqi_penalty_radio_loss: ${dqiPenaltyRadioLossTxt}
+dqi_penalty_ws_loss: ${dqiPenaltyWsLossTxt}
+dqi_penalty_rtt: ${dqiPenaltyRttTxt}
+dqi_penalty_stale: ${dqiPenaltyStaleTxt}
+uplink_miss_streak: ${uplinkMissStreakTxt}
+uplink_fresh: ${uplinkFreshTxt}
+uplink_air_age_ms: ${uplinkAirAgeTxt}
+uplink_rtt_ms: ${uplinkRttTxt}
+uplink_penalty_fresh: ${uplinkPenaltyFreshTxt}
+uplink_penalty_age: ${uplinkPenaltyAgeTxt}
+uplink_penalty_miss: ${uplinkPenaltyMissTxt}
+uplink_penalty_timeout: ${uplinkPenaltyTimeoutTxt}
+uplink_penalty_rtt: ${uplinkPenaltyRttTxt}
 air_link: ${airLinkTxt}
 air_radio: ${airRadioTxt}
 air_peer: ${airPeerTxt}
@@ -758,13 +1430,8 @@ radio_rtt: ${fmtMs(radioRttTxt)}
 radio_rtt_avg: ${fmtMs(radioRttAvgTxt)}
 radio_state_fps: ${radioStateFpsTxt}
 ap_clients: ${dash(linkStatus.ap_clients)}
-ctrl_ws: ${ctrlSocketTxt}
-state_ws: ${stateSocketTxt}
-state_fps: ${stateFpsTxt}
+web_fps: ${stateFpsTxt}
 state_age_ms: ${stateAgeTxt}
-source_seq: ${sourceSeqTxt}
-source_t_us: ${sourceTusTxt}
-esp_rx_ms: ${espRxMsTxt}
 link_rx: ${dash(linkStatus.link_rx)}
 state_rx: ${dash(linkStatus.state_packets)}
 state_gap: ${dash(linkStatus.state_seq_gap)}
@@ -773,12 +1440,6 @@ frames_ok: ${dash(linkStatus.ok)}
 len_err: ${dash(linkStatus.len_err)}
 unknown_msg: ${dash(linkStatus.unknown_msg)}
 drop: ${dash(linkStatus.drop)}
-ws_loss: ${wsLossTxt}
-binary_parse_fail: ${parseFailTxt}
-ctrl_reconnects: ${ctrlReconnectTxt}
-state_reconnects: ${stateReconnectTxt}
-ctrl_last_close: ${ctrlLastCloseTxt}
-state_last_close: ${stateLastCloseTxt}
 ping: ${fmtMs(pingTxt)}
 ping_avg: ${fmtMs(pingAvgTxt)}`;
 }
@@ -805,7 +1466,9 @@ function renderActiveTab() {
     renderStale();
     return;
   }
-  if (activeTab === "gps") {
+  if (activeTab === "pfd") {
+    renderPfdPanel();
+  } else if (activeTab === "gps") {
     renderGpsPanel();
   } else if (activeTab === "att") {
     renderAttPanel();
@@ -830,6 +1493,7 @@ function renderNow() {
     lastLinkRenderAt = Date.now();
     linkDirty = false;
   }
+  if (activeTab === "pfd") (latestAtt || latestGps || latestBaro) ? renderPfdPanel() : renderPfdStale();
   if (activeTab === "gps") latestGps ? renderGpsPanel() : renderGpsStale();
   if (activeTab === "att") latestAtt ? renderAttPanel() : renderAttStale();
   if (activeTab === "baro") latestBaro ? renderBaroPanel() : renderBaroStale();
@@ -1026,6 +1690,9 @@ function handleCtrlMessage(text) {
   }
   if (m.type === "config") {
     document.getElementById("sourceHz").value = m.source_rate_hz ?? m.capture_rate_hz ?? m.log_rate_hz ?? 50;
+    if (Object.prototype.hasOwnProperty.call(m, "radio_lr_mode")) {
+      linkStatus.radio_lr_mode = !!m.radio_lr_mode;
+    }
     uiDirty = true;
     linkDirty = true;
     return;
@@ -1210,6 +1877,8 @@ setInterval(() => {
       clientStateFps = dt > 0 ? (1000 * d / dt) : 0;
       binaryRxCountLast = binaryRxCount;
       binaryRxFpsLastMs = now;
+      updateDataQuality();
+      updateUplinkDataQuality();
       uiDirty = true;
       linkDirty = true;
     }
@@ -1262,6 +1931,47 @@ document.querySelectorAll(".tabs button").forEach((b) => {
   });
 });
 
+window.addEventListener("resize", () => {
+  uiDirty = true;
+  renderNow();
+});
+
+try {
+  const savedCourse = localStorage.getItem("pfd_course_deg");
+  if (savedCourse !== null) {
+    courseSetDeg = norm360(Number(savedCourse));
+  }
+} catch (_err) {
+}
+updateCourseSetUi();
+
+if (pfdCanvas) {
+  pfdCanvas.addEventListener("click", (ev) => {
+    const rect = pfdCanvas.getBoundingClientRect();
+    const cssW = pfdLastW || rect.width || 390;
+    const cssH = pfdLastH || rect.height || 680;
+    const x = ((ev.clientX - rect.left) / rect.width) * cssW;
+    const y = ((ev.clientY - rect.top) / rect.height) * cssH;
+    const hit = pfdTapTargets.find((t) => x >= t.x && x <= (t.x + t.w) && y >= t.y && y <= (t.y + t.h));
+    if (!hit) {
+      if (courseEditOpen) setCourseEditOpen(false);
+      return;
+    }
+    if (hit.id === "course_toggle") {
+      setCourseEditOpen(!courseEditOpen);
+      return;
+    }
+    if (hit.id.startsWith("course_")) {
+      const key = hit.id.slice(7);
+      if (/^[0-9]$/.test(key)) appendCourseDigit(key);
+      if (key === "clr") courseEditBuffer = "";
+      if (key === "ent") commitCourseEdit();
+      uiDirty = true;
+      renderNow();
+    }
+  });
+}
+
 document.getElementById("gainSlider").addEventListener("input", () => {
   ensureFusionDraft();
   fusionDirty = true;
@@ -1307,7 +2017,8 @@ document.getElementById("recoverySlider").addEventListener("change", () => {
 document.getElementById("applyRate").addEventListener("click", async () => {
   const body = {
     source_rate_hz: Math.min(400, parseInt(document.getElementById("sourceHz").value, 10)),
-    radio_state_only: false
+    radio_state_only: false,
+    radio_lr_mode: !!linkStatus.radio_lr_mode
   };
   await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   try {
@@ -1340,9 +2051,9 @@ document.getElementById("resetAirNetwork").addEventListener("click", async () =>
     if (!resp.ok) {
       throw new Error(`reset failed: ${resp.status}`);
     }
-    setStatus("Connected / resetting AIR link");
+    setStatus("Con / resetting AIR link");
   } catch (_err) {
-    setStatus("Connected / AIR reset failed");
+    setStatus("Con / AIR reset failed");
   }
 });
 

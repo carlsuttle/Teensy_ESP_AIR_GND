@@ -8,13 +8,12 @@
 </head>
 <body>
   <header class="top">
-    <div class="title">Telemetry GND Unit</div>
-    <div id="status">Loading</div>
-    <div id="stats">state_fps: -- | seq: -- | ctrl: -- | state: -- | ping: -- ms</div>
-    <div id="rec" class="rec unknown">REC --</div>
+    <div class="title-row"><span class="title">Telemetry GND Unit</span><span id="status">Loading</span><span id="rec" class="rec unknown">REC --</span></div>
+    <div id="stats">web_fps: -- | dqi: -- | avg ping: -- ms</div>
   </header>
 
   <nav class="tabs">
+    <button data-tab="pfd">PFD</button>
     <button data-tab="gps" class="active">GPS</button>
     <button data-tab="att">Attitude</button>
     <button data-tab="baro">Baro</button>
@@ -23,6 +22,11 @@
   </nav>
 
   <main>
+    <section id="tab-pfd" class="tab">
+      <div class="pfd-wrap">
+        <canvas id="pfdCanvas" class="pfd-canvas" width="390" height="680"></canvas>
+      </div>
+    </section>
     <section id="tab-gps" class="tab active"><pre id="gps"></pre></section>
     <section id="tab-att" class="tab">
       <pre id="att"></pre>
@@ -95,6 +99,6 @@
     </section>
   </main>
 
-  <script src="/app.js?v=20260311d"></script>
+  <script src="/app.js?v=20260312ap"></script>
 </body>
 </html>
