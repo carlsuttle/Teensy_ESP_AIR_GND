@@ -1,10 +1,14 @@
 #include "imu_fusion.h"
 #include "config.h"
 
+#include <EEPROM.h>
 #include <math.h>
+#include <stddef.h>
 #include <Wire.h>
 #include <BMI2_BMM1.h>
 #include <Fusion.h>
+#include <FusionAxes.h>
+#include <FusionCompass.h>
 
 namespace imu_fusion {
 bool readRawAccelGyro(float out6[6]);
@@ -20,13 +24,28 @@ constexpr float kDefaultFusionGain = 0.06f;
 constexpr float kDefaultFusionAccelRejectDeg = 20.0f;
 constexpr float kDefaultFusionMagRejectDeg = 60.0f;
 constexpr uint16_t kDefaultFusionRecoverySamples = 1200U;
+constexpr int kFusionSettingsAddr = 256;
+constexpr uint32_t kFusionSettingsMagic = 0x46555331UL;  // "FUS1"
+constexpr uint16_t kFusionSettingsVersion = 1U;
 FusionAhrsSettings g_settings = {
-    .convention = FusionConventionNwu,
+    .convention = FusionConventionNed,
     .gain = kDefaultFusionGain,
-    .gyroscopeRange = BMI2_GYR_RANGE_250,
+    .gyroscopeRange = 250.0f,
     .accelerationRejection = kDefaultFusionAccelRejectDeg,
     .magneticRejection = kDefaultFusionMagRejectDeg,
     .recoveryTriggerPeriod = kDefaultFusionRecoverySamples,
+};
+
+struct PersistedFusionSettings {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  float gain;
+  float accelerationRejection;
+  float magneticRejection;
+  uint16_t recoveryTriggerPeriod;
+  uint16_t reserved;
+  uint32_t checksum;
 };
 
 const FusionMatrix kGyroMisalignment = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
@@ -44,12 +63,58 @@ FusionVector g_hardIronOffset = {0.0f, 0.0f, 0.0f};
 float g_mx = 0.0f;
 float g_my = 0.0f;
 float g_mz = 0.0f;
+FusionVector g_last_accel_body = {0.0f, 0.0f, 1.0f};
+FusionVector g_last_mag_body = {1.0f, 0.0f, 0.0f};
+FusionVector g_last_mag_fusion = {1.0f, 0.0f, 0.0f};
 uint32_t g_sampleRate = 100;
 constexpr float kGravityMps2 = 9.80665f;
 constexpr float kFusionDtSec = 0.0025f;  // 400 Hz
 constexpr uint32_t kFusionPeriodUs = 2500U;
+constexpr uint8_t kAccelLeastFilteredBwp = BMI2_ACC_OSR4_AVG1;
+constexpr uint8_t kAccelLeastFilteredPerf = 1U;
+constexpr uint8_t kGyroLeastFilteredBwp = BMI2_GYR_OSR4_MODE;
+constexpr uint8_t kGyroLeastFilteredNoisePerf = 1U;
+constexpr uint8_t kGyroLeastFilteredPerf = 1U;
+constexpr float kMinFusionDtSec = 0.0005f;
+constexpr float kMaxFusionDtSec = 0.05f;
 float g_accLsbPerG = 16384.0f;
 float g_gyrLsbPerDps = 16.384f;
+constexpr FusionAxesAlignment kSensorToBodyAlignment = FusionAxesAlignmentPXNYNZ; // sensor X fwd, Y left, Z up -> body X fwd, Y right, Z down
+
+uint32_t crc32(const uint8_t* data, size_t length) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < length; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      const uint32_t mask = -(int32_t)(crc & 1U);
+      crc = (crc >> 1) ^ (0xEDB88320UL & mask);
+    }
+  }
+  return ~crc;
+}
+
+uint32_t fusionSettingsChecksum(const PersistedFusionSettings& cfg) {
+  return crc32(reinterpret_cast<const uint8_t*>(&cfg), offsetof(PersistedFusionSettings, checksum));
+}
+
+void initDefaultFusionSettings(PersistedFusionSettings& cfg) {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.magic = kFusionSettingsMagic;
+  cfg.version = kFusionSettingsVersion;
+  cfg.size = sizeof(PersistedFusionSettings);
+  cfg.gain = kDefaultFusionGain;
+  cfg.accelerationRejection = kDefaultFusionAccelRejectDeg;
+  cfg.magneticRejection = kDefaultFusionMagRejectDeg;
+  cfg.recoveryTriggerPeriod = kDefaultFusionRecoverySamples;
+}
+
+void applyFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod) {
+  g_settings.gain = gain;
+  g_settings.accelerationRejection = accelRejection;
+  g_settings.magneticRejection = magRejection;
+  g_settings.recoveryTriggerPeriod = recoveryPeriod;
+  FusionAhrsSetSettings(&g_ahrs, &g_settings);
+}
 
 struct ImuFrame {
   float ax = 0.0f;
@@ -65,12 +130,15 @@ struct ImuFrame {
 };
 
 constexpr uint8_t kImuFrameQueueDepth = 4;
+constexpr bool kUseFrameAveraging = true;
+constexpr bool kUseGyroOffsetFilter = true;
 ImuFrame g_frameQueue[kImuFrameQueueDepth];
 uint8_t g_frameHead = 0;
 uint8_t g_frameTail = 0;
 uint8_t g_frameCount = 0;
 uint32_t g_nextReadUs = 0;
 uint32_t g_nextFusionUs = 0;
+uint32_t g_lastFusionUpdateUs = 0;
 
 void queueFrame(const ImuFrame& f) {
   if (g_frameCount >= kImuFrameQueueDepth) {
@@ -139,6 +207,15 @@ bool readImuFrame(ImuFrame& out) {
   return true;
 }
 
+bool takeLatestFrame(ImuFrame& out) {
+  if (g_frameCount == 0U) return false;
+  const uint8_t latestIndex = (uint8_t)((g_frameHead + kImuFrameQueueDepth - 1U) % kImuFrameQueueDepth);
+  out = g_frameQueue[latestIndex];
+  g_frameTail = g_frameHead;
+  g_frameCount = 0U;
+  return out.valid;
+}
+
 float accelLsbPerG(uint8_t range) {
   switch (range) {
     case BMI2_ACC_RANGE_2G: return 16384.0f;
@@ -159,12 +236,67 @@ float gyroLsbPerDps(uint8_t range) {
     default: return 16.384f;
   }
 }
+
+float gyroRangeDps(uint8_t range) {
+  switch (range) {
+    case BMI2_GYR_RANGE_2000: return 2000.0f;
+    case BMI2_GYR_RANGE_1000: return 1000.0f;
+    case BMI2_GYR_RANGE_500: return 500.0f;
+    case BMI2_GYR_RANGE_250: return 250.0f;
+    case BMI2_GYR_RANGE_125: return 125.0f;
+    default: return 2000.0f;
+  }
+}
 }  // namespace
 
 float computeHeadingDeg(float magX, float magY) {
+  // Body frame is aircraft-standard X forward, Y right, Z down. Heading is
+  // clockwise from North, so use +Y in atan2 for the body-frame horizontal
+  // field components.
   float heading = atan2f(magY, magX) * 180.0f / (float)M_PI;
   if (heading < 0.0f) heading += 360.0f;
   return heading;
+}
+
+float wrapHeading360(float headingDeg) {
+  while (headingDeg < 0.0f) headingDeg += 360.0f;
+  while (headingDeg >= 360.0f) headingDeg -= 360.0f;
+  return headingDeg;
+}
+
+float wrapHeading180(float headingDeg) {
+  headingDeg = wrapHeading360(headingDeg);
+  if (headingDeg > 180.0f) headingDeg -= 360.0f;
+  return headingDeg;
+}
+
+FusionVector sensorFrameToBodyFrame(const FusionVector& sensor) {
+  return FusionAxesSwap(sensor, kSensorToBodyAlignment);
+}
+
+FusionVector magBodyToFusionNed(const FusionVector& bodyMag) {
+  // The calibrated debug heading uses aircraft body axes directly:
+  //   X forward, Y right, Z down.
+  // Fusion is also configured for NED, but its magnetic feedback convention is
+  // effectively mirrored on the lateral body axis relative to our debug
+  // heading calculation. Keep the debug/body-frame magnetometer unchanged and
+  // apply the convention correction only on the vector passed into Fusion.
+  return {bodyMag.axis.x, -bodyMag.axis.y, bodyMag.axis.z};
+}
+
+FusionVector calibratedMagSensorToBodyFrame(const FusionVector& magSensorRaw) {
+  const FusionVector magSensorHardIronCorrected = {
+      magSensorRaw.axis.x - g_hardIronOffset.axis.x,
+      magSensorRaw.axis.y - g_hardIronOffset.axis.y,
+      magSensorRaw.axis.z - g_hardIronOffset.axis.z};
+  const FusionVector zeroHardIron = {0.0f, 0.0f, 0.0f};
+  const FusionVector magSensorCalibrated =
+      FusionCalibrationMagnetic(magSensorHardIronCorrected, kSoftIronMatrix, zeroHardIron);
+  return sensorFrameToBodyFrame(magSensorCalibrated);
+}
+
+FusionVector rotateBodyVectorToEarthFrame(const FusionVector& bodyVector) {
+  return FusionMatrixMultiplyVector(FusionQuaternionToMatrix(FusionAhrsGetQuaternion(&g_ahrs)), bodyVector);
 }
 
 bool begin(Stream* dbg) {
@@ -182,8 +314,17 @@ bool begin(Stream* dbg) {
   g_ready = true;
   ImuConfig cfg{};
   if (getImuConfig(cfg)) {
+    cfg.accBwp = kAccelLeastFilteredBwp;
+    cfg.accFilterPerf = kAccelLeastFilteredPerf;
+    cfg.gyrBwp = kGyroLeastFilteredBwp;
+    cfg.gyrNoisePerf = kGyroLeastFilteredNoisePerf;
+    cfg.gyrFilterPerf = kGyroLeastFilteredPerf;
+    (void)setImuConfig(cfg);
+  }
+  if (getImuConfig(cfg)) {
     g_accLsbPerG = accelLsbPerG(cfg.accRange);
     g_gyrLsbPerDps = gyroLsbPerDps(cfg.gyrRange);
+    g_settings.gyroscopeRange = gyroRangeDps(cfg.gyrRange);
   }
 
   FusionOffsetInitialise(&g_offset, g_sampleRate);
@@ -231,6 +372,8 @@ bool readCorrectedAccelGyro(float out6[6]) {
   FusionVector accel = {raw[0], raw[1], raw[2]};
   gyro = FusionCalibrationInertial(gyro, kGyroMisalignment, kGyroSensitivity, g_gyroOffset);
   accel = FusionCalibrationInertial(accel, kAccelMisalignment, kAccelSensitivity, g_accelOffset);
+  gyro = sensorFrameToBodyFrame(gyro);
+  accel = sensorFrameToBodyFrame(accel);
   accel.axis.x *= g_accelScale;
   accel.axis.y *= g_accelScale;
   accel.axis.z *= g_accelScale;
@@ -297,6 +440,18 @@ void getFusionFlags(bool& initialising, bool& angularRecovery, bool& acceleratio
   magneticRecovery = flags.magneticRecovery;
 }
 
+void getFusionHealthFlags(bool& accelerationError, bool& accelerometerIgnored, bool& magneticError, bool& magnetometerIgnored) {
+  const FusionAhrsInternalStates internal = FusionAhrsGetInternalStates(&g_ahrs);
+  accelerationError =
+      (g_settings.accelerationRejection > 0.0f) && isfinite(internal.accelerationError) &&
+      (internal.accelerationError >= g_settings.accelerationRejection);
+  accelerometerIgnored = internal.accelerometerIgnored;
+  magneticError =
+      (g_settings.magneticRejection > 0.0f) && isfinite(internal.magneticError) &&
+      (internal.magneticError >= g_settings.magneticRejection);
+  magnetometerIgnored = internal.magnetometerIgnored;
+}
+
 bool setFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod) {
   if (!g_ready) return false;
   if (!isfinite(gain) || !isfinite(accelRejection) || !isfinite(magRejection)) return false;
@@ -304,11 +459,37 @@ bool setFusionSettings(float gain, float accelRejection, float magRejection, uin
   if (accelRejection < 0.0f || magRejection < 0.0f) return false;
   if (recoveryPeriod == 0U) return false;
 
-  g_settings.gain = gain;
-  g_settings.accelerationRejection = accelRejection;
-  g_settings.magneticRejection = magRejection;
-  g_settings.recoveryTriggerPeriod = recoveryPeriod;
-  FusionAhrsSetSettings(&g_ahrs, &g_settings);
+  applyFusionSettings(gain, accelRejection, magRejection, recoveryPeriod);
+  return savePersistedFusionSettings();
+}
+
+bool loadPersistedFusionSettings() {
+  if (!g_ready) return false;
+  PersistedFusionSettings cfg{};
+  EEPROM.get(kFusionSettingsAddr, cfg);
+  if (cfg.magic != kFusionSettingsMagic ||
+      cfg.version != kFusionSettingsVersion ||
+      cfg.size != sizeof(PersistedFusionSettings) ||
+      cfg.checksum != fusionSettingsChecksum(cfg)) {
+    return false;
+  }
+  if (!isfinite(cfg.gain) || !isfinite(cfg.accelerationRejection) || !isfinite(cfg.magneticRejection)) return false;
+  if (cfg.gain <= 0.0f || cfg.accelerationRejection < 0.0f || cfg.magneticRejection < 0.0f || cfg.recoveryTriggerPeriod == 0U) {
+    return false;
+  }
+  applyFusionSettings(cfg.gain, cfg.accelerationRejection, cfg.magneticRejection, cfg.recoveryTriggerPeriod);
+  return true;
+}
+
+bool savePersistedFusionSettings() {
+  PersistedFusionSettings cfg{};
+  initDefaultFusionSettings(cfg);
+  cfg.gain = g_settings.gain;
+  cfg.accelerationRejection = g_settings.accelerationRejection;
+  cfg.magneticRejection = g_settings.magneticRejection;
+  cfg.recoveryTriggerPeriod = g_settings.recoveryTriggerPeriod;
+  cfg.checksum = fusionSettingsChecksum(cfg);
+  EEPROM.put(kFusionSettingsAddr, cfg);
   return true;
 }
 
@@ -325,10 +506,12 @@ bool setImuConfig(const ImuConfig& cfg) {
   if (!g_imu.setGyroConfig(cfg.gyrOdr, cfg.gyrRange, cfg.gyrBwp, cfg.gyrNoisePerf, cfg.gyrFilterPerf)) return false;
   g_accLsbPerG = accelLsbPerG(cfg.accRange);
   g_gyrLsbPerDps = gyroLsbPerDps(cfg.gyrRange);
+  g_settings.gyroscopeRange = gyroRangeDps(cfg.gyrRange);
 
   g_sampleRate = (uint32_t)(g_imu.accelerationSampleRate() + 0.5f);
   if (g_sampleRate == 0U) g_sampleRate = 100U;
   FusionOffsetInitialise(&g_offset, g_sampleRate);
+  g_lastFusionUpdateUs = 0U;
   return true;
 }
 
@@ -372,6 +555,51 @@ void getHardIronOffset(float& x, float& y, float& z) {
   z = g_hardIronOffset.axis.z;
 }
 
+void getMagHeadingInputs(float& magX, float& magY, float& magZ) {
+  float mx = 0.0f;
+  float my = 0.0f;
+  float mz = 0.0f;
+  if (!readRawMag(mx, my, mz)) {
+    magX = 0.0f;
+    magY = 0.0f;
+    magZ = 0.0f;
+    return;
+  }
+  const FusionVector magBody = calibratedMagSensorToBodyFrame({mx, my, mz});
+  magX = magBody.axis.x;
+  magY = magBody.axis.y;
+  magZ = magBody.axis.z;
+}
+
+void getFusionHeadingDebug(float& eulerYaw, float& matrixColHeading, float& matrixRowHeading, float& tiltCompHeading) {
+  const FusionQuaternion q = FusionAhrsGetQuaternion(&g_ahrs);
+  const FusionEuler e = FusionQuaternionToEuler(q);
+  const FusionMatrix m = FusionQuaternionToMatrix(q);
+  eulerYaw = e.angle.yaw;
+  matrixColHeading = wrapHeading360(FusionRadiansToDegrees(atan2f(m.element.yx, m.element.xx)));
+  matrixRowHeading = wrapHeading360(FusionRadiansToDegrees(atan2f(m.element.xy, m.element.xx)));
+  tiltCompHeading = wrapHeading360(FusionCompassCalculateHeading(g_settings.convention, g_last_accel_body, g_last_mag_fusion));
+}
+
+void getFusionMagDebug(FusionMagDebug& out) {
+  const FusionVector magEarthFromBody = rotateBodyVectorToEarthFrame(g_last_mag_body);
+  const FusionVector magEarthFromFusion = rotateBodyVectorToEarthFrame(g_last_mag_fusion);
+  out.bodyX = g_last_mag_body.axis.x;
+  out.bodyY = g_last_mag_body.axis.y;
+  out.bodyZ = g_last_mag_body.axis.z;
+  out.fusionX = g_last_mag_fusion.axis.x;
+  out.fusionY = g_last_mag_fusion.axis.y;
+  out.fusionZ = g_last_mag_fusion.axis.z;
+  out.earthFromBodyX = magEarthFromBody.axis.x;
+  out.earthFromBodyY = magEarthFromBody.axis.y;
+  out.earthFromBodyZ = magEarthFromBody.axis.z;
+  out.earthFromFusionX = magEarthFromFusion.axis.x;
+  out.earthFromFusionY = magEarthFromFusion.axis.y;
+  out.earthFromFusionZ = magEarthFromFusion.axis.z;
+  out.earthFromBodyHeading = computeHeadingDeg(magEarthFromBody.axis.x, magEarthFromBody.axis.y);
+  out.earthFromFusionHeading = computeHeadingDeg(magEarthFromFusion.axis.x, magEarthFromFusion.axis.y);
+}
+
 void update400Hz(State& s) {
   if (!g_ready) return;
   const uint32_t nowUs = micros();
@@ -393,34 +621,52 @@ void update400Hz(State& s) {
   uint32_t fuseGuard = 0;
   while ((int32_t)(nowUs - g_nextFusionUs) >= 0 && fuseGuard < 4U) {
     ImuFrame f{};
-    // Use averaged buffered frames to reduce fusion aliasing from read/fuse phase mismatch.
-    if (takeAveragedFrame(f)) {
+    const bool haveFrame = kUseFrameAveraging ? takeAveragedFrame(f) : takeLatestFrame(f);
+    if (haveFrame) {
       FusionVector gyro = {f.gx, f.gy, f.gz};
       FusionVector accel = {f.ax, f.ay, f.az};
-      const FusionVector magRaw = {-f.mx, -f.my, -f.mz};
-      const FusionVector magHard = {
-          magRaw.axis.x + g_hardIronOffset.axis.x,
-          magRaw.axis.y + g_hardIronOffset.axis.y,
-          magRaw.axis.z + g_hardIronOffset.axis.z};
-      const FusionVector zeroHard = {0.0f, 0.0f, 0.0f};
-      FusionVector mag = FusionCalibrationMagnetic(magHard, kSoftIronMatrix, zeroHard);
+      const FusionVector magBody = calibratedMagSensorToBodyFrame({f.mx, f.my, f.mz});
 
       gyro = FusionCalibrationInertial(gyro, kGyroMisalignment, kGyroSensitivity, g_gyroOffset);
       accel = FusionCalibrationInertial(accel, kAccelMisalignment, kAccelSensitivity, g_accelOffset);
+      gyro = sensorFrameToBodyFrame(gyro);
+      accel = sensorFrameToBodyFrame(accel);
+      const FusionVector magFusion = magBodyToFusionNed(magBody);
+      g_last_accel_body = accel;
+      g_last_mag_body = magBody;
+      g_last_mag_fusion = magFusion;
       accel.axis.x *= g_accelScale;
       accel.axis.y *= g_accelScale;
       accel.axis.z *= g_accelScale;
       accel.axis.x /= kGravityMps2;
       accel.axis.y /= kGravityMps2;
       accel.axis.z /= kGravityMps2;
-      gyro = FusionOffsetUpdate(&g_offset, gyro);
+      if (kUseGyroOffsetFilter) {
+        gyro = FusionOffsetUpdate(&g_offset, gyro);
+      }
+      const uint32_t fusionNowUs = micros();
+      float dtSec = kFusionDtSec;
+      if (g_lastFusionUpdateUs != 0U) {
+        dtSec = (float)(fusionNowUs - g_lastFusionUpdateUs) * 1.0e-6f;
+        if (!isfinite(dtSec) || dtSec < kMinFusionDtSec || dtSec > kMaxFusionDtSec) {
+          dtSec = kFusionDtSec;
+        }
+      }
+      g_lastFusionUpdateUs = fusionNowUs;
 
-      FusionAhrsUpdate(&g_ahrs, gyro, accel, mag, kFusionDtSec);
-      const FusionEuler e = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&g_ahrs));
+      const float headingDeg = computeHeadingDeg(magBody.axis.x, magBody.axis.y);
+      FusionAhrsUpdate(&g_ahrs, gyro, accel, magFusion, dtSec);
+      const FusionQuaternion q = FusionAhrsGetQuaternion(&g_ahrs);
+      const FusionEuler e = FusionQuaternionToEuler(q);
+      const FusionMatrix m = FusionQuaternionToMatrix(q);
+      const float fusionHeadingCol = wrapHeading360(FusionRadiansToDegrees(atan2f(m.element.yx, m.element.xx)));
 
       s.roll = e.angle.roll;
       s.pitch = e.angle.pitch;
-      s.yaw = e.angle.yaw;
+      // Publish compass heading, not raw Euler yaw. Euler yaw couples badly under
+      // large roll/pitch, while the rotation-matrix heading stays stable.
+      s.yaw = wrapHeading180(fusionHeadingCol);
+      s.mag_heading = headingDeg;
       s.last_imu_ms = millis();
     }
     g_nextFusionUs += kFusionPeriodUs;

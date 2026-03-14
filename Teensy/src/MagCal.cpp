@@ -4,7 +4,9 @@
 #include <float.h>
 
 namespace {
-constexpr float kAutoCompleteConfidence = 0.85f;
+constexpr float kAutoCompleteConfidence = 0.90f;
+constexpr uint32_t kMinAutoCompleteSamples = 1500U;
+constexpr uint32_t kMinAutoCompleteMs = 20000U;
 }
 
 void MagCal::start() {
@@ -43,7 +45,10 @@ void MagCal::update(float magX, float magY, float magZ) {
     sampleCount_++;
 
     recompute();
-    if (confidence_ >= kAutoCompleteConfidence) {
+    const uint32_t elapsedMs = millis() - startMs_;
+    if ((sampleCount_ >= kMinAutoCompleteSamples) &&
+        (elapsedMs >= kMinAutoCompleteMs) &&
+        (confidence_ >= kAutoCompleteConfidence)) {
         done_ = true;
     }
 }

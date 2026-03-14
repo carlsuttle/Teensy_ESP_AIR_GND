@@ -19,6 +19,10 @@ constexpr uint16_t kStateFlagFusionInitialising = 1U << 1;
 constexpr uint16_t kStateFlagFusionAngularRecovery = 1U << 2;
 constexpr uint16_t kStateFlagFusionAccelerationRecovery = 1U << 3;
 constexpr uint16_t kStateFlagFusionMagneticRecovery = 1U << 4;
+constexpr uint16_t kStateFlagFusionAccelerationError = 1U << 5;
+constexpr uint16_t kStateFlagFusionAccelerometerIgnored = 1U << 6;
+constexpr uint16_t kStateFlagFusionMagneticError = 1U << 7;
+constexpr uint16_t kStateFlagFusionMagnetometerIgnored = 1U << 8;
 constexpr size_t kPacketMax = 512U;
 constexpr size_t kRxMax = 768U;
 constexpr uint16_t kDefaultStreamRateHz = 50U;
@@ -41,6 +45,7 @@ struct TelemetryFullStateV1 {
   float roll_deg;
   float pitch_deg;
   float yaw_deg;
+  float mag_heading_deg;
 
   uint32_t iTOW_ms;
   uint8_t fixType;
@@ -326,6 +331,7 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us) {
   payload.roll_deg = s.roll;
   payload.pitch_deg = s.pitch;
   payload.yaw_deg = s.yaw;
+  payload.mag_heading_deg = s.mag_heading;
   payload.iTOW_ms = s.iTOW;
   payload.fixType = s.fixType;
   payload.numSV = s.numSV;
@@ -352,14 +358,24 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us) {
   bool fusionAngularRecovery = false;
   bool fusionAccelerationRecovery = false;
   bool fusionMagneticRecovery = false;
+  bool fusionAccelerationError = false;
+  bool fusionAccelerometerIgnored = false;
+  bool fusionMagneticError = false;
+  bool fusionMagnetometerIgnored = false;
   imu_fusion::getFusionFlags(
       fusionInitialising, fusionAngularRecovery, fusionAccelerationRecovery, fusionMagneticRecovery);
+  imu_fusion::getFusionHealthFlags(
+      fusionAccelerationError, fusionAccelerometerIgnored, fusionMagneticError, fusionMagnetometerIgnored);
   payload.flags = 0U;
   if (s.fixType >= 3U) payload.flags |= kStateFlagGpsFix3d;
   if (fusionInitialising) payload.flags |= kStateFlagFusionInitialising;
   if (fusionAngularRecovery) payload.flags |= kStateFlagFusionAngularRecovery;
   if (fusionAccelerationRecovery) payload.flags |= kStateFlagFusionAccelerationRecovery;
   if (fusionMagneticRecovery) payload.flags |= kStateFlagFusionMagneticRecovery;
+  if (fusionAccelerationError) payload.flags |= kStateFlagFusionAccelerationError;
+  if (fusionAccelerometerIgnored) payload.flags |= kStateFlagFusionAccelerometerIgnored;
+  if (fusionMagneticError) payload.flags |= kStateFlagFusionMagneticError;
+  if (fusionMagnetometerIgnored) payload.flags |= kStateFlagFusionMagnetometerIgnored;
 
   FrameHeader hdr{};
   hdr.magic = kMagic;

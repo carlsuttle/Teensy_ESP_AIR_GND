@@ -6,6 +6,7 @@ struct State {
   float roll;
   float pitch;
   float yaw;
+  float mag_heading;
 
   uint32_t iTOW;
   uint8_t fixType;

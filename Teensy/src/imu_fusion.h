@@ -5,6 +5,23 @@
 
 namespace imu_fusion {
 
+struct FusionMagDebug {
+  float bodyX;
+  float bodyY;
+  float bodyZ;
+  float fusionX;
+  float fusionY;
+  float fusionZ;
+  float earthFromBodyX;
+  float earthFromBodyY;
+  float earthFromBodyZ;
+  float earthFromFusionX;
+  float earthFromFusionY;
+  float earthFromFusionZ;
+  float earthFromBodyHeading;
+  float earthFromFusionHeading;
+};
+
 struct ImuConfig {
   uint8_t accOdr;
   uint8_t accRange;
@@ -31,7 +48,10 @@ void getAccelBiasMps2(float& ax, float& ay, float& az);
 void getGyroScale(float& lsbPerDps, float& dpsPerLsb);
 void getFusionSettings(float& gain, float& accelRejection, float& magRejection, uint16_t& recoveryPeriod);
 void getFusionFlags(bool& initialising, bool& angularRecovery, bool& accelerationRecovery, bool& magneticRecovery);
+void getFusionHealthFlags(bool& accelerationError, bool& accelerometerIgnored, bool& magneticError, bool& magnetometerIgnored);
 bool setFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod);
+bool loadPersistedFusionSettings();
+bool savePersistedFusionSettings();
 bool getImuConfig(ImuConfig& cfg);
 bool setImuConfig(const ImuConfig& cfg);
 bool getImuSampleRates(float& accHz, float& gyrHz);
@@ -42,5 +62,8 @@ float getAccelScale();
 void setHardIronOffset(float x, float y, float z);
 void getHardIronOffset(float& x, float& y, float& z);
 float computeHeadingDeg(float magX, float magY);
+void getMagHeadingInputs(float& magX, float& magY, float& magZ);
+void getFusionHeadingDebug(float& eulerYaw, float& matrixColHeading, float& matrixRowHeading, float& tiltCompHeading);
+void getFusionMagDebug(FusionMagDebug& out);
 
 }  // namespace imu_fusion

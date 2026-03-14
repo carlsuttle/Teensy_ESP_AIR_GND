@@ -45,6 +45,7 @@ enum class CommandMode : uint8_t {
   CalMag,
   CalImu,
   GetHdg,
+  ShowYawCmp,
   SpdTest,
   ShowCrsfIn,
   ShowImuData,
@@ -290,6 +291,19 @@ void printImuConfig();
 void printSetImuCfgUsage();
 bool applySetImuCfg(const char* cmd);
 void runTeensyLoopbackTest();
+
+void printFusionSettingsSummary(const char* source) {
+  float gain = 0.0f, accelRejection = 0.0f, magRejection = 0.0f;
+  uint16_t recoveryPeriod = 0U;
+  imu_fusion::getFusionSettings(gain, accelRejection, magRejection, recoveryPeriod);
+  Serial.printf("FUSION %s: gain=%.3f accRej=%.1f magRej=%.1f rec=%u (%.2fs)\r\n",
+                source ? source : "active",
+                (double)gain,
+                (double)accelRejection,
+                (double)magRejection,
+                (unsigned)recoveryPeriod,
+                (double)((float)recoveryPeriod / 400.0f));
+}
 
 bool writeLineNonBlocking(Stream& out, const char* line) {
   if (!line) return false;
@@ -569,6 +583,7 @@ void printCommandHelp() {
   Serial.println("  calimu     - start accel/gyro calibration");
   Serial.println("  teensyloopback - run Serial3 TX/RX loopback test");
   Serial.println("  gethdg     - print heading monitor once per second");
+  Serial.println("  showyawcmp - print raw gyro/raw mag/corrected mag/fusion together");
   Serial.println("  showimucfg - print live accel/gyro config");
   Serial.println("  setimucfg  - set accel/gyro config (see usage)");
   Serial.println("  showimudata- print corrected accel/gyro data");
@@ -681,6 +696,10 @@ void setMode(CommandMode mode) {
     case CommandMode::GetHdg:
       Serial.println("GETHDG START");
       break;
+    case CommandMode::ShowYawCmp:
+      Serial.println("SHOWYAWCMP START");
+      Serial.println("YAWCMP\tgx_raw\tgy_raw\tgz_raw\tmx_raw\tmy_raw\tmz_raw\tmx_corr\tmy_corr\tmz_corr\traw_hdg\tfusion_roll\tfusion_pitch\tfusion_yaw\tfusion_hdg_col\tfusion_hdg_row\tfusion_hdg_tc\tmag_heading\tmagE_body_hdg\tmagE_fusion_hdg");
+      break;
     case CommandMode::SpdTest:
       Serial.println("SPDTEST START");
       break;
@@ -750,6 +769,7 @@ void processCommand(const char* cmd) {
     if (g_mode == CommandMode::CalMag) Serial.println("CALMAG EXIT");
     if (g_mode == CommandMode::CalImu) Serial.println("CALIMU EXIT");
     if (g_mode == CommandMode::GetHdg) Serial.println("GETHDG EXIT");
+    if (g_mode == CommandMode::ShowYawCmp) Serial.println("SHOWYAWCMP EXIT");
     if (g_mode == CommandMode::SpdTest) Serial.println("SPDTEST EXIT");
     if (g_mode == CommandMode::ShowCrsfIn) Serial.println("SHOWCRSFIN EXIT");
     if (g_mode == CommandMode::ShowImuData) Serial.println("SHOWIMUDATA EXIT");
@@ -765,6 +785,8 @@ void processCommand(const char* cmd) {
     runTeensyLoopbackTest();
   } else if (strcmp(cmd, "gethdg") == 0) {
     setMode(CommandMode::GetHdg);
+  } else if (strcmp(cmd, "showyawcmp") == 0) {
+    setMode(CommandMode::ShowYawCmp);
   } else if (strcmp(cmd, "spdtest") == 0) {
     setMode(CommandMode::SpdTest);
   } else if (strcmp(cmd, "showcrsfin") == 0) {
@@ -992,7 +1014,7 @@ void serviceCommandMode() {
         g_cal_mag.active = true;
         g_cal_mag.last_print_ms = 0;
         g_mag_cal.start();
-        Serial.println("Calibration auto-stops at confidence >= 0.85 or press 'x' to stop.");
+        Serial.println("Calibration auto-stops at confidence >= 0.90 or press 'x' to stop.");
       }
       float mx, my, mz;
       if (imu_fusion::readRawMag(mx, my, mz)) {
@@ -1027,15 +1049,52 @@ void serviceCommandMode() {
       if (g_mode_last_print_ms == 0 || (uint32_t)(now - g_mode_last_print_ms) >= 1000U) {
         g_mode_last_print_ms = now;
         float mx = 0, my = 0, mz = 0;
-        float ox = 0, oy = 0, oz = 0;
-        imu_fusion::readRawMag(mx, my, mz);
-        imu_fusion::getHardIronOffset(ox, oy, oz);
-        const float mag_x_corr = mx - ox;
-        const float mag_y_corr = my - oy;
-        const float raw = imu_fusion::computeHeadingDeg(-mag_x_corr, mag_y_corr);
-        Serial.printf("GETHDG raw=%.1f deg fusion=%.1f deg mx=%.3f my=%.3f mx_corr=%.3f my_corr=%.3f\r\n",
-                      (double)raw, (double)g_state.yaw, (double)mx, (double)my,
-                      (double)(-mag_x_corr), (double)mag_y_corr);
+        imu_fusion::getMagHeadingInputs(mx, my, mz);
+        const float raw = imu_fusion::computeHeadingDeg(mx, my);
+        Serial.printf("GETHDG raw=%.1f deg fusion=%.1f deg mag_heading=%.1f deg mag_in=(%.3f, %.3f, %.3f)\r\n",
+                      (double)raw, (double)g_state.yaw, (double)g_state.mag_heading,
+                      (double)mx, (double)my, (double)mz);
+      }
+      return;
+    }
+
+    case CommandMode::ShowYawCmp: {
+      if (g_mode_last_print_ms == 0 || (uint32_t)(now - g_mode_last_print_ms) >= 100U) {
+        g_mode_last_print_ms = now;
+        float raw6[6] = {0, 0, 0, 0, 0, 0};
+        float mxRaw = 0.0f, myRaw = 0.0f, mzRaw = 0.0f;
+        float mxCorr = 0.0f, myCorr = 0.0f, mzCorr = 0.0f;
+        float fusionYawEuler = 0.0f;
+        float fusionHeadingCol = 0.0f;
+        float fusionHeadingRow = 0.0f;
+        float fusionHeadingTc = 0.0f;
+        imu_fusion::FusionMagDebug magDebug{};
+        const bool haveGyro = imu_fusion::readRawAccelGyro(raw6);
+        const bool haveMagRaw = imu_fusion::readRawMag(mxRaw, myRaw, mzRaw);
+        imu_fusion::getMagHeadingInputs(mxCorr, myCorr, mzCorr);
+        imu_fusion::getFusionHeadingDebug(fusionYawEuler, fusionHeadingCol, fusionHeadingRow, fusionHeadingTc);
+        imu_fusion::getFusionMagDebug(magDebug);
+        const float rawHeading = imu_fusion::computeHeadingDeg(mxCorr, myCorr);
+        Serial.printf("YAWCMP\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\r\n",
+                      (double)(haveGyro ? raw6[3] : NAN),
+                      (double)(haveGyro ? raw6[4] : NAN),
+                      (double)(haveGyro ? raw6[5] : NAN),
+                      (double)(haveMagRaw ? mxRaw : NAN),
+                      (double)(haveMagRaw ? myRaw : NAN),
+                      (double)(haveMagRaw ? mzRaw : NAN),
+                      (double)mxCorr,
+                      (double)myCorr,
+                      (double)mzCorr,
+                      (double)rawHeading,
+                      (double)g_state.roll,
+                      (double)g_state.pitch,
+                      (double)fusionYawEuler,
+                      (double)fusionHeadingCol,
+                      (double)fusionHeadingRow,
+                      (double)fusionHeadingTc,
+                      (double)g_state.mag_heading,
+                      (double)magDebug.earthFromBodyHeading,
+                      (double)magDebug.earthFromFusionHeading);
       }
       return;
     }
@@ -1414,6 +1473,8 @@ void setup() {
   if (g_imu_ok) {
     // Load persisted calibration first so printed config reflects active runtime calibration.
     loadCalibrationAtBoot();
+    const bool fusionLoaded = imu_fusion::loadPersistedFusionSettings();
+    printFusionSettingsSummary(fusionLoaded ? "loaded" : "default");
     printImuConfig();
   }
 
