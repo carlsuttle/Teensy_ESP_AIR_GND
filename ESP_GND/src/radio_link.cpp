@@ -466,6 +466,7 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
   g_snapshot.state.roll_deg = base.fast.roll_deg;
   g_snapshot.state.pitch_deg = base.fast.pitch_deg;
   g_snapshot.state.yaw_deg = base.fast.yaw_deg;
+  g_snapshot.state.mag_heading_deg = base.fast.mag_heading_deg;
   g_snapshot.state.last_imu_ms = base.fast.last_imu_ms;
   g_snapshot.state.baro_temp_c = base.fast.baro_temp_c;
   g_snapshot.state.baro_press_hpa = base.fast.baro_press_hpa;

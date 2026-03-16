@@ -1,0 +1,314 @@
+AI-Assisted Experimental Avionics Laboratory
+
+Version: 0.1
+Author: Carl Suttle
+Date: 2026
+
+1. Purpose
+
+This project explores AI-assisted avionics development.
+
+The goal is to determine whether a technically minded pilot using AI tools can design and prototype flight instrumentation systems that previously required large engineering teams.
+
+The project is experimental and research-oriented.
+
+Primary motivations:
+
+explore pilot-centric instrumentation
+
+accelerate avionics prototyping
+
+evaluate AI as an engineering collaborator
+
+document a repeatable development method
+
+The broader hypothesis is:
+
+AI reduces implementation difficulty so that domain expertise becomes the primary driver of innovation.
+
+2. Project Philosophy
+
+This project follows several principles.
+
+2.1 Domain Knowledge Drives Design
+
+Aviation knowledge determines system requirements.
+
+AI assists implementation but does not define system behavior.
+
+2.2 Rapid Prototyping
+
+Engineering follows a prototype loop:
+
+identify instrumentation problem
+
+conceptual design
+
+AI-assisted implementation
+
+bench testing
+
+flight test or simulation
+
+observation and documentation
+
+iterate
+
+AI greatly accelerates step 3.
+
+2.3 Demonstration Over Perfection
+
+The goal is first working demonstrations, not finished products.
+
+The key moment of interest is when an idea first works.
+
+This validates feasibility and allows further exploration.
+
+2.4 Pilot-Centric Instrumentation
+
+Many avionics systems prioritize sensors or automation.
+
+This project prioritizes pilot situational awareness.
+
+Questions include:
+
+What information does a pilot truly need?
+
+When do instruments mislead?
+
+How can energy state be better represented?
+
+3. Engineering Method
+
+This project represents a new workflow:
+
+AI-Assisted Domain Engineering
+
+Traditional engineering:
+
+Idea → Engineering team → Implementation → Prototype
+
+AI-assisted engineering:
+
+Domain insight → AI collaboration → Prototype
+
+Implementation becomes faster, shifting the challenge to:
+
+system architecture
+
+validation
+
+human factors
+
+4. System Architecture (Current)
+Flight Computer
+
+Primary processor:
+
+Teensy 4.0
+
+Responsibilities:
+
+sensor acquisition
+
+sensor fusion
+
+flight state estimation
+
+primary avionics logic
+
+Sensors
+
+Current sensors include:
+
+IMU
+BMI270
+
+Magnetometer
+BMM150
+
+GPS
+u-blox M10 (NAV-PVT messages)
+
+Barometer
+BMP280
+
+Telemetry / Networking Processor
+
+ESP32-S3
+
+Responsibilities:
+
+telemetry streaming
+
+SD logging
+
+web instrumentation interface
+
+networking
+
+Data Path
+Sensors → Teensy fusion → UART → ESP32
+ESP32 → WiFi → Web instrumentation display
+Rates
+
+Approximate update rates:
+
+IMU ≈ 400 Hz
+GPS = 10 Hz
+Telemetry ≈ 20 Hz
+Display ≈ 20 Hz
+
+5. Key Technical Insights (So Far)
+5.1 GPS Velocity is Extremely Valuable
+
+GPS velocity measurements are extremely accurate.
+
+They can assist:
+
+heading validation
+
+ground track estimation
+
+energy calculations
+
+5.2 Gravity-Vector Assumptions Break in Turns
+
+Many attitude systems assume acceleration is dominated by gravity.
+
+During coordinated turns, centripetal acceleration corrupts this assumption.
+
+Better models may use:
+
+yaw rate
+
+GPS velocity
+
+turn geometry
+
+5.3 Instrumentation Should Emphasize Meaning
+
+Sensors provide data.
+
+Pilots need understanding.
+
+Instrumentation should interpret sensor data into useful flight awareness.
+
+6. AI Collaboration Lessons
+
+AI tools (ChatGPT, Codex) are highly effective at:
+
+generating infrastructure code
+
+implementing communication protocols
+
+building software scaffolding
+
+debugging patterns
+
+AI tools are less effective at:
+
+system architecture
+
+aviation physics
+
+operational flight understanding
+
+validation of sensor assumptions
+
+Therefore:
+
+Human domain expertise must guide development.
+
+7. Constraints
+
+Several architectural rules apply.
+
+Logging Priority
+
+Flight data logging must never block or fail.
+
+Telemetry and networking are secondary.
+
+Debug Visibility
+
+Systems must remain observable through serial debug output.
+
+Deterministic Processing
+
+Flight computer tasks must not depend on networking performance.
+
+8. Current Development State
+
+Working components:
+
+GPS NAV-PVT parser
+
+IMU fusion running ~400 Hz
+
+telemetry data structures defined
+
+ESP32 telemetry architecture under development
+
+9. Next Experiments
+
+Possible experiments include:
+
+improved roll estimation in coordinated turns
+
+GPS-assisted validation of inertial estimates
+
+energy state display for pilot awareness
+
+alternative attitude presentation methods
+
+telemetry-driven cockpit displays
+
+10. Broader Insight
+
+A key realization during development:
+
+AI may allow many technically minded pilots to prototype avionics systems.
+
+Historically this required large engineering resources.
+
+Lowering the barrier to prototyping may lead to:
+
+many more experiments
+
+community innovation
+
+improvements in flight safety
+
+This project may serve as an early demonstration of that possibility.
+
+11. AI Session Context (For Future Use)
+
+When starting a new AI session, provide the following briefing:
+
+You are assisting an experimental avionics research project.
+
+Architecture:
+Teensy 4.0 flight computer
+ESP32 telemetry and logging processor
+IMU + GPS + barometer sensors
+
+Goals:
+Explore pilot-centric instrumentation
+Experiment with new ways of presenting flight state
+
+Constraints:
+Logging must never block.
+Networking is secondary.
+System must remain debuggable.
+12. Role of This Document
+
+This document serves as:
+
+project memory
+
+architecture reference
+
+AI session briefing
+
+laboratory notebook summary

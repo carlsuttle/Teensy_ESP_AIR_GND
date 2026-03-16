@@ -62,6 +62,7 @@ struct TelemetryFullStateV1 {
   float roll_deg;
   float pitch_deg;
   float yaw_deg;
+  float mag_heading_deg;
 
   uint32_t iTOW_ms;
   uint8_t fixType;
@@ -101,6 +102,7 @@ struct DownlinkFastStateV1 {
   float roll_deg;
   float pitch_deg;
   float yaw_deg;
+  float mag_heading_deg;
   uint32_t last_imu_ms;
   float baro_temp_c;
   float baro_press_hpa;

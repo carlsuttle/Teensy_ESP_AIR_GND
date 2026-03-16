@@ -6,7 +6,19 @@ Date: 2026
 
 ## 1. Purpose
 
-This project explores AI-assisted avionics development in a practical experimental laboratory context.
+The purpose of this laboratory is to explore pilot-centric instrumentation using low-cost sensors and AI-assisted engineering workflows.
+
+This project emerged from the observation that AI-assisted development
+dramatically reduces the effort required to implement avionics
+infrastructure.
+
+Historically, avionics prototyping required significant engineering
+resources. With AI assistance, a technically minded pilot can now
+implement telemetry, sensor fusion scaffolding, and display logic
+rapidly.
+
+This project explores whether that shift enables wider experimentation
+with flight instrumentation and pilot-centric displays.
 
 The central question is:
 
@@ -232,28 +244,6 @@ AI tools are weaker at:
 
 Therefore human domain judgement remains primary.
 
-### 7.5 AI Was Highly Effective For PFD/HSI Generation, But The Editing Loop Was Inefficient
-
-The development of the web-based PFD/HSI was a significant practical result.
-
-AI was able to generate most of the page structure, instrumentation logic, and data-flow plumbing quickly. A reasonable estimate is that AI produced roughly 90% of the initial result.
-
-The remaining work was concentrated in:
-
-- Graphical refinement
-- Layout correction
-- Text and labeling adjustments
-- Feature additions not present in the first generated version
-- Removal of AI-generated elements that were not operationally useful
-
-The main inefficiency was not code generation. The main inefficiency was the editing interface.
-
-Because the page was refined through chat interaction rather than a direct graphical editing environment, relatively small visual adjustments required long iterative text exchanges. This made final tuning much slower than the initial implementation.
-
-Important lesson:
-
-AI is highly effective at generating the underlying data plumbing and software structure for cockpit displays, but visual instrument refinement benefits strongly from direct graphical editing tools.
-
 ## 8. Constraints And Design Rules
 
 ### 8.1 Flight-Critical Processing First
@@ -392,41 +382,7 @@ When assisting this project, AI should:
 - Support repeatable tests and documentation
 - Treat this document as project context, not as proof that any subsystem is already correct
 
-For web instrumentation work, AI should also assume:
-
-- AI is useful for building display logic, data paths, and initial layout generation
-- Final cockpit-display refinement is likely to require graphical iteration, not only chat-based code edits
-- Display elements may need both graphical and textual editing
-- The ideal workflow would combine AI code generation with a visual editor or direct manipulation environment
-
-## 14. Tooling Requirements And Workflow Improvements
-
-One explicit goal of this project is not only to build instrumentation, but also to discover the best workflow for building it.
-
-The PFD/HSI experience suggests a strong tooling requirement:
-
-- AI should handle data flow, display logic, and scaffolding
-- A graphical editor should be available for final visual refinement
-
-Desired future workflow features:
-
-- Visual editing of instrument components
-- Direct manipulation of layout, scale, spacing, and alignment
-- Text editing of labels and display annotations in context
-- AI-assisted regeneration of code behind edited components
-- Rapid preview of display changes without long conversational round-trips
-
-This should be treated as an architectural requirement for the development process, not just a convenience.
-
-If possible, future work should explore a hybrid workflow in which:
-
-1. AI generates the first working display
-2. The developer adjusts it in a graphical editor
-3. AI updates code and behavior without destroying the visual edits
-
-That workflow would likely improve both speed and quality for cockpit display development.
-
-## 15. Record Maintenance Guidance
+## 14. Record Maintenance Guidance
 
 This file should be updated when any of the following change materially:
 

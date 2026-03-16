@@ -5,6 +5,11 @@
 
 namespace imu_fusion {
 
+enum class DebugMagMode : uint8_t {
+  Live = 0,
+  SyntheticEarth = 1,
+};
+
 struct FusionMagDebug {
   float bodyX;
   float bodyY;
@@ -65,5 +70,9 @@ float computeHeadingDeg(float magX, float magY);
 void getMagHeadingInputs(float& magX, float& magY, float& magZ);
 void getFusionHeadingDebug(float& eulerYaw, float& matrixColHeading, float& matrixRowHeading, float& tiltCompHeading);
 void getFusionMagDebug(FusionMagDebug& out);
+void setDebugMagLive();
+void setDebugMagSyntheticEarth(float north, float east, float down);
+DebugMagMode getDebugMagMode();
+void getDebugMagSyntheticEarth(float& north, float& east, float& down);
 
 }  // namespace imu_fusion

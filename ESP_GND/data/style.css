@@ -40,6 +40,8 @@ input, select, button { padding: 6px 8px; }
 .fusion-indicator { display: flex; align-items: center; gap: 10px; font-size: 14px; color: #cbd5e1; }
 .fusion-light { width: 14px; height: 14px; border-radius: 3px; border: 1px solid #475569; background: #1e293b; box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.35); }
 .fusion-light.on { background: #22c55e; border-color: #4ade80; }
+.fusion-light.on.orange { background: #eab308; border-color: #fde68a; }
+.fusion-light.on.red { background: #ef4444; border-color: #fca5a5; }
 .fusion-light.off { background: #334155; border-color: #475569; }
 .logs-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
 .pfd-wrap {

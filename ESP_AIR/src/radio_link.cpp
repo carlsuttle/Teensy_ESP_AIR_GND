@@ -558,6 +558,7 @@ void fillFastState(const telem::TelemetryFullStateV1& state, telem::DownlinkFast
   fast.roll_deg = state.roll_deg;
   fast.pitch_deg = state.pitch_deg;
   fast.yaw_deg = state.yaw_deg;
+  fast.mag_heading_deg = state.mag_heading_deg;
   fast.last_imu_ms = state.last_imu_ms;
   fast.baro_temp_c = state.baro_temp_c;
   fast.baro_press_hpa = state.baro_press_hpa;

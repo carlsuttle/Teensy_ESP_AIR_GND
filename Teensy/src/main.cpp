@@ -4,6 +4,8 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <EEPROM.h>
+#include <SPI.h>
+#include <SD.h>
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
 #include <bmi2_defs.h>
@@ -34,6 +36,10 @@ constexpr float BARO_QNH_HPA = 1013.25f;
 constexpr float BARO_ALT_TAU_S = 2.0f;
 constexpr float BARO_VSI_TAU_S = 2.0f;
 constexpr float kGravityMps2 = 9.80665f;
+constexpr uint8_t TEENSY_SD_CS_PIN = 10;
+constexpr uint8_t TEENSY_SD_MOSI_PIN = 11;
+constexpr uint8_t TEENSY_SD_MISO_PIN = 12;
+constexpr uint8_t TEENSY_SD_SCK_PIN = 13;
 float g_last_baro_alt_m = NAN;
 
 constexpr int kCalibStructAddr = 64;
@@ -579,11 +585,16 @@ void loadCalibrationAtBoot() {
 void printCommandHelp() {
   Serial.println("FAST COMMANDS:");
   Serial.println("  help / h   - show this command list");
+  Serial.println("  sdprobe    - probe external SPI SD card on pins 10/11/12/13");
+  Serial.println("  sdwrite    - write small binary test file to external SPI SD card");
   Serial.println("  calmag     - start magnetometer calibration");
   Serial.println("  calimu     - start accel/gyro calibration");
   Serial.println("  teensyloopback - run Serial3 TX/RX loopback test");
   Serial.println("  gethdg     - print heading monitor once per second");
   Serial.println("  showyawcmp - print raw gyro/raw mag/corrected mag/fusion together");
+  Serial.println("  maglive    - use live magnetometer input");
+  Serial.println("  magnorth   - use synthetic earth-frame north mag vector");
+  Serial.println("  magvec     - use synthetic earth-frame mag vector: magvec <north> <east> <down>");
   Serial.println("  showimucfg - print live accel/gyro config");
   Serial.println("  setimucfg  - set accel/gyro config (see usage)");
   Serial.println("  showimudata- print corrected accel/gyro data");
@@ -595,6 +606,56 @@ void printCommandHelp() {
   Serial.println("  x          - exit active mode");
   Serial.println("  stats      - start 2Hz summary stream");
   Serial.println("  zero       - zero attitude state");
+}
+
+bool beginExternalSdCard() {
+  pinMode(TEENSY_SD_CS_PIN, OUTPUT);
+  digitalWrite(TEENSY_SD_CS_PIN, HIGH);
+  pinMode(TEENSY_SD_MISO_PIN, INPUT_PULLUP);
+  pinMode(TEENSY_SD_MOSI_PIN, INPUT_PULLUP);
+  pinMode(TEENSY_SD_SCK_PIN, INPUT_PULLUP);
+  SPI.begin();
+  return SD.begin(TEENSY_SD_CS_PIN);
+}
+
+void runSdProbe() {
+  Serial.printf("SDPROBE pins cs=%u sck=%u miso=%u mosi=%u\r\n",
+                (unsigned)TEENSY_SD_CS_PIN,
+                (unsigned)TEENSY_SD_SCK_PIN,
+                (unsigned)TEENSY_SD_MISO_PIN,
+                (unsigned)TEENSY_SD_MOSI_PIN);
+  const bool beginOk = beginExternalSdCard();
+  Serial.printf("SDPROBE begin_ok=%u\r\n", (unsigned)(beginOk ? 1U : 0U));
+}
+
+void runSdWriteTest() {
+  const bool beginOk = beginExternalSdCard();
+  if (!beginOk) {
+    Serial.printf("SDPROBE pins cs=%u sck=%u miso=%u mosi=%u\r\n",
+                  (unsigned)TEENSY_SD_CS_PIN,
+                  (unsigned)TEENSY_SD_SCK_PIN,
+                  (unsigned)TEENSY_SD_MISO_PIN,
+                  (unsigned)TEENSY_SD_MOSI_PIN);
+    Serial.println("SDPROBE begin_ok=0");
+    Serial.println("SDWRITE write_ok=0 write_bytes=0");
+    return;
+  }
+
+  constexpr char kTestPath[] = "teensy_sd_test.bin";
+  const uint8_t payload[] = {0x54, 0x45, 0x45, 0x4E, 0x53, 0x59, 0x5F, 0x53, 0x44, 0x5F, 0x4F, 0x4B};
+  SD.remove(kTestPath);
+  File f = SD.open(kTestPath, FILE_WRITE);
+  if (!f) {
+    Serial.println("SDWRITE write_ok=0 write_bytes=0 err=open_failed");
+    return;
+  }
+  const size_t written = f.write(payload, sizeof(payload));
+  f.flush();
+  f.close();
+  SD.remove(kTestPath);
+  Serial.printf("SDWRITE write_ok=%u write_bytes=%u\r\n",
+                (unsigned)((written == sizeof(payload)) ? 1U : 0U),
+                (unsigned)written);
 }
 
 void printImuConfig() {
@@ -748,6 +809,10 @@ void processCommand(const char* cmd) {
   if (!cmd || cmd[0] == '\0') return;
   if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0) {
     printCommandHelp();
+  } else if (strcmp(cmd, "sdprobe") == 0) {
+    runSdProbe();
+  } else if (strcmp(cmd, "sdwrite") == 0) {
+    runSdWriteTest();
   } else if (strcmp(cmd, "stats") == 0) {
     g_stats_streaming = true;
     g_summary_timer_us = 0;
@@ -787,6 +852,23 @@ void processCommand(const char* cmd) {
     setMode(CommandMode::GetHdg);
   } else if (strcmp(cmd, "showyawcmp") == 0) {
     setMode(CommandMode::ShowYawCmp);
+  } else if (strcmp(cmd, "maglive") == 0) {
+    imu_fusion::setDebugMagLive();
+    Serial.println("mag debug mode: live sensor");
+  } else if (strcmp(cmd, "magnorth") == 0) {
+    imu_fusion::setDebugMagSyntheticEarth(1.0f, 0.0f, 0.5f);
+    Serial.println("mag debug mode: synthetic earth north=(1.0, 0.0, 0.5)");
+  } else if (startsWith(cmd, "magvec ")) {
+    float north = 0.0f, east = 0.0f, down = 0.0f;
+    if (sscanf(cmd + 7, "%f %f %f", &north, &east, &down) == 3) {
+      imu_fusion::setDebugMagSyntheticEarth(north, east, down);
+      Serial.printf("mag debug mode: synthetic earth north=(%.3f, %.3f, %.3f)\r\n",
+                    (double)north,
+                    (double)east,
+                    (double)down);
+    } else {
+      Serial.println("magvec usage: magvec <north> <east> <down>");
+    }
   } else if (strcmp(cmd, "spdtest") == 0) {
     setMode(CommandMode::SpdTest);
   } else if (strcmp(cmd, "showcrsfin") == 0) {

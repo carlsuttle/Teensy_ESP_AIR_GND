@@ -66,6 +66,8 @@ float g_mz = 0.0f;
 FusionVector g_last_accel_body = {0.0f, 0.0f, 1.0f};
 FusionVector g_last_mag_body = {1.0f, 0.0f, 0.0f};
 FusionVector g_last_mag_fusion = {1.0f, 0.0f, 0.0f};
+DebugMagMode g_debugMagMode = DebugMagMode::Live;
+FusionVector g_debugSyntheticEarthMag = {1.0f, 0.0f, 0.5f};
 uint32_t g_sampleRate = 100;
 constexpr float kGravityMps2 = 9.80665f;
 constexpr float kFusionDtSec = 0.0025f;  // 400 Hz
@@ -297,6 +299,23 @@ FusionVector calibratedMagSensorToBodyFrame(const FusionVector& magSensorRaw) {
 
 FusionVector rotateBodyVectorToEarthFrame(const FusionVector& bodyVector) {
   return FusionMatrixMultiplyVector(FusionQuaternionToMatrix(FusionAhrsGetQuaternion(&g_ahrs)), bodyVector);
+}
+
+FusionVector rotateEarthVectorToBodyFrame(const FusionVector& earthVector) {
+  const FusionMatrix earthFromBody = FusionQuaternionToMatrix(FusionAhrsGetQuaternion(&g_ahrs));
+  const FusionMatrix bodyFromEarth = {
+      earthFromBody.element.xx, earthFromBody.element.yx, earthFromBody.element.zx,
+      earthFromBody.element.xy, earthFromBody.element.yy, earthFromBody.element.zy,
+      earthFromBody.element.xz, earthFromBody.element.yz, earthFromBody.element.zz,
+  };
+  return FusionMatrixMultiplyVector(bodyFromEarth, earthVector);
+}
+
+FusionVector currentMagBodyVector(float mx, float my, float mz) {
+  if (g_debugMagMode == DebugMagMode::SyntheticEarth) {
+    return rotateEarthVectorToBodyFrame(g_debugSyntheticEarthMag);
+  }
+  return calibratedMagSensorToBodyFrame({mx, my, mz});
 }
 
 bool begin(Stream* dbg) {
@@ -556,6 +575,12 @@ void getHardIronOffset(float& x, float& y, float& z) {
 }
 
 void getMagHeadingInputs(float& magX, float& magY, float& magZ) {
+  if (g_debugMagMode == DebugMagMode::SyntheticEarth) {
+    magX = g_last_mag_body.axis.x;
+    magY = g_last_mag_body.axis.y;
+    magZ = g_last_mag_body.axis.z;
+    return;
+  }
   float mx = 0.0f;
   float my = 0.0f;
   float mz = 0.0f;
@@ -600,6 +625,25 @@ void getFusionMagDebug(FusionMagDebug& out) {
   out.earthFromFusionHeading = computeHeadingDeg(magEarthFromFusion.axis.x, magEarthFromFusion.axis.y);
 }
 
+void setDebugMagLive() {
+  g_debugMagMode = DebugMagMode::Live;
+}
+
+void setDebugMagSyntheticEarth(float north, float east, float down) {
+  g_debugSyntheticEarthMag = {north, east, down};
+  g_debugMagMode = DebugMagMode::SyntheticEarth;
+}
+
+DebugMagMode getDebugMagMode() {
+  return g_debugMagMode;
+}
+
+void getDebugMagSyntheticEarth(float& north, float& east, float& down) {
+  north = g_debugSyntheticEarthMag.axis.x;
+  east = g_debugSyntheticEarthMag.axis.y;
+  down = g_debugSyntheticEarthMag.axis.z;
+}
+
 void update400Hz(State& s) {
   if (!g_ready) return;
   const uint32_t nowUs = micros();
@@ -625,7 +669,7 @@ void update400Hz(State& s) {
     if (haveFrame) {
       FusionVector gyro = {f.gx, f.gy, f.gz};
       FusionVector accel = {f.ax, f.ay, f.az};
-      const FusionVector magBody = calibratedMagSensorToBodyFrame({f.mx, f.my, f.mz});
+      const FusionVector magBody = currentMagBodyVector(f.mx, f.my, f.mz);
 
       gyro = FusionCalibrationInertial(gyro, kGyroMisalignment, kGyroSensitivity, g_gyroOffset);
       accel = FusionCalibrationInertial(accel, kAccelMisalignment, kAccelSensitivity, g_accelOffset);

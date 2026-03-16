@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <LittleFS.h>
+#include <SD.h>
 #include <WiFi.h>
 #include <ctype.h>
 #include <esp_wifi.h>
@@ -7,6 +8,8 @@
 
 #include "config_store.h"
 #include "log_store.h"
+#include "sd_capture_test.h"
+#include "sd_card_test.h"
 #include "uart_telem.h"
 #include "radio_link.h"
 
@@ -27,6 +30,15 @@ bool g_link_ready = false;
 bool g_link_wait_printed = false;
 bool g_teensy_ready = false;
 bool g_teensy_wait_printed = false;
+bool g_gpio_pulse_active = false;
+uint8_t g_gpio_pulse_pin = 0U;
+uint32_t g_gpio_pulse_until_ms = 0U;
+bool g_sd_capture_was_active = false;
+bool g_baseline_active = false;
+bool g_baseline_completed = false;
+uint32_t g_baseline_duration_ms = 0U;
+uint32_t g_baseline_started_ms = 0U;
+uint32_t g_baseline_stopped_ms = 0U;
 uint32_t g_last_radio_tx_packets = 0U;
 uint32_t g_last_radio_rx_packets = 0U;
 uint32_t g_last_source_seq_seen = 0U;
@@ -38,8 +50,46 @@ constexpr size_t kStateTxReserveSlots = 4U;
 constexpr uint32_t kRadioProgressTimeoutMs = 6000U;
 constexpr uint32_t kRadioRecoveryCooldownMs = 10000U;
 
+struct CaptureBenchBaseline {
+  radio_link::Stats radio = {};
+  uart_telem::RxStats uart = {};
+  uint32_t started_ms = 0U;
+};
+
+CaptureBenchBaseline g_sd_capture_baseline = {};
+
 void beginWifiStation();
 void restartWifiStation();
+void beginSdCaptureBenchmark(uint32_t duration_ms);
+void printSdCaptureImpactReport();
+void beginBaselineBenchmark(uint32_t duration_ms);
+void stopBaselineBenchmark();
+void printBaselineImpactReport();
+
+void stopGpioPulse() {
+  if (!g_gpio_pulse_active) return;
+  digitalWrite(g_gpio_pulse_pin, LOW);
+  pinMode(g_gpio_pulse_pin, INPUT);
+  Serial.printf("SETPIN done gpio=%u state=0\r\n", (unsigned)g_gpio_pulse_pin);
+  g_gpio_pulse_active = false;
+}
+
+void startGpioPulse(uint8_t pin) {
+  stopGpioPulse();
+  g_gpio_pulse_pin = pin;
+  pinMode(g_gpio_pulse_pin, OUTPUT);
+  digitalWrite(g_gpio_pulse_pin, HIGH);
+  g_gpio_pulse_until_ms = millis() + 5000U;
+  g_gpio_pulse_active = true;
+  Serial.printf("SETPIN gpio=%u state=1 duration_ms=5000\r\n", (unsigned)g_gpio_pulse_pin);
+}
+
+void serviceGpioPulse() {
+  if (!g_gpio_pulse_active) return;
+  if ((int32_t)(millis() - g_gpio_pulse_until_ms) >= 0) {
+    stopGpioPulse();
+  }
+}
 
 void resetRadioWatchdog() {
   g_last_radio_tx_packets = 0U;
@@ -97,6 +147,15 @@ void printConsoleHelp() {
   Serial.println("  getfusion     - send CMD_GET_FUSION_SETTINGS to Teensy");
   Serial.println("  kickteensy    - resend current stream-rate command to Teensy");
   Serial.println("  resendrate    - same as kickteensy");
+  Serial.println("  sdprobe       - probe microSD card over SPI and print init/mount status");
+  Serial.println("  sdwrite       - run tiny binary create/write/delete test on microSD");
+  Serial.println("  base1m        - run 60-second radio/UART baseline with no SD capture");
+  Serial.println("  basestop      - stop active baseline run");
+  Serial.println("  basestat      - print baseline status");
+  Serial.println("  sdcap1m       - capture every Teensy state to one SD binary file for 60 seconds");
+  Serial.println("  sdcapstop     - stop active SD capture benchmark");
+  Serial.println("  sdcapstat     - print SD capture benchmark status");
+  Serial.println("  setpin <gpio> - drive a GPIO high for 5 seconds, then return it low");
   Serial.println("  tx1           - send current state once to GND");
   Serial.println("  linkclear     - clear AIR radio-link state and stop ESP-NOW");
   Serial.println("  linkopen      - reopen AIR radio-link only");
@@ -111,10 +170,11 @@ void printConsoleHelp() {
 
 void printStats(const uart_telem::Snapshot& snap) {
   const auto link = radio_link::stats();
+  const auto cap = sd_capture_test::stats();
   Serial.printf(
       "STAT unit=AIR seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
       "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu "
-      "link_tx=%lu link_rx=%lu link_drop=%lu\n",
+      "link_tx=%lu link_rx=%lu link_drop=%lu sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -131,7 +191,104 @@ void printStats(const uart_telem::Snapshot& snap) {
       (unsigned long)snap.stats.drop,
       (unsigned long)link.tx_packets,
       (unsigned long)link.rx_packets,
-      (unsigned long)link.tx_drop);
+      (unsigned long)link.tx_drop,
+      cap.active ? 1U : 0U,
+      (unsigned long)cap.dropped,
+      (unsigned long)cap.queue_max);
+}
+
+void beginSdCaptureBenchmark(uint32_t duration_ms) {
+  stopBaselineBenchmark();
+  const auto snap = uart_telem::snapshot();
+  g_sd_capture_baseline.radio = radio_link::stats();
+  g_sd_capture_baseline.uart = snap.stats;
+  g_sd_capture_baseline.started_ms = millis();
+  sd_capture_test::clearCompleted();
+  const bool ok = sd_capture_test::start(duration_ms);
+  const auto cap = sd_capture_test::stats();
+  Serial.printf("SDCAP START ok=%u duration_ms=%lu init_hz=%lu file=%s\r\n",
+                ok ? 1U : 0U,
+                (unsigned long)duration_ms,
+                (unsigned long)cap.init_hz,
+                cap.file_name[0] ? cap.file_name : "(none)");
+  if (!ok) {
+    sd_capture_test::printReport(Serial, cap);
+  }
+}
+
+void beginBaselineBenchmark(uint32_t duration_ms) {
+  sd_capture_test::stop(false);
+  g_sd_capture_was_active = false;
+  const auto snap = uart_telem::snapshot();
+  g_sd_capture_baseline.radio = radio_link::stats();
+  g_sd_capture_baseline.uart = snap.stats;
+  g_sd_capture_baseline.started_ms = millis();
+  g_baseline_active = true;
+  g_baseline_completed = false;
+  g_baseline_duration_ms = duration_ms;
+  g_baseline_started_ms = g_sd_capture_baseline.started_ms;
+  g_baseline_stopped_ms = 0U;
+  Serial.printf("BASELINE START duration_ms=%lu\r\n", (unsigned long)duration_ms);
+}
+
+void stopBaselineBenchmark() {
+  if (!g_baseline_active) return;
+  g_baseline_active = false;
+  g_baseline_completed = true;
+  g_baseline_stopped_ms = millis();
+}
+
+void printBaselineImpactReport() {
+  const auto radio_now = radio_link::stats();
+  const auto snap = uart_telem::snapshot();
+  const uint32_t elapsed_ms =
+      (g_baseline_stopped_ms >= g_sd_capture_baseline.started_ms)
+          ? (g_baseline_stopped_ms - g_sd_capture_baseline.started_ms)
+          : 0U;
+  Serial.printf("BASELINE RESULT elapsed_ms=%lu duration_ms=%lu\r\n",
+                (unsigned long)elapsed_ms,
+                (unsigned long)g_baseline_duration_ms);
+  Serial.printf(
+      "BASELINE IMPACT radio_tx=%lu radio_rx=%lu radio_drop=%lu uart_ok=%lu uart_crc=%lu uart_cobs=%lu uart_len=%lu uart_unk=%lu uart_drop=%lu\r\n",
+      (unsigned long)(radio_now.tx_packets - g_sd_capture_baseline.radio.tx_packets),
+      (unsigned long)(radio_now.rx_packets - g_sd_capture_baseline.radio.rx_packets),
+      (unsigned long)(radio_now.tx_drop - g_sd_capture_baseline.radio.tx_drop),
+      (unsigned long)(snap.stats.frames_ok - g_sd_capture_baseline.uart.frames_ok),
+      (unsigned long)(snap.stats.crc_err - g_sd_capture_baseline.uart.crc_err),
+      (unsigned long)(snap.stats.cobs_err - g_sd_capture_baseline.uart.cobs_err),
+      (unsigned long)(snap.stats.len_err - g_sd_capture_baseline.uart.len_err),
+      (unsigned long)(snap.stats.unknown_msg - g_sd_capture_baseline.uart.unknown_msg),
+      (unsigned long)(snap.stats.drop - g_sd_capture_baseline.uart.drop));
+}
+
+void printSdCaptureImpactReport() {
+  const auto cap = sd_capture_test::stats();
+  const auto radio_now = radio_link::stats();
+  const auto snap = uart_telem::snapshot();
+  const uint32_t elapsed_ms =
+      (cap.stopped_ms >= g_sd_capture_baseline.started_ms) ? (cap.stopped_ms - g_sd_capture_baseline.started_ms) : 0U;
+
+  Serial.printf(
+      "SDCAP RESULT elapsed_ms=%lu timed_out=%u file=%s records=%lu bytes=%lu qmax=%lu cap_drop=%lu\r\n",
+      (unsigned long)elapsed_ms,
+      cap.timed_out ? 1U : 0U,
+      cap.file_name[0] ? cap.file_name : "(none)",
+      (unsigned long)cap.records_written,
+      (unsigned long)cap.bytes_written,
+      (unsigned long)cap.queue_max,
+      (unsigned long)cap.dropped);
+  Serial.printf(
+      "SDCAP IMPACT radio_tx=%lu radio_rx=%lu radio_drop=%lu uart_ok=%lu uart_crc=%lu uart_cobs=%lu uart_len=%lu uart_unk=%lu uart_drop=%lu\r\n",
+      (unsigned long)(radio_now.tx_packets - g_sd_capture_baseline.radio.tx_packets),
+      (unsigned long)(radio_now.rx_packets - g_sd_capture_baseline.radio.rx_packets),
+      (unsigned long)(radio_now.tx_drop - g_sd_capture_baseline.radio.tx_drop),
+      (unsigned long)(snap.stats.frames_ok - g_sd_capture_baseline.uart.frames_ok),
+      (unsigned long)(snap.stats.crc_err - g_sd_capture_baseline.uart.crc_err),
+      (unsigned long)(snap.stats.cobs_err - g_sd_capture_baseline.uart.cobs_err),
+      (unsigned long)(snap.stats.len_err - g_sd_capture_baseline.uart.len_err),
+      (unsigned long)(snap.stats.unknown_msg - g_sd_capture_baseline.uart.unknown_msg),
+      (unsigned long)(snap.stats.drop - g_sd_capture_baseline.uart.drop));
+  sd_capture_test::printReport(Serial, cap);
 }
 
 void handleConsoleCommands() {
@@ -148,6 +305,43 @@ void handleConsoleCommands() {
 
       if (strcmp(g_console_line, "help") == 0 || strcmp(g_console_line, "h") == 0) {
         printConsoleHelp();
+      } else if (strcmp(g_console_line, "sdprobe") == 0 || strcmp(g_console_line, "sdcard") == 0) {
+        sd_card_test::Status status = {};
+        (void)sd_card_test::probe(status);
+        sd_card_test::printProbeReport(Serial, status);
+      } else if (strcmp(g_console_line, "sdwrite") == 0 || strcmp(g_console_line, "sdtest") == 0) {
+        sd_card_test::Status status = {};
+        (void)sd_card_test::writeProbe(status);
+        sd_card_test::printProbeReport(Serial, status);
+      } else if (strcmp(g_console_line, "base1m") == 0) {
+        beginBaselineBenchmark(60000U);
+      } else if (strcmp(g_console_line, "basestop") == 0) {
+        stopBaselineBenchmark();
+        printBaselineImpactReport();
+        g_baseline_completed = false;
+      } else if (strcmp(g_console_line, "basestat") == 0) {
+        Serial.printf("BASELINE active=%u completed=%u duration_ms=%lu started_ms=%lu stopped_ms=%lu\r\n",
+                      g_baseline_active ? 1U : 0U,
+                      g_baseline_completed ? 1U : 0U,
+                      (unsigned long)g_baseline_duration_ms,
+                      (unsigned long)g_baseline_started_ms,
+                      (unsigned long)g_baseline_stopped_ms);
+      } else if (strcmp(g_console_line, "sdcap1m") == 0) {
+        beginSdCaptureBenchmark(60000U);
+      } else if (strcmp(g_console_line, "sdcapstop") == 0) {
+        sd_capture_test::stop(false);
+        printSdCaptureImpactReport();
+        sd_capture_test::clearCompleted();
+      } else if (strcmp(g_console_line, "sdcapstat") == 0) {
+        const auto cap = sd_capture_test::stats();
+        sd_capture_test::printReport(Serial, cap);
+      } else if (strncmp(g_console_line, "setpin ", 7) == 0) {
+        unsigned pin = 0U;
+        if (sscanf(g_console_line + 7, "%u", &pin) == 1 && pin <= 48U) {
+          startGpioPulse((uint8_t)pin);
+        } else {
+          Serial.println("SETPIN usage: setpin <gpio>");
+        }
       } else if (strcmp(g_console_line, "getfusion") == 0 || strcmp(g_console_line, "get fusion") == 0) {
         const bool ok = uart_telem::sendGetFusionSettings();
         Serial.printf("GETFUSION tx_ok=%u\n", ok ? 1U : 0U);
@@ -413,6 +607,7 @@ void setup() {
 
   uart_telem::begin(cfg);
   radio_link::begin(cfg);
+  sd_capture_test::begin();
   radio_link::setRecorderEnabled(air_file_logging_enabled);
   log_store::begin(cfg, air_file_logging_enabled);
   Serial.printf("AIR INFO recorder=%s\n", air_file_logging_enabled ? "on" : "off");
@@ -426,6 +621,12 @@ void setup() {
 
 void loop() {
   handleConsoleCommands();
+  serviceGpioPulse();
+  sd_capture_test::poll();
+  if (g_baseline_active &&
+      (uint32_t)(millis() - g_baseline_started_ms) >= g_baseline_duration_ms) {
+    stopBaselineBenchmark();
+  }
   if (radio_link::takeNetworkResetRequest()) {
     restartWifiStation();
   }
@@ -464,6 +665,17 @@ void loop() {
   publishPendingTelemetry();
   radio_link::publish(snap);
   maybeRecoverRadioLink(snap);
+
+  const auto cap = sd_capture_test::stats();
+  if (g_sd_capture_was_active && !cap.active && cap.completed) {
+    printSdCaptureImpactReport();
+    sd_capture_test::clearCompleted();
+  }
+  g_sd_capture_was_active = cap.active;
+  if (!g_baseline_active && g_baseline_completed) {
+    printBaselineImpactReport();
+    g_baseline_completed = false;
+  }
 
   const uint32_t now = millis();
   if (g_stats_streaming && (uint32_t)(now - g_last_stat_ms) >= 1000U) {

@@ -36,21 +36,17 @@
           <div class="fusion-indicators">
             <div class="fusion-indicator">
               <span id="fusionAngularLight" class="fusion-light off"></span>
-              <span>Angular Recovery</span>
-            </div>
-            <div class="fusion-indicator">
-              <span id="fusionAccelLight" class="fusion-light off"></span>
-              <span>Acceleration Recovery</span>
+              <span>Accel Status (orange=error, red=ignored)</span>
             </div>
             <div class="fusion-indicator">
               <span id="fusionMagLight" class="fusion-light off"></span>
-              <span>Magnetic Recovery</span>
+              <span>Mag Status (orange=error, red=ignored)</span>
             </div>
           </div>
           <div class="fusion-control">
             <div class="fusion-head"><span>gain</span><span id="gainValue">-</span></div>
             <div class="fusion-row">
-              <input id="gainSlider" type="range" min="0.02" max="0.20" step="0.01" value="0.06" />
+              <input id="gainSlider" type="range" min="0.02" max="1.00" step="0.01" value="0.06" />
             </div>
           </div>
           <div class="fusion-control">
@@ -68,7 +64,7 @@
           <div class="fusion-control">
             <div class="fusion-head"><span>recoveryTriggerPeriod (s / samples)</span><span id="recoveryValue">-</span></div>
             <div class="fusion-row">
-              <input id="recoverySlider" type="range" min="1.0" max="8.0" step="0.1" value="3.0" />
+              <input id="recoverySlider" type="range" min="1.00" max="5.12" step="0.01" value="3.00" />
             </div>
           </div>
         </section>
@@ -103,6 +99,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20260313a"></script>
+  <script src="/app.js?v=20260313g"></script>
 </body>
 </html>

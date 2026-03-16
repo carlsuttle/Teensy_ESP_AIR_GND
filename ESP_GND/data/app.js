@@ -11,7 +11,6 @@ const appShellFrameEl = document.getElementById("appShellFrame");
 const appShellEl = document.getElementById("appShell");
 const airLoggerTextEl = document.getElementById("airLoggerText");
 const fusionAngularLightEl = document.getElementById("fusionAngularLight");
-const fusionAccelLightEl = document.getElementById("fusionAccelLight");
 const fusionMagLightEl = document.getElementById("fusionMagLight");
 
 let wsCtrl = null;
@@ -63,7 +62,11 @@ let fusionFlagsLast = {
   initialising: false,
   angularRecovery: false,
   accelerationRecovery: false,
-  magneticRecovery: false
+  magneticRecovery: false,
+  accelerationError: false,
+  accelerometerIgnored: false,
+  magneticError: false,
+  magnetometerIgnored: false
 };
 let fusionUiHoldUntilMs = 0;
 let fusionDraft = null;
@@ -97,6 +100,8 @@ let pfdLastH = 0;
 let courseSetDeg = 0;
 let courseEditOpen = false;
 let courseEditBuffer = "";
+let coursePressedKey = "";
+let coursePressedUntilMs = 0;
 let pfdTapTargets = [];
 let nextCtrlReqId = 1;
 let clientEventLog = [];
@@ -169,6 +174,10 @@ const STATE_FLAG_FUSION_INITIALISING = 1 << 1;
 const STATE_FLAG_FUSION_ANGULAR_RECOVERY = 1 << 2;
 const STATE_FLAG_FUSION_ACCELERATION_RECOVERY = 1 << 3;
 const STATE_FLAG_FUSION_MAGNETIC_RECOVERY = 1 << 4;
+const STATE_FLAG_FUSION_ACCELERATION_ERROR = 1 << 5;
+const STATE_FLAG_FUSION_ACCELEROMETER_IGNORED = 1 << 6;
+const STATE_FLAG_FUSION_MAGNETIC_ERROR = 1 << 7;
+const STATE_FLAG_FUSION_MAGNETOMETER_IGNORED = 1 << 8;
 
 const WS_STATE_MAGIC = 0x57535445;
 const WS_STATE_VERSION = 2;
@@ -224,6 +233,7 @@ function parseBinaryState(buf) {
   m.a.r = dv.getFloat32(o, true); o += 4;
   m.a.p = dv.getFloat32(o, true); o += 4;
   m.a.y = dv.getFloat32(o, true); o += 4;
+  m.a.mh = dv.getFloat32(o, true); o += 4;
 
   m.g.it = dv.getUint32(o, true); o += 4;
   m.g.fx = dv.getUint8(o); o += 1;
@@ -283,7 +293,7 @@ function setFusionUiValues(gain, acc, mag, rec) {
   document.getElementById("gainSlider").value = gain;
   document.getElementById("accelRejSlider").value = acc;
   document.getElementById("magRejSlider").value = mag;
-  document.getElementById("recoverySlider").value = recoverySamplesToSeconds(rec).toFixed(1);
+  document.getElementById("recoverySlider").value = recoverySamplesToSeconds(rec).toFixed(2);
   document.getElementById("gainValue").textContent = fmt(gain, 2);
   document.getElementById("accelRejValue").textContent = `${fmt(acc, 0)} deg`;
   document.getElementById("magRejValue").textContent = `${fmt(mag, 0)} deg`;
@@ -532,10 +542,17 @@ function setFusionLight(el, on) {
   el.classList.toggle("off", !on);
 }
 
+function setFusionPriorityLight(el, orangeOn, redOn) {
+  if (!el) return;
+  const on = !!(orangeOn || redOn);
+  setFusionLight(el, on);
+  el.classList.toggle("orange", !!on && !redOn);
+  el.classList.toggle("red", !!redOn);
+}
+
 function renderFusionLights() {
-  setFusionLight(fusionAngularLightEl, fusionFlagsLast.angularRecovery);
-  setFusionLight(fusionAccelLightEl, fusionFlagsLast.accelerationRecovery);
-  setFusionLight(fusionMagLightEl, fusionFlagsLast.magneticRecovery);
+  setFusionPriorityLight(fusionAngularLightEl, fusionFlagsLast.accelerationError, fusionFlagsLast.accelerometerIgnored);
+  setFusionPriorityLight(fusionMagLightEl, fusionFlagsLast.magneticError, fusionFlagsLast.magnetometerIgnored);
 }
 
 function applyLogStatus(logStatus = null) {
@@ -753,6 +770,7 @@ function renderAttStale() {
 `roll: - deg
 pitch: - deg
 yaw: - deg
+mag.heading: - deg
 
 fusion.gain: -
 fusion.accelRej: - deg
@@ -762,7 +780,11 @@ fusion.recovery: - s / - smp`;
     initialising: false,
     angularRecovery: false,
     accelerationRecovery: false,
-    magneticRecovery: false
+    magneticRecovery: false,
+    accelerationError: false,
+    accelerometerIgnored: false,
+    magneticError: false,
+    magnetometerIgnored: false
   };
   renderFusionLights();
 }
@@ -826,6 +848,21 @@ function pfdText(ctx, text, x, y, size, color, align = "center") {
   ctx.fillText(text, x, y);
 }
 
+function drawRecoveryLed(ctx, cx, cy, radius, color) {
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = radius * 3;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "#fed7aa";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+}
+
 function pfdPad(value, width) {
   const n = Math.max(0, Math.abs(Math.round(Number(value) || 0)));
   return String(n).padStart(width, "0");
@@ -864,6 +901,11 @@ function appendCourseDigit(digit) {
   courseEditBuffer = `${courseEditBuffer}${digit}`.replace(/\D/g, "").slice(-3);
 }
 
+function markCourseKeyPressed(key) {
+  coursePressedKey = String(key || "");
+  coursePressedUntilMs = Date.now() + 220;
+}
+
 function commitCourseEdit() {
   if (!courseEditBuffer) return;
   setCourseSetDeg(Number(courseEditBuffer));
@@ -900,6 +942,9 @@ function renderPfdPanel() {
   const rollDeg = Number(att.r ?? 0);
   const pitchDeg = Number(att.p ?? 0);
   const yawDeg = Number(att.y ?? 0);
+  // Flight data is now aircraft-standard body axes. For the fixed aircraft
+  // symbol, the horizon rotates opposite the aircraft bank.
+  const displayRollDeg = -rollDeg;
   const headingDeg = ((yawDeg % 360) + 360) % 360;
   const altM = Number(baro.a ?? gps.hm ?? 0);
   const vsiMps = Number(baro.v ?? 0);
@@ -921,7 +966,7 @@ function renderPfdPanel() {
   ctx.arc(horizonCx, horizonCy, horizonR, 0, Math.PI * 2);
   ctx.clip();
   ctx.translate(horizonCx, horizonCy + pitchDeg * pitchPxPerDeg);
-  ctx.rotate((rollDeg * Math.PI) / 180);
+  ctx.rotate((displayRollDeg * Math.PI) / 180);
 
   ctx.fillStyle = "#4da7e8";
   ctx.fillRect(-w, -h * 1.2, w * 2, h * 1.2);
@@ -1117,6 +1162,15 @@ function renderPfdPanel() {
   ctx.lineWidth = 2;
   ctx.stroke();
   pfdText(ctx, pfdPad(headingDeg, 3), horizonCx, hdgBoxY + 14, 20, "#f8fafc");
+  if (fusionFlagsLast.accelerometerIgnored || fusionFlagsLast.accelerationError) {
+    drawRecoveryLed(
+      ctx,
+      w - 18,
+      16,
+      5,
+      fusionFlagsLast.accelerometerIgnored ? "#ef4444" : "#eab308"
+    );
+  }
 
   const hsiAreaX = 12;
   const hsiAreaY = tapeBottom + 18;
@@ -1130,6 +1184,15 @@ function renderPfdPanel() {
   ctx.lineWidth = 2;
   drawRoundedRect(ctx, hsiAreaX, hsiAreaY, hsiAreaW, hsiAreaH, 16);
   ctx.stroke();
+  if (fusionFlagsLast.magnetometerIgnored || fusionFlagsLast.magneticError) {
+    drawRecoveryLed(
+      ctx,
+      hsiAreaX + hsiAreaW - 18,
+      hsiAreaY + 16,
+      5,
+      fusionFlagsLast.magnetometerIgnored ? "#ef4444" : "#eab308"
+    );
+  }
   ctx.strokeStyle = "#475569";
   ctx.lineWidth = 4;
   ctx.beginPath();
@@ -1227,10 +1290,11 @@ function renderPfdPanel() {
       { id: "course_ent", x: crsBoxX + (btnW + btnGap) * 2, y: btnY + (btnH + btnGap) * 3, label: "OK" }
     ];
     buttons.forEach((btn) => {
+      const pressed = coursePressedKey === btn.label && Date.now() < coursePressedUntilMs;
       drawRoundedRect(ctx, btn.x, btn.y, btnW, btnH, 8);
-      ctx.fillStyle = "#08111d";
+      ctx.fillStyle = pressed ? "#1d4ed8" : "#08111d";
       ctx.fill();
-      ctx.strokeStyle = "#475569";
+      ctx.strokeStyle = pressed ? "#93c5fd" : "#475569";
       ctx.stroke();
       pfdText(ctx, btn.label, btn.x + (btnW * 0.5), btn.y + 18, 16, "#f8fafc");
       setPfdTapTarget(btn.id, btn.x, btn.y, btnW, btnH);
@@ -1353,6 +1417,7 @@ function renderAttPanel() {
 `roll: ${fmt(att.r, 2)} deg
 pitch: ${fmt(att.p, 2)} deg
 yaw: ${fmt(att.y, 2)} deg
+mag.heading: ${fmt(att.mh, 2)} deg
 
 fusion.gain: ${fmt(fusion.gain, 3)}
 fusion.accelRej: ${fmt(fusion.accelerationRejection, 1)} deg
@@ -1622,7 +1687,11 @@ function handleBinaryStateMessage(buf) {
     initialising: (stateFlags & STATE_FLAG_FUSION_INITIALISING) !== 0,
     angularRecovery: (stateFlags & STATE_FLAG_FUSION_ANGULAR_RECOVERY) !== 0,
     accelerationRecovery: (stateFlags & STATE_FLAG_FUSION_ACCELERATION_RECOVERY) !== 0,
-    magneticRecovery: (stateFlags & STATE_FLAG_FUSION_MAGNETIC_RECOVERY) !== 0
+    magneticRecovery: (stateFlags & STATE_FLAG_FUSION_MAGNETIC_RECOVERY) !== 0,
+    accelerationError: (stateFlags & STATE_FLAG_FUSION_ACCELERATION_ERROR) !== 0,
+    accelerometerIgnored: (stateFlags & STATE_FLAG_FUSION_ACCELEROMETER_IGNORED) !== 0,
+    magneticError: (stateFlags & STATE_FLAG_FUSION_MAGNETIC_ERROR) !== 0,
+    magnetometerIgnored: (stateFlags & STATE_FLAG_FUSION_MAGNETOMETER_IGNORED) !== 0
   };
   const fusionMatchesDraft = fusionDraft &&
     near(fusionLast.gain, fusionDraft.gain, 0.005) &&
@@ -1988,9 +2057,18 @@ if (pfdCanvas) {
     }
     if (hit.id.startsWith("course_")) {
       const key = hit.id.slice(7);
-      if (/^[0-9]$/.test(key)) appendCourseDigit(key);
-      if (key === "clr") courseEditBuffer = "";
-      if (key === "ent") commitCourseEdit();
+      if (/^[0-9]$/.test(key)) {
+        appendCourseDigit(key);
+        markCourseKeyPressed(key);
+      }
+      if (key === "clr") {
+        courseEditBuffer = "";
+        markCourseKeyPressed("C");
+      }
+      if (key === "ent") {
+        commitCourseEdit();
+        markCourseKeyPressed("OK");
+      }
       uiDirty = true;
       renderNow();
     }

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "log_store.h"
+#include "sd_capture_test.h"
 
 namespace uart_telem {
 namespace {
@@ -266,6 +267,7 @@ void handlePacket(const uint8_t* pkt, size_t len) {
     }
     portEXIT_CRITICAL(&g_mux);
     log_store::enqueueState(h.seq, h.t_us, tmp);
+    sd_capture_test::enqueueState(h.seq, h.t_us, tmp);
     return;
   }
 
