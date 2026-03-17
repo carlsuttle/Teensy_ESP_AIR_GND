@@ -6,12 +6,13 @@
 namespace sd_card_test {
 namespace {
 
-// Temporary bench-test wiring. These pins should match the current physical
-// hookup, not the XIAO's default SPI silk labels.
-constexpr uint8_t kSdCsPin = 10;
-constexpr uint8_t kSdSckPin = 43;
-constexpr uint8_t kSdMisoPin = 44;
-constexpr uint8_t kSdMosiPin = 9;
+// Temporary bench-test wiring.
+constexpr uint8_t kSdCsPin = D7;
+constexpr uint8_t kSdSckPin = D8;
+constexpr uint8_t kSdMisoPin = D9;
+constexpr uint8_t kSdMosiPin = D10;
+
+
 
 constexpr uint32_t kInitFrequenciesHz[] = {
     400000UL,
