@@ -6,14 +6,11 @@
 namespace sd_card_test {
 namespace {
 
-// XIAO ESP32S3 SPI wiring:
-//   CS   -> D6  -> GPIO43
-//   SCK  -> D8  -> GPIO7
-//   MISO -> D9  -> GPIO8
-//   MOSI -> D10 -> GPIO9
-constexpr uint8_t kSdCsPin = 43;
-constexpr uint8_t kSdSckPin = 7;
-constexpr uint8_t kSdMisoPin = 8;
+// Temporary bench-test wiring. These pins should match the current physical
+// hookup, not the XIAO's default SPI silk labels.
+constexpr uint8_t kSdCsPin = 10;
+constexpr uint8_t kSdSckPin = 43;
+constexpr uint8_t kSdMisoPin = 44;
 constexpr uint8_t kSdMosiPin = 9;
 
 constexpr uint32_t kInitFrequenciesHz[] = {
@@ -52,15 +49,6 @@ void fillPinStatus(Status& status) {
   status.mosi_pin = kSdMosiPin;
 }
 
-void prepareSpiPinsForSdInit() {
-  // Bias lines to known idle states before handing them to the SPI peripheral.
-  pinMode(kSdCsPin, OUTPUT);
-  digitalWrite(kSdCsPin, HIGH);
-  pinMode(kSdSckPin, INPUT_PULLUP);
-  pinMode(kSdMisoPin, INPUT_PULLUP);
-  pinMode(kSdMosiPin, INPUT_PULLUP);
-}
-
 bool beginAtFrequency(Status& status, uint32_t hz) {
   fillPinStatus(status);
   status.init_hz = hz;
@@ -73,7 +61,6 @@ bool beginAtFrequency(Status& status, uint32_t hz) {
 
   SD.end();
   SPI.end();
-  prepareSpiPinsForSdInit();
   SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
   status.spi_configured = true;
 
