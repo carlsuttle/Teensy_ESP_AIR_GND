@@ -211,6 +211,13 @@ The remaining engineering risk lies in **system interaction (UART + radio + logg
 
 Future validation should therefore occur **inside the full AIR application**, not through further synthetic storage benchmarks.
 
+Note:  Pins that worked
+// ---------- SPI pins ----------
+int8_t sck  = D8;
+int8_t miso = D10;
+int8_t mosi = D9;
+int8_t cs   = D7;
+
 ---
 
 End of document.
