@@ -49,16 +49,36 @@ Current defaults:
 
 ## Logging
 
-The AIR logging pipeline still exists, but file logging is currently disabled in firmware.
+The AIR logger is now integrated with a shared microSD backend.
 
 Current state:
-- `log_store` code remains in place
-- recorder state is exposed to GND/web UI
+- `log_store` writes binary `.tlog` sessions to microSD instead of `LittleFS`
+- the AIR logger, `sdprobe`, `sdwrite`, and `sdcap1m` all use the same shared SD backend
+- recorder state is exposed to GND through the radio link with real:
+  - active/inactive state
+  - backend/media presence
+  - session id
+  - bytes written
+  - free bytes
+- file logging is still disabled by default at boot because there is still no finished quota/rotation/download workflow
 - `kEnableAirFileLogging` is currently `false`
-- start/stop/status commands already flow through the radio link for later SD-card integration
 
-Reason:
-- there is still no finished quota/rotation/download workflow for onboard log files
+Shared SD backend details:
+- SPI pins use raw GPIO numbers:
+  - `CS=2`
+  - `SCK=7`
+  - `MISO=8`
+  - `MOSI=9`
+- SD init tries `40 MHz` first
+- SD init falls back to `26 MHz` if `40 MHz` does not mount
+
+AIR logger details:
+- one file per session under `/logs`
+- block-based writer instead of per-record filesystem writes
+- current writer block size: `10000` bytes
+- current block count: `4`
+- writer task is pinned to core `0`
+- start/stop/status commands work both from GND and from the AIR USB console
 
 ## Serial Console
 
@@ -68,6 +88,15 @@ Current AIR commands:
 - `help`
 - `getfusion`
 - `kickteensy`
+- `sdprobe`
+- `sdwrite`
+- `base1m`
+- `sdcap1m`
+- `sdcapstop`
+- `sdcapstat`
+- `logstart`
+- `logstop`
+- `logstat`
 - `resendrate`
 - `tx1`
 - `linkclear`
@@ -84,6 +113,21 @@ Useful boot/status lines:
 - `AIR READY radio channel=6`
 - `AIR READY teensy_link ...`
 - `AIR READY gnd_link peer=...`
+- `AIR INFO recorder=off`
+
+Useful SD bench lines:
+- `SDPROBE ...`
+- `SDCAP ...`
+- `AIRLOG ...`
+
+Useful SD bench flow:
+1. `sdprobe`
+2. `sdwrite`
+3. `logstart`
+4. let telemetry run
+5. `logstat`
+6. `logstop`
+7. `logstat`
 
 ## Build And Upload
 

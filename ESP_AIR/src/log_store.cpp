@@ -1,29 +1,27 @@
 #include "log_store.h"
 
 #include <Arduino.h>
-#include <LittleFS.h>
+#include <SD.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
 
+#include "sd_backend.h"
+
 namespace log_store {
 namespace {
 
-static constexpr char LOG_DIR[] = "/logs";
-static constexpr char kBinaryExt[] = ".tlog";
-static constexpr char kCsvHeader[] =
-    "seq,t_us,roll_deg,pitch_deg,yaw_deg,"
-    "iTOW_ms,fix,sats,lat_deg,lon_deg,hMSL_m,gSpeed_mps,headMot_deg,hAcc_m,sAcc_mps,"
-    "gps_parse_errors,mirror_tx_ok,mirror_drop_count,last_gps_ms,last_imu_ms,last_baro_ms,"
-    "baro_temp_c,baro_press_hpa,baro_alt_m,baro_vsi_mps,"
-    "fusion_gain,fusion_accel_rej_deg,fusion_mag_rej_deg,fusion_recovery_period,flags\n";
-static constexpr size_t kCsvLineMaxBytes = 512;
-static constexpr size_t kQueueDepth = 256;
-static constexpr size_t kWriteBufferBytes = 8192;
-static constexpr uint32_t kBatchWriteMs = 500U;
-static constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
-static constexpr uint16_t kLogVersion = 1U;
+constexpr char LOG_DIR[] = "/logs";
+constexpr char kBinaryExt[] = ".tlog";
+constexpr size_t kBlockBytes = 10000U;
+constexpr size_t kBlockCount = 4U;
+constexpr uint32_t kMaxReportableFreeBytes = telem::kLogBytesUnknown - 1U;
+constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
+constexpr uint16_t kLogVersion = 1U;
+constexpr uint8_t kWriteRetryCount = 8U;
+constexpr uint32_t kWriteRetryDelayMs = 2U;
 
 #pragma pack(push, 1)
 struct BinaryLogRecordV1 {
@@ -36,246 +34,261 @@ struct BinaryLogRecordV1 {
 };
 #pragma pack(pop)
 
+struct Block {
+  uint8_t data[kBlockBytes];
+  size_t used_bytes = 0;
+  uint32_t record_count = 0;
+};
+
+struct LockGuard {
+  SemaphoreHandle_t handle = nullptr;
+  bool locked = false;
+
+  explicit LockGuard(SemaphoreHandle_t h) : handle(h) {
+    if (handle) locked = xSemaphoreTake(handle, portMAX_DELAY) == pdTRUE;
+  }
+
+  ~LockGuard() {
+    if (locked && handle) xSemaphoreGive(handle);
+  }
+};
+
 AppConfig g_cfg = {};
 File g_file;
 String g_current_name;
 TaskHandle_t g_writer_task = nullptr;
-SemaphoreHandle_t g_fs_mutex = nullptr;
+SemaphoreHandle_t g_state_mutex = nullptr;
+QueueHandle_t g_free_block_queue = nullptr;
+QueueHandle_t g_full_block_queue = nullptr;
 Stats g_stats = {};
-bool g_fs_ready = false;
-uint32_t g_last_log_ms = 0;
-uint32_t g_last_log_t_us = 0;
-uint32_t g_last_seq = 0;
-uint32_t g_last_write_ms = 0;
-uint8_t g_write_buffer[kWriteBufferBytes];
-size_t g_write_used = 0;
-BinaryLogRecordV1 g_record_ring[kQueueDepth] = {};
-volatile uint16_t g_ring_head = 0;
-volatile uint16_t g_ring_tail = 0;
-portMUX_TYPE g_log_mux = portMUX_INITIALIZER_UNLOCKED;
+RecorderStatus g_recorder = {};
+Block g_blocks[kBlockCount] = {};
+int g_active_block_index = -1;
+bool g_close_pending = false;
+uint32_t g_last_seq = 0U;
+uint32_t g_last_status_refresh_ms = 0U;
+portMUX_TYPE g_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
-uint32_t ringCountUnsafe() {
-  return (uint16_t)(g_ring_head - g_ring_tail);
+void recordDuration(uint32_t elapsed_ms, uint32_t& last_ms, uint32_t& max_ms) {
+  last_ms = elapsed_ms;
+  if (elapsed_ms > max_ms) max_ms = elapsed_ms;
 }
 
-bool ringPush(const BinaryLogRecordV1& rec, uint32_t& q_now) {
-  bool ok = false;
-  portENTER_CRITICAL(&g_log_mux);
-  const uint32_t q = ringCountUnsafe();
-  if (q < kQueueDepth) {
-    g_record_ring[g_ring_head % kQueueDepth] = rec;
-    g_ring_head = (uint16_t)(g_ring_head + 1U);
-    q_now = ringCountUnsafe();
-    ok = true;
+void updateQueueCur() {
+  const uint32_t q = g_full_block_queue ? (uint32_t)uxQueueMessagesWaiting(g_full_block_queue) : 0U;
+  portENTER_CRITICAL(&g_stats_mux);
+  g_stats.queue_cur = q;
+  if (q > g_stats.queue_max) g_stats.queue_max = q;
+  portEXIT_CRITICAL(&g_stats_mux);
+}
+
+void noteFreeDepth(UBaseType_t free_depth) {
+  portENTER_CRITICAL(&g_stats_mux);
+  if (g_stats.min_free_blocks_seen == 0U || free_depth < g_stats.min_free_blocks_seen) {
+    g_stats.min_free_blocks_seen = (uint32_t)free_depth;
   }
-  portEXIT_CRITICAL(&g_log_mux);
-  return ok;
+  portEXIT_CRITICAL(&g_stats_mux);
 }
 
-bool ringPop(BinaryLogRecordV1& rec, uint32_t& q_now) {
-  bool ok = false;
-  portENTER_CRITICAL(&g_log_mux);
-  if (g_ring_tail != g_ring_head) {
-    rec = g_record_ring[g_ring_tail % kQueueDepth];
-    g_ring_tail = (uint16_t)(g_ring_tail + 1U);
-    q_now = ringCountUnsafe();
-    ok = true;
+void refreshBackendStatus(bool force = false) {
+  const uint32_t now = millis();
+  if (!force && (uint32_t)(now - g_last_status_refresh_ms) < 1000U) return;
+  g_last_status_refresh_ms = now;
+
+  sd_backend::Status backend = {};
+  bool ready = false;
+  if (g_recorder.feature_enabled) {
+    if (sd_backend::mounted()) {
+      ready = sd_backend::refreshStatus(backend);
+    } else {
+      ready = sd_backend::begin(&backend);
+    }
+  }
+
+  g_recorder.backend_ready = ready;
+  g_recorder.media_present = ready && backend.card_type != CARD_NONE;
+  g_recorder.init_hz = backend.init_hz;
+  const uint64_t total_bytes = backend.total_bytes ? backend.total_bytes : backend.card_size_bytes;
+  if (ready && total_bytes >= backend.used_bytes) {
+    const uint64_t free_bytes = total_bytes - backend.used_bytes;
+    g_recorder.free_bytes =
+        (free_bytes > (uint64_t)kMaxReportableFreeBytes) ? kMaxReportableFreeBytes : (uint32_t)free_bytes;
   } else {
-    q_now = 0;
+    g_recorder.free_bytes = telem::kLogBytesUnknown;
   }
-  portEXIT_CRITICAL(&g_log_mux);
-  return ok;
 }
 
-struct FsLockGuard {
-  bool locked = false;
-  FsLockGuard() {
-    if (g_fs_mutex) {
-      locked = xSemaphoreTake(g_fs_mutex, portMAX_DELAY) == pdTRUE;
-    }
-  }
-  ~FsLockGuard() {
-    if (locked) {
-      xSemaphoreGive(g_fs_mutex);
-    }
-  }
-};
-
-void recordDuration(uint32_t elapsedMs, uint32_t& lastMs, uint32_t& maxMs) {
-  lastMs = elapsedMs;
-  if (elapsedMs > maxMs) maxMs = elapsedMs;
+String makeLogName(uint32_t session_id) {
+  return String(LOG_DIR) + "/air_" + String(session_id ? session_id : 1U) + "_" + String(millis()) + kBinaryExt;
 }
 
-String makeLogName() {
-  const uint32_t t = millis();
-  String name = String(LOG_DIR) + "/log_" + String(t) + kBinaryExt;
-  return name;
+void resetBlockQueues() {
+  g_active_block_index = -1;
+  g_close_pending = false;
+  if (g_free_block_queue) xQueueReset(g_free_block_queue);
+  if (g_full_block_queue) xQueueReset(g_full_block_queue);
+  for (int i = 0; i < (int)kBlockCount; ++i) {
+    g_blocks[i].used_bytes = 0U;
+    g_blocks[i].record_count = 0U;
+    if (g_free_block_queue) {
+      (void)xQueueSend(g_free_block_queue, &i, 0);
+    }
+  }
+  g_stats.min_free_blocks_seen = kBlockCount;
+  updateQueueCur();
+}
+
+bool openCurrentLog() {
+  if (g_file) return true;
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
+
+  const uint32_t t0 = millis();
+  if (!SD.exists(LOG_DIR)) (void)SD.mkdir(LOG_DIR);
+  g_current_name = makeLogName(g_recorder.session_id);
+  g_file = SD.open(g_current_name, FILE_WRITE);
+  portENTER_CRITICAL(&g_stats_mux);
+  recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
+  portEXIT_CRITICAL(&g_stats_mux);
+  refreshBackendStatus(true);
+  return (bool)g_file;
 }
 
 void closeCurrentLog() {
-  if (g_write_used && g_file) {
-    const uint32_t t0 = millis();
-    const size_t written = g_file.write(g_write_buffer, g_write_used);
-    recordDuration(millis() - t0, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
-    g_stats.bytes_written += (uint32_t)written;
-    g_write_used = (written == g_write_used) ? 0U : g_write_used;
-  }
-  if (g_file) {
-    const uint32_t t0 = millis();
-    g_file.close();
-    recordDuration(millis() - t0, g_stats.fs_close_last_ms, g_stats.fs_close_max_ms);
-  }
+  if (!g_file) return;
+  const uint32_t t0 = millis();
+  g_file.flush();
+  g_file.close();
+  portENTER_CRITICAL(&g_stats_mux);
+  recordDuration(millis() - t0, g_stats.fs_close_last_ms, g_stats.fs_close_max_ms);
+  portEXIT_CRITICAL(&g_stats_mux);
   g_current_name = "";
+  refreshBackendStatus(true);
 }
 
-void ensureFileOpen() {
-  if (g_file) return;
-  const uint32_t t0 = millis();
-  if (!LittleFS.exists(LOG_DIR)) LittleFS.mkdir(LOG_DIR);
-  g_current_name = makeLogName();
-  g_file = LittleFS.open(g_current_name, FILE_APPEND);
-  recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
-}
-
-bool flushBufferedWrites() {
-  if (!g_write_used) return true;
-  ensureFileOpen();
-  if (!g_file) return false;
-  const uint32_t t0 = millis();
-  const size_t written = g_file.write(g_write_buffer, g_write_used);
-  recordDuration(millis() - t0, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
-  if (written < g_write_used) {
-    const size_t remain = g_write_used - written;
-    memmove(g_write_buffer, g_write_buffer + written, remain);
-    g_write_used = remain;
-  } else {
-    g_write_used = 0;
+bool acquireFreeBlock(int& block_index) {
+  if (!g_free_block_queue) return false;
+  if (xQueueReceive(g_free_block_queue, &block_index, 0) != pdTRUE) {
+    portENTER_CRITICAL(&g_stats_mux);
+    g_stats.no_free_block_events++;
+    portEXIT_CRITICAL(&g_stats_mux);
+    return false;
   }
-  g_stats.bytes_written += (uint32_t)written;
-  return written > 0;
-}
-
-bool appendBufferedBytes(const uint8_t* data, size_t len) {
-  if (!data || !len) return true;
-  if (len > sizeof(g_write_buffer)) {
-    if (!flushBufferedWrites()) return false;
-    ensureFileOpen();
-    if (!g_file) return false;
-    const uint32_t t0 = millis();
-    const size_t written = g_file.write(data, len);
-    recordDuration(millis() - t0, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
-    g_stats.bytes_written += (uint32_t)written;
-    return written == len;
-  }
-  if ((g_write_used + len) > sizeof(g_write_buffer)) {
-    if (!flushBufferedWrites()) return false;
-  }
-  memcpy(g_write_buffer + g_write_used, data, len);
-  g_write_used += len;
+  g_blocks[block_index].used_bytes = 0U;
+  g_blocks[block_index].record_count = 0U;
+  noteFreeDepth(uxQueueMessagesWaiting(g_free_block_queue));
   return true;
 }
 
-size_t formatCsvLine(const BinaryLogRecordV1& rec, char* out, size_t outSize) {
-  if (!out || outSize == 0) return 0;
-  const int n = snprintf(
-      out, outSize,
-      "%lu,%lu,%.3f,%.3f,%.3f,"
-      "%lu,%u,%u,%.7f,%.7f,%.3f,%.3f,%.5f,%.3f,%.3f,"
-      "%lu,%lu,%lu,%lu,%lu,%lu,"
-      "%.3f,%.3f,%.3f,%.3f,"
-      "%.3f,%.3f,%.3f,%u,%u\n",
-      (unsigned long)rec.seq,
-      (unsigned long)rec.t_us,
-      (double)rec.state.roll_deg,
-      (double)rec.state.pitch_deg,
-      (double)rec.state.yaw_deg,
-      (unsigned long)rec.state.iTOW_ms,
-      (unsigned)rec.state.fixType,
-      (unsigned)rec.state.numSV,
-      (double)rec.state.lat_1e7 * 1e-7,
-      (double)rec.state.lon_1e7 * 1e-7,
-      (double)rec.state.hMSL_mm / 1000.0,
-      (double)rec.state.gSpeed_mms / 1000.0,
-      (double)rec.state.headMot_1e5deg / 100000.0,
-      (double)rec.state.hAcc_mm / 1000.0,
-      (double)rec.state.sAcc_mms / 1000.0,
-      (unsigned long)rec.state.gps_parse_errors,
-      (unsigned long)rec.state.mirror_tx_ok,
-      (unsigned long)rec.state.mirror_drop_count,
-      (unsigned long)rec.state.last_gps_ms,
-      (unsigned long)rec.state.last_imu_ms,
-      (unsigned long)rec.state.last_baro_ms,
-      (double)rec.state.baro_temp_c,
-      (double)rec.state.baro_press_hpa,
-      (double)rec.state.baro_alt_m,
-      (double)rec.state.baro_vsi_mps,
-      (double)rec.state.fusion_gain,
-      (double)rec.state.fusion_accel_rej,
-      (double)rec.state.fusion_mag_rej,
-      (unsigned)rec.state.fusion_recovery_period,
-      (unsigned)rec.state.flags);
-  if (n <= 0 || (size_t)n >= outSize) return 0;
-  return (size_t)n;
+void releaseBlock(int block_index) {
+  if (block_index < 0 || block_index >= (int)kBlockCount) return;
+  g_blocks[block_index].used_bytes = 0U;
+  g_blocks[block_index].record_count = 0U;
+  if (g_free_block_queue) {
+    (void)xQueueSend(g_free_block_queue, &block_index, 0);
+    noteFreeDepth(uxQueueMessagesWaiting(g_free_block_queue));
+  }
+}
+
+bool queueBlockForWrite(int block_index) {
+  if (block_index < 0 || block_index >= (int)kBlockCount || !g_full_block_queue) return false;
+  if (xQueueSend(g_full_block_queue, &block_index, 0) != pdTRUE) {
+    portENTER_CRITICAL(&g_stats_mux);
+    g_stats.blocks_dropped++;
+    g_stats.dropped += g_blocks[block_index].record_count;
+    portEXIT_CRITICAL(&g_stats_mux);
+    releaseBlock(block_index);
+    return false;
+  }
+  updateQueueCur();
+  if (g_writer_task) xTaskNotifyGive(g_writer_task);
+  return true;
+}
+
+bool writeBlock(Block& block) {
+  if (!block.used_bytes) return true;
+  if (!openCurrentLog()) return false;
+
+  const uint32_t t0 = millis();
+  size_t total_written = 0U;
+  while (total_written < block.used_bytes) {
+    size_t written = 0U;
+    for (uint8_t attempt = 0U; attempt < kWriteRetryCount; ++attempt) {
+      written = g_file.write(block.data + total_written, block.used_bytes - total_written);
+      if (written > 0U) break;
+      delay(kWriteRetryDelayMs);
+    }
+    if (written == 0U) {
+      portENTER_CRITICAL(&g_stats_mux);
+      recordDuration(millis() - t0, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
+      portEXIT_CRITICAL(&g_stats_mux);
+      return false;
+    }
+    total_written += written;
+  }
+
+  const uint32_t elapsed_ms = millis() - t0;
+  portENTER_CRITICAL(&g_stats_mux);
+  g_stats.bytes_written += (uint32_t)block.used_bytes;
+  g_stats.records_written += block.record_count;
+  g_stats.blocks_written++;
+  g_stats.flushes++;
+  recordDuration(elapsed_ms, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
+  if (block.used_bytes > g_stats.max_write_bytes) g_stats.max_write_bytes = (uint32_t)block.used_bytes;
+  portEXIT_CRITICAL(&g_stats_mux);
+
+  g_recorder.bytes_written = g_stats.bytes_written;
+  block.used_bytes = 0U;
+  block.record_count = 0U;
+  refreshBackendStatus(true);
+  return true;
 }
 
 void writerTask(void* param) {
   (void)param;
-  BinaryLogRecordV1 record = {};
   for (;;) {
     (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
-    uint32_t q_now = 0;
-    bool gotRecord = ringPop(record, q_now);
-    while (gotRecord) {
-      g_last_log_ms = millis();
-      g_last_log_t_us = record.t_us;
-      FsLockGuard lock;
-      if (appendBufferedBytes(reinterpret_cast<const uint8_t*>(&record), sizeof(record))) {
-        g_stats.records_written++;
+    int block_index = -1;
+    while (g_full_block_queue && xQueueReceive(g_full_block_queue, &block_index, 0) == pdTRUE) {
+      if (block_index < 0 || block_index >= (int)kBlockCount) {
+        g_recorder.active = false;
+        g_close_pending = true;
+        continue;
       }
-      gotRecord = ringPop(record, q_now);
+      if (!writeBlock(g_blocks[block_index])) {
+        g_recorder.active = false;
+        g_close_pending = true;
+      }
+      releaseBlock(block_index);
+      updateQueueCur();
     }
-    g_stats.queue_cur = q_now;
 
-    const uint32_t now = millis();
-    {
-      FsLockGuard lock;
-      const bool batchDue = g_write_used && ((uint32_t)(now - g_last_write_ms) >= kBatchWriteMs);
-      const bool bufferNearlyFull = g_write_used >= (sizeof(g_write_buffer) * 3U / 4U);
-      if (batchDue || bufferNearlyFull) {
-        (void)flushBufferedWrites();
-        g_last_write_ms = now;
-      }
+    if (g_close_pending && (!g_full_block_queue || uxQueueMessagesWaiting(g_full_block_queue) == 0U)) {
+      closeCurrentLog();
+      g_close_pending = false;
     }
   }
 }
 
 }  // namespace
 
-void begin(const AppConfig& cfg, bool fs_ready) {
+void begin(const AppConfig& cfg, bool enabled) {
   g_cfg = cfg;
-  g_fs_ready = fs_ready;
   g_stats = {};
-  g_last_log_ms = 0;
-  g_last_log_t_us = 0;
-  g_last_seq = 0;
-  g_last_write_ms = 0;
-  g_write_used = 0;
-  if (!g_fs_mutex) {
-    g_fs_mutex = xSemaphoreCreateMutex();
-  }
-  {
-    FsLockGuard lock;
-    if (!LittleFS.exists(LOG_DIR)) LittleFS.mkdir(LOG_DIR);
-  }
-  portENTER_CRITICAL(&g_log_mux);
-  g_ring_head = 0;
-  g_ring_tail = 0;
-  portEXIT_CRITICAL(&g_log_mux);
-  if (!g_fs_ready) {
-    return;
-  }
+  g_recorder = {};
+  g_recorder.feature_enabled = enabled;
+  g_last_seq = 0U;
+  g_last_status_refresh_ms = 0U;
+
+  if (!g_state_mutex) g_state_mutex = xSemaphoreCreateMutex();
+  if (!g_free_block_queue) g_free_block_queue = xQueueCreate(kBlockCount, sizeof(int));
+  if (!g_full_block_queue) g_full_block_queue = xQueueCreate(kBlockCount, sizeof(int));
+  resetBlockQueues();
+  refreshBackendStatus(true);
+
   if (!g_writer_task) {
-    xTaskCreatePinnedToCore(writerTask, "log_writer", 4096, nullptr, 1, &g_writer_task, 1);
+    xTaskCreatePinnedToCore(writerTask, "log_writer", 6144, nullptr,
+                            sd_backend::kSdWriterPriority, &g_writer_task, sd_backend::kSdWriterCore);
   }
 }
 
@@ -283,8 +296,72 @@ void setConfig(const AppConfig& cfg) {
   g_cfg = cfg;
 }
 
+void setEnabled(bool enabled) {
+  if (!enabled) stopSession();
+  g_recorder.feature_enabled = enabled;
+  refreshBackendStatus(true);
+}
+
+bool startSession(uint32_t session_id) {
+  LockGuard lock(g_state_mutex);
+  if (!g_recorder.feature_enabled) {
+    refreshBackendStatus(true);
+    return false;
+  }
+  if (g_recorder.active) return true;
+
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
+
+  resetStats();
+  resetBlockQueues();
+  closeCurrentLog();
+  g_recorder.session_id = session_id;
+  g_recorder.bytes_written = 0U;
+  g_last_seq = 0U;
+  if (!openCurrentLog()) {
+    refreshBackendStatus(true);
+    return false;
+  }
+  g_recorder.active = true;
+  return true;
+}
+
+void stopSession() {
+  LockGuard lock(g_state_mutex);
+  if (!g_recorder.active && !g_file) return;
+
+  int final_block = -1;
+  if (g_active_block_index >= 0) {
+    if (g_blocks[g_active_block_index].used_bytes > 0U) {
+      final_block = g_active_block_index;
+    } else {
+      releaseBlock(g_active_block_index);
+    }
+    g_active_block_index = -1;
+  }
+
+  g_recorder.active = false;
+  g_close_pending = true;
+  if (final_block >= 0) {
+    if (!queueBlockForWrite(final_block)) {
+      if (g_writer_task) xTaskNotifyGive(g_writer_task);
+    }
+  } else {
+    if (g_writer_task) xTaskNotifyGive(g_writer_task);
+  }
+}
+
+void poll() {
+  refreshBackendStatus(false);
+  g_recorder.bytes_written = g_stats.bytes_written;
+  if (!g_recorder.active && g_close_pending && g_writer_task) {
+    xTaskNotifyGive(g_writer_task);
+  }
+}
+
 void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state) {
-  if (!g_fs_ready) return;
+  if (!g_recorder.feature_enabled || !g_recorder.active) return;
   if (seq == g_last_seq) return;
   g_last_seq = seq;
 
@@ -296,33 +373,75 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1
   record.t_us = t_us;
   record.state = state;
 
-  uint32_t q_now = 0;
-  if (ringPush(record, q_now)) {
-    g_stats.enqueued++;
-    g_stats.queue_cur = q_now;
-    if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
-    if (g_writer_task) {
-      xTaskNotifyGive(g_writer_task);
+  LockGuard lock(g_state_mutex);
+  if (!g_recorder.active) return;
+
+  if (g_active_block_index < 0) {
+    if (!acquireFreeBlock(g_active_block_index)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return;
     }
-  } else {
-    g_stats.dropped++;
   }
+
+  const size_t record_size = sizeof(record);
+  if ((g_blocks[g_active_block_index].used_bytes + record_size) > sizeof(g_blocks[g_active_block_index].data)) {
+    const int full_block_index = g_active_block_index;
+    g_active_block_index = -1;
+    if (!queueBlockForWrite(full_block_index)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return;
+    }
+    if (!acquireFreeBlock(g_active_block_index)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return;
+    }
+  }
+
+  Block& block = g_blocks[g_active_block_index];
+  memcpy(block.data + block.used_bytes, &record, sizeof(record));
+  block.used_bytes += sizeof(record);
+  block.record_count++;
+  portENTER_CRITICAL(&g_stats_mux);
+  g_stats.enqueued++;
+  portEXIT_CRITICAL(&g_stats_mux);
 }
 
-Stats stats() { return g_stats; }
+bool active() {
+  return g_recorder.active;
+}
+
+RecorderStatus recorderStatus() {
+  RecorderStatus status = g_recorder;
+  status.bytes_written = g_stats.bytes_written;
+  return status;
+}
+
+Stats stats() {
+  Stats copy = {};
+  portENTER_CRITICAL(&g_stats_mux);
+  copy = g_stats;
+  portEXIT_CRITICAL(&g_stats_mux);
+  return copy;
+}
 
 void resetStats() {
-  const uint32_t queueCur = g_stats.queue_cur;
+  portENTER_CRITICAL(&g_stats_mux);
   g_stats = {};
-  g_stats.queue_cur = queueCur;
+  g_stats.min_free_blocks_seen = kBlockCount;
+  portEXIT_CRITICAL(&g_stats_mux);
 }
 
 String filesJson() {
-  if (!g_fs_ready) return "[]";
+  if (!sd_backend::mounted()) return "[]";
   String out = "[";
   bool first = true;
-  FsLockGuard lock;
-  File dir = LittleFS.open(LOG_DIR);
+  File dir = SD.open(LOG_DIR);
   if (dir && dir.isDirectory()) {
     File f = dir.openNextFile();
     while (f) {
@@ -352,16 +471,18 @@ bool isSafeName(const String& name) {
 }
 
 bool deleteFileByName(const String& name) {
-  if (!g_fs_ready) return false;
+  if (!sd_backend::mounted()) return false;
   if (!isSafeName(name)) return false;
   const String full = String(LOG_DIR) + "/" + name;
-  FsLockGuard lock;
   if (g_current_name == full) {
     closeCurrentLog();
   }
   const uint32_t t0 = millis();
-  const bool ok = LittleFS.remove(full);
+  const bool ok = SD.remove(full);
+  portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_delete_last_ms, g_stats.fs_delete_max_ms);
+  portEXIT_CRITICAL(&g_stats_mux);
+  refreshBackendStatus(true);
   return ok;
 }
 

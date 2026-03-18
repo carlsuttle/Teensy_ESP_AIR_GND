@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <LittleFS.h>
 #include <SD.h>
 #include <WiFi.h>
 #include <ctype.h>
@@ -39,6 +38,7 @@ bool g_baseline_completed = false;
 uint32_t g_baseline_duration_ms = 0U;
 uint32_t g_baseline_started_ms = 0U;
 uint32_t g_baseline_stopped_ms = 0U;
+uint32_t g_console_log_session_id = 0U;
 uint32_t g_last_radio_tx_packets = 0U;
 uint32_t g_last_radio_rx_packets = 0U;
 uint32_t g_last_source_seq_seen = 0U;
@@ -65,6 +65,7 @@ void printSdCaptureImpactReport();
 void beginBaselineBenchmark(uint32_t duration_ms);
 void stopBaselineBenchmark();
 void printBaselineImpactReport();
+void printAirLogStatus();
 
 void stopGpioPulse() {
   if (!g_gpio_pulse_active) return;
@@ -155,6 +156,9 @@ void printConsoleHelp() {
   Serial.println("  sdcap1m       - capture every Teensy state to one SD binary file for 60 seconds");
   Serial.println("  sdcapstop     - stop active SD capture benchmark");
   Serial.println("  sdcapstat     - print SD capture benchmark status");
+  Serial.println("  logstart      - start real AIR SD logging session");
+  Serial.println("  logstop       - stop real AIR SD logging session");
+  Serial.println("  logstat       - print real AIR SD logging status");
   Serial.println("  setpin <gpio> - drive a GPIO high for 5 seconds, then return it low");
   Serial.println("  tx1           - send current state once to GND");
   Serial.println("  linkclear     - clear AIR radio-link state and stop ESP-NOW");
@@ -291,6 +295,38 @@ void printSdCaptureImpactReport() {
   sd_capture_test::printReport(Serial, cap);
 }
 
+void printAirLogStatus() {
+  const auto recorder = log_store::recorderStatus();
+  const auto stats = log_store::stats();
+  Serial.printf("AIRLOG enabled=%u active=%u backend_ready=%u media_present=%u session=%lu init_hz=%lu bytes=%lu free=%lu\r\n",
+                recorder.feature_enabled ? 1U : 0U,
+                recorder.active ? 1U : 0U,
+                recorder.backend_ready ? 1U : 0U,
+                recorder.media_present ? 1U : 0U,
+                (unsigned long)recorder.session_id,
+                (unsigned long)recorder.init_hz,
+                (unsigned long)recorder.bytes_written,
+                (unsigned long)recorder.free_bytes);
+  Serial.printf("AIRLOG queue_cur=%lu queue_max=%lu enqueued=%lu dropped=%lu written=%lu blocks_written=%lu blocks_dropped=%lu no_free=%lu min_free=%lu\r\n",
+                (unsigned long)stats.queue_cur,
+                (unsigned long)stats.queue_max,
+                (unsigned long)stats.enqueued,
+                (unsigned long)stats.dropped,
+                (unsigned long)stats.records_written,
+                (unsigned long)stats.blocks_written,
+                (unsigned long)stats.blocks_dropped,
+                (unsigned long)stats.no_free_block_events,
+                (unsigned long)stats.min_free_blocks_seen);
+  Serial.printf("AIRLOG fs_open_last_ms=%lu fs_open_max_ms=%lu fs_write_last_ms=%lu fs_write_max_ms=%lu fs_close_last_ms=%lu fs_close_max_ms=%lu max_write_bytes=%lu\r\n",
+                (unsigned long)stats.fs_open_last_ms,
+                (unsigned long)stats.fs_open_max_ms,
+                (unsigned long)stats.fs_write_last_ms,
+                (unsigned long)stats.fs_write_max_ms,
+                (unsigned long)stats.fs_close_last_ms,
+                (unsigned long)stats.fs_close_max_ms,
+                (unsigned long)stats.max_write_bytes);
+}
+
 void handleConsoleCommands() {
   while (Serial.available() > 0) {
     const char c = (char)Serial.read();
@@ -335,6 +371,21 @@ void handleConsoleCommands() {
       } else if (strcmp(g_console_line, "sdcapstat") == 0) {
         const auto cap = sd_capture_test::stats();
         sd_capture_test::printReport(Serial, cap);
+      } else if (strcmp(g_console_line, "logstart") == 0) {
+        g_console_log_session_id++;
+        if (g_console_log_session_id == 0U) g_console_log_session_id = 1U;
+        radio_link::setRecorderEnabled(true);
+        const bool ok = log_store::startSession(g_console_log_session_id);
+        Serial.printf("AIRLOG START ok=%u session=%lu\r\n",
+                      ok ? 1U : 0U,
+                      (unsigned long)g_console_log_session_id);
+        printAirLogStatus();
+      } else if (strcmp(g_console_line, "logstop") == 0) {
+        log_store::stopSession();
+        Serial.println("AIRLOG STOP requested=1");
+        printAirLogStatus();
+      } else if (strcmp(g_console_line, "logstat") == 0) {
+        printAirLogStatus();
       } else if (strncmp(g_console_line, "setpin ", 7) == 0) {
         unsigned pin = 0U;
         if (sscanf(g_console_line + 7, "%u", &pin) == 1 && pin <= 48U) {
@@ -599,17 +650,13 @@ void setup() {
 
   beginWifiStation();
 
-  const bool fs_ready = LittleFS.begin(true);
-  if (!fs_ready) {
-    Serial.println("LittleFS mount failed");
-  }
-  const bool air_file_logging_enabled = fs_ready && kEnableAirFileLogging;
+  const bool air_file_logging_enabled = kEnableAirFileLogging;
 
   uart_telem::begin(cfg);
   radio_link::begin(cfg);
   sd_capture_test::begin();
-  radio_link::setRecorderEnabled(air_file_logging_enabled);
   log_store::begin(cfg, air_file_logging_enabled);
+  radio_link::setRecorderEnabled(air_file_logging_enabled);
   Serial.printf("AIR INFO recorder=%s\n", air_file_logging_enabled ? "on" : "off");
   g_last_stream_rate_ui_hz = 0;
   g_last_stream_rate_log_hz = 0;
@@ -623,6 +670,7 @@ void loop() {
   handleConsoleCommands();
   serviceGpioPulse();
   sd_capture_test::poll();
+  log_store::poll();
   if (g_baseline_active &&
       (uint32_t)(millis() - g_baseline_started_ms) >= g_baseline_duration_ms) {
     stopBaselineBenchmark();

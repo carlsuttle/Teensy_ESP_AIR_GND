@@ -1,24 +1,15 @@
 #include "sd_capture_test.h"
 
 #include <SD.h>
-#include <SPI.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
 
+#include "sd_backend.h"
+
 namespace sd_capture_test {
 namespace {
-
-constexpr uint8_t kSdCsPin   = 2;
-constexpr uint8_t kSdSckPin  = 7;
-constexpr uint8_t kSdMisoPin = 8;
-constexpr uint8_t kSdMosiPin = 9;
-
-constexpr uint32_t kInitFrequenciesHz[] = {
-    4000000UL,
-    26000000UL,
-};
 
 constexpr char kBinaryExt[] = ".tlog";
 constexpr size_t kQueueDepth = 512U;
@@ -102,45 +93,28 @@ void recordDuration(uint32_t elapsed_ms, uint32_t& last_ms, uint32_t& max_ms) {
 }
 
 void fillPinStats() {
-  g_stats.cs_pin = kSdCsPin;
-  g_stats.sck_pin = kSdSckPin;
-  g_stats.miso_pin = kSdMisoPin;
-  g_stats.mosi_pin = kSdMosiPin;
-}
-
-void prepareSpiPinsForSdInit() {
-  // Bias lines to known idle states before handing them to the SPI peripheral.
-  pinMode(kSdCsPin, OUTPUT);
-  digitalWrite(kSdCsPin, HIGH);
-  pinMode(kSdSckPin, INPUT_PULLUP);
-  pinMode(kSdMisoPin, INPUT_PULLUP);
-  pinMode(kSdMosiPin, INPUT_PULLUP);
+  g_stats.cs_pin = sd_backend::csPin();
+  g_stats.sck_pin = sd_backend::sckPin();
+  g_stats.miso_pin = sd_backend::misoPin();
+  g_stats.mosi_pin = sd_backend::mosiPin();
 }
 
 void setError(const char* text) {
   strlcpy(g_stats.last_error, text ? text : "", sizeof(g_stats.last_error));
 }
 
-bool beginSdAtFrequency(uint32_t hz) {
-  SD.end();
-  SPI.end();
-  prepareSpiPinsForSdInit();
-  SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
-  if (!SD.begin(kSdCsPin, SPI, hz)) return false;
-  g_stats.init_hz = hz;
-  g_stats.backend_ready = true;
-  return true;
-}
-
 bool initSd() {
   g_stats.backend_ready = false;
   g_stats.init_hz = 0U;
   setError("");
-  for (uint32_t hz : kInitFrequenciesHz) {
-    if (beginSdAtFrequency(hz)) return true;
+  sd_backend::Status backend = {};
+  if (!sd_backend::begin(&backend)) {
+    setError("sd begin failed");
+    return false;
   }
-  setError("sd begin failed");
-  return false;
+  g_stats.init_hz = backend.init_hz;
+  g_stats.backend_ready = backend.begin_ok;
+  return true;
 }
 
 void resetQueue() {
@@ -273,7 +247,8 @@ void begin() {
   fillPinStats();
   if (!g_mutex) g_mutex = xSemaphoreCreateMutex();
   if (!g_writer_task) {
-    xTaskCreatePinnedToCore(writerTask, "sd_cap_writer", 4096, nullptr, 1, &g_writer_task, 1);
+    xTaskCreatePinnedToCore(writerTask, "sd_cap_writer", 4096, nullptr,
+                            sd_backend::kSdWriterPriority, &g_writer_task, sd_backend::kSdWriterCore);
   }
 }
 

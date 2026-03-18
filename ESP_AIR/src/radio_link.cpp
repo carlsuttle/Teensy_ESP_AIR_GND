@@ -6,6 +6,7 @@
 #include <esp_wifi.h>
 #include <string.h>
 
+#include "log_store.h"
 #include "types_shared.h"
 
 namespace radio_link {
@@ -435,10 +436,11 @@ bool sendHelloTo(const uint8_t* mac) {
 }
 
 uint8_t currentMetaFlags() {
+  const log_store::RecorderStatus recorder = log_store::recorderStatus();
   uint8_t flags = 0U;
   if (g_has_gnd_mac) flags |= telem::kLinkMetaFlagPeerKnown;
   if (g_espnow_ready) flags |= telem::kLinkMetaFlagRadioReady;
-  if (g_recorder_enabled) flags |= telem::kLinkMetaFlagRecorderOn;
+  if (recorder.active) flags |= telem::kLinkMetaFlagRecorderOn;
   if (g_rssi_valid) flags |= telem::kLinkMetaFlagRssiValid;
   return flags;
 }
@@ -453,21 +455,23 @@ telem::LinkMetaPayloadV1 currentLinkMeta() {
 }
 
 uint8_t currentLogFlags() {
+  const log_store::RecorderStatus recorder = log_store::recorderStatus();
   uint8_t flags = 0U;
-  if (g_recorder_enabled) flags |= telem::kLogStatusFlagActive;
+  if (recorder.active) flags |= telem::kLogStatusFlagActive;
   if (g_log_requested) flags |= telem::kLogStatusFlagRequested;
-  if (g_log_backend_ready) flags |= telem::kLogStatusFlagBackendReady;
-  if (g_log_media_present) flags |= telem::kLogStatusFlagMediaPresent;
+  if (recorder.backend_ready) flags |= telem::kLogStatusFlagBackendReady;
+  if (recorder.media_present) flags |= telem::kLogStatusFlagMediaPresent;
   return flags;
 }
 
 telem::LogStatusPayloadV1 currentLogStatus() {
+  const log_store::RecorderStatus recorder = log_store::recorderStatus();
   telem::LogStatusPayloadV1 status = {};
   status.flags = currentLogFlags();
   status.last_command = g_log_last_command;
-  status.session_id = g_log_session_id;
-  status.bytes_written = 0U;
-  status.free_bytes = telem::kLogBytesUnknown;
+  status.session_id = recorder.session_id ? recorder.session_id : g_log_session_id;
+  status.bytes_written = recorder.bytes_written;
+  status.free_bytes = recorder.free_bytes;
   status.last_change_ms = g_log_last_change_ms ? (uint32_t)(millis() - g_log_last_change_ms) : 0xFFFFFFFFUL;
   return status;
 }
@@ -740,15 +744,12 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      g_log_requested = true;
       g_log_last_command = hdr.msg_type;
       g_log_last_change_ms = millis();
       g_log_session_id = (g_log_session_id == 0U) ? (g_session_id ? g_session_id : 1U) : (g_log_session_id + 1U);
-      if (g_log_backend_ready && g_log_media_present) {
-        g_recorder_enabled = true;
-      }
+      g_log_requested = log_store::startSession(g_log_session_id);
       markLogStatusDirty();
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      sendCommandAck(hdr.msg_type, g_log_requested, g_log_requested ? 0U : 2U, hdr.seq, micros());
       break;
     case telem::CMD_LOG_STOP:
       if (hdr.payload_len != 0U) {
@@ -756,8 +757,8 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
+      log_store::stopSession();
       g_log_requested = false;
-      g_recorder_enabled = false;
       g_log_last_command = hdr.msg_type;
       g_log_last_change_ms = millis();
       markLogStatusDirty();
@@ -930,9 +931,7 @@ String peerMac() { return macToString(g_gnd_mac); }
 bool radioReady() { return g_espnow_ready; }
 
 void setRecorderEnabled(bool enabled) {
-  g_recorder_enabled = enabled;
-  g_log_backend_ready = enabled;
-  g_log_media_present = enabled;
+  log_store::setEnabled(enabled);
   if (!enabled) {
     g_log_requested = false;
   }

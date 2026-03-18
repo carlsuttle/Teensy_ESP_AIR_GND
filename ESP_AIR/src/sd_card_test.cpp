@@ -1,25 +1,11 @@
 #include "sd_card_test.h"
 
 #include <SD.h>
-#include <SPI.h>
+
+#include "sd_backend.h"
 
 namespace sd_card_test {
 namespace {
-
-// Temporary bench-test wiring.
-// constexpr uint8_t kSdCsPin = D1;
-// constexpr uint8_t kSdSckPin = D8;
-// constexpr uint8_t kSdMisoPin = D9;
-// constexpr uint8_t kSdMosiPin = D10;
-constexpr uint8_t kSdCsPin   = 2;
-constexpr uint8_t kSdSckPin  = 7;
-constexpr uint8_t kSdMisoPin = 8;
-constexpr uint8_t kSdMosiPin = 9;
-
-constexpr uint32_t kInitFrequenciesHz[] = {
-    40000000UL,
-    26000000UL,
-};
 
 constexpr char kProbePath[] = "/sdprobe.bin";
 
@@ -44,48 +30,29 @@ uint64_t bytesToMiB(uint64_t bytes) {
 }
 
 void fillPinStatus(Status& status) {
-  status.cs_pin = kSdCsPin;
-  status.sck_pin = kSdSckPin;
-  status.miso_pin = kSdMisoPin;
-  status.mosi_pin = kSdMosiPin;
+  status.cs_pin = sd_backend::csPin();
+  status.sck_pin = sd_backend::sckPin();
+  status.miso_pin = sd_backend::misoPin();
+  status.mosi_pin = sd_backend::mosiPin();
 }
 
-bool beginAtFrequency(Status& status, uint32_t hz) {
+void copyBackendStatus(const sd_backend::Status& backend, Status& status) {
   fillPinStatus(status);
-  status.init_hz = hz;
-  status.spi_configured = false;
-  status.begin_ok = false;
-  status.card_type = CARD_NONE;
-  status.card_size_bytes = 0;
-  status.total_bytes = 0;
-  status.used_bytes = 0;
-  status.write_ok = false;
-  status.write_bytes = 0;
-
-  SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
-  status.spi_configured = true;
-
-  if (!SD.begin(kSdCsPin, SPI, hz)) {
-    return false;
-  }
-
-  status.begin_ok = true;
-  status.card_type = SD.cardType();
-  status.card_size_bytes = SD.cardSize();
-  status.total_bytes = SD.totalBytes();
-  status.used_bytes = SD.usedBytes();
-  return true;
+  status.init_hz = backend.init_hz;
+  status.spi_configured = backend.spi_configured;
+  status.begin_ok = backend.begin_ok;
+  status.card_type = backend.card_type;
+  status.card_size_bytes = backend.card_size_bytes;
+  status.total_bytes = backend.total_bytes;
+  status.used_bytes = backend.used_bytes;
 }
 
 bool tryBegin(Status& status) {
   status = {};
-  fillPinStatus(status);
-  for (uint32_t hz : kInitFrequenciesHz) {
-    if (beginAtFrequency(status, hz)) {
-      return true;
-    }
-  }
-  return false;
+  sd_backend::Status backend = {};
+  const bool ok = sd_backend::begin(&backend);
+  copyBackendStatus(backend, status);
+  return ok;
 }
 
 bool writeBinaryProbe(Status& status) {

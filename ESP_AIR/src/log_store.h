@@ -8,28 +8,50 @@
 namespace log_store {
 
 struct Stats {
-  uint32_t queue_cur;
-  uint32_t queue_max;
-  uint32_t enqueued;
-  uint32_t dropped;
-  uint32_t records_written;
-  uint32_t bytes_written;
-  uint32_t flushes;
-  uint32_t fs_open_last_ms;
-  uint32_t fs_open_max_ms;
-  uint32_t fs_write_last_ms;
-  uint32_t fs_write_max_ms;
-  uint32_t fs_close_last_ms;
-  uint32_t fs_close_max_ms;
-  uint32_t fs_delete_last_ms;
-  uint32_t fs_delete_max_ms;
-  uint32_t fs_download_last_ms;
-  uint32_t fs_download_max_ms;
+  uint32_t queue_cur = 0;
+  uint32_t queue_max = 0;
+  uint32_t enqueued = 0;
+  uint32_t dropped = 0;
+  uint32_t records_written = 0;
+  uint32_t bytes_written = 0;
+  uint32_t flushes = 0;
+  uint32_t fs_open_last_ms = 0;
+  uint32_t fs_open_max_ms = 0;
+  uint32_t fs_write_last_ms = 0;
+  uint32_t fs_write_max_ms = 0;
+  uint32_t fs_close_last_ms = 0;
+  uint32_t fs_close_max_ms = 0;
+  uint32_t fs_delete_last_ms = 0;
+  uint32_t fs_delete_max_ms = 0;
+  uint32_t fs_download_last_ms = 0;
+  uint32_t fs_download_max_ms = 0;
+  uint32_t no_free_block_events = 0;
+  uint32_t blocks_written = 0;
+  uint32_t blocks_dropped = 0;
+  uint32_t min_free_blocks_seen = 0;
+  uint32_t max_write_bytes = 0;
 };
 
-void begin(const AppConfig& cfg, bool fs_ready = true);
+struct RecorderStatus {
+  bool feature_enabled = false;
+  bool backend_ready = false;
+  bool media_present = false;
+  bool active = false;
+  uint32_t session_id = 0;
+  uint32_t bytes_written = 0;
+  uint32_t free_bytes = telem::kLogBytesUnknown;
+  uint32_t init_hz = 0;
+};
+
+void begin(const AppConfig& cfg, bool enabled = true);
 void setConfig(const AppConfig& cfg);
+void setEnabled(bool enabled);
+bool startSession(uint32_t session_id);
+void stopSession();
+void poll();
 void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state);
+bool active();
+RecorderStatus recorderStatus();
 Stats stats();
 void resetStats();
 
