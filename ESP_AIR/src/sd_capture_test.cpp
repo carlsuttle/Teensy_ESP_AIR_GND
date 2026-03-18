@@ -10,16 +10,14 @@
 namespace sd_capture_test {
 namespace {
 
-constexpr uint8_t kSdCsPin = 43;
-constexpr uint8_t kSdSckPin = 7;
+constexpr uint8_t kSdCsPin   = 2;
+constexpr uint8_t kSdSckPin  = 7;
 constexpr uint8_t kSdMisoPin = 8;
 constexpr uint8_t kSdMosiPin = 9;
 
 constexpr uint32_t kInitFrequenciesHz[] = {
-    400000UL,
-    1000000UL,
     4000000UL,
-    10000000UL,
+    26000000UL,
 };
 
 constexpr char kBinaryExt[] = ".tlog";

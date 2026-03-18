@@ -7,18 +7,18 @@ namespace sd_card_test {
 namespace {
 
 // Temporary bench-test wiring.
-constexpr uint8_t kSdCsPin = D7;
-constexpr uint8_t kSdSckPin = D8;
-constexpr uint8_t kSdMisoPin = D9;
-constexpr uint8_t kSdMosiPin = D10;
-
-
+// constexpr uint8_t kSdCsPin = D1;
+// constexpr uint8_t kSdSckPin = D8;
+// constexpr uint8_t kSdMisoPin = D9;
+// constexpr uint8_t kSdMosiPin = D10;
+constexpr uint8_t kSdCsPin   = 2;
+constexpr uint8_t kSdSckPin  = 7;
+constexpr uint8_t kSdMisoPin = 8;
+constexpr uint8_t kSdMosiPin = 9;
 
 constexpr uint32_t kInitFrequenciesHz[] = {
-    400000UL,
-    1000000UL,
-    4000000UL,
-    10000000UL,
+    40000000UL,
+    26000000UL,
 };
 
 constexpr char kProbePath[] = "/sdprobe.bin";
@@ -59,9 +59,9 @@ bool beginAtFrequency(Status& status, uint32_t hz) {
   status.card_size_bytes = 0;
   status.total_bytes = 0;
   status.used_bytes = 0;
+  status.write_ok = false;
+  status.write_bytes = 0;
 
-  SD.end();
-  SPI.end();
   SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
   status.spi_configured = true;
 
