@@ -3,7 +3,7 @@
 Version: 0.3
 Author: Carl Suttle
 Date: 2026
-Updated: 2026-03-20
+Updated: 2026-03-21
 
 This document is the architectural briefing and continuity record for an
 AI-assisted experimental avionics development project. It is intended to let a
@@ -48,6 +48,9 @@ This document serves four purposes:
 - Architecture reference
 - AI session briefing
 - Laboratory notebook summary
+
+It is the canonical project-history document. Older standalone report notes
+should be folded into this file rather than maintained in parallel.
 
 It should be sufficient for a new AI session to understand:
 
@@ -349,36 +352,59 @@ Important prototype source files:
 Current validated prototype characteristics:
 
 - SPI clock: `40 MHz`
-- fixed transaction size: `2048 bytes`
-- current benchmark record size: `160 bytes`
-- full-duplex framed messages with batching
-- current practical bulk setting tested: `100 Hz` transaction rate with about
-  `10` packed `160-byte` records per transaction per direction
+- framed fixed-size full-duplex transactions
+- benchmark record size: `160 bytes`
+- DMA-backed transport on both sides in the current prototype
+- exact packed-record fit depends on transaction size:
+  - `2048 bytes` -> `12` records max
+  - `4096 bytes` -> `25` records max
+  - `8192 bytes` -> `51` records max
 
-Observed clean benchmark points:
+Demonstrated full-duplex operating points, `40 MHz`, `160-byte` records:
 
-- `mode 1` one-way Teensy -> ESP at `200 Hz`, about `10 x 160-byte` records per
-  transaction
-- `mode 2` one-way ESP -> Teensy at `200 Hz`, about `10 x 160-byte` records per
-  transaction
-- `mode 3` balanced full duplex at `100 Hz`, about `10 x 160-byte` records per
-  transaction per direction
+| Transaction Size | Txn Rate | Approx Records / Txn / Dir | Approx Records / s / Dir | Notes |
+|---|---:|---:|---:|---|
+| `2048` | `300 Hz` | `10` | `3000` | Clean, higher-cadence setting |
+| `4096` | `200 Hz` | `15` | `3000` | Clean, same payload rate with lower churn |
+| `8192` | `100 Hz` | `35` | `3500` | Clean, strong SD-replay candidate |
 
-Approximate payload rates at the clean `mode 3` setting:
+Demonstrated low-interference one-way operating points, `40 MHz`, `160-byte`
+records:
 
-- about `1000` records/s each way
-- about `160,000 bytes/s` each way
-- about `156 KiB/s` each way
-- about `312 KiB/s` combined useful payload
+| Transaction Size | Mode | Txn Rate | Approx Records / Txn | Approx Records / s | Notes |
+|---|---|---:|---:|---:|---|
+| `2048` | `1` or `2` | `200 Hz` | `10` | `2000` | Clean one-way in both directions |
+| `4096` | `1` or `2` | `100 Hz` | `20` | `2000` | Clean one-way in both directions |
+
+Raw transport benchmark result, `8192-byte` transactions, `160-byte` records,
+full duplex, no live record generation in the timed path:
+
+- exact fit: `51` records per transaction per direction
+- clean through `110 Hz`
+- saturates above that at about `6620` transactions in `60 s`
+- practical raw full-duplex ceiling: about `5627 records/s` each way
+- recommended safe raw full-duplex operating point: `5000 records/s` each way
+  at `100 Hz`, about `50` records per transaction per direction
+
+Approximate useful payload at the recommended safe raw full-duplex point:
+
+- about `800,000 bytes/s` each way
+- about `781 KiB/s` each way
+- about `1.56 MiB/s` combined useful payload
 
 Application notes:
 
-- at `100 Hz`, each transaction period is `10 ms`
-- at `10 x 160-byte` records, each direction carries about `1600 bytes` every
-  `10 ms`
-- this is favorable for SD logging because it is already batched
-- buffering two to four transactions before writing gives chunk sizes of about
-  `3200` to `6400 bytes`, which is far more SD-friendly than per-record writes
+- at `100 Hz`, transaction latency is bounded to about `10 ms`
+- the recommended `8192 @ 100 Hz` setting supports about `50 x 160-byte`
+  records each way per transaction
+- this is favorable for SD replay and SD logging because it is already strongly
+  batched
+- buffering one to four transactions before writing gives chunk sizes of about
+  `8 KiB` to `32 KiB`, which is substantially more SD-friendly than per-record
+  writes
+- for practical replay work, the `8192 @ 100 Hz` operating point is credible as
+  a bulk path for replaying about `3.5 kHz` record rate through the Teensy back
+  to the ESP while staying inside the `10 ms` latency target
 
 Important problems that were overcome:
 
@@ -397,6 +423,10 @@ Fixes that materially improved the prototype:
 - added explicit run-start synchronization and cleaner benchmark control
 - fixed the Teensy re-arm race so completed transactions are parsed before a new
   transaction can overwrite the RX buffer
+- added raw one-way and raw full-duplex benchmark modes to separate transport
+  limits from live synthetic record-generation limits
+- confirmed that earlier apparent reverse-direction weakness was primarily a
+  benchmark-source limitation, not a fundamental raw SPI asymmetry
 
 Current interpretation:
 
@@ -404,6 +434,10 @@ Current interpretation:
   transport
 - it is especially attractive where bounded latency is acceptable and batching
   is desirable
+- for integrated avionics use, `8192-byte` transactions at `100 Hz` are a
+  strong background-bulk setting when `10 ms` latency is acceptable
+- if lower transaction churn matters more than maximum rate, `4096 @ 200 Hz`
+  and `8192 @ 100 Hz` are both attractive
 - it is not yet integrated into the production avionics codebase
 
 Integration guidance:
@@ -464,11 +498,17 @@ Current authoritative implementation:
 
 - [ESP_AIR/src/log_store.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_AIR/src/log_store.cpp)
 - [ESP_AIR/src/log_store.h](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_AIR/src/log_store.h)
+- [ESP_AIR/src/sd_backend.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_AIR/src/sd_backend.cpp)
+- [ESP_AIR/src/sd_backend.h](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_AIR/src/sd_backend.h)
+- [ESP_AIR/src/sd_capture_test.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_AIR/src/sd_capture_test.cpp)
+- [ESP_AIR/README.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/ESP_AIR/README.md)
+- [AIR_SD_logging_benchmark_notes.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/AIR_SD_logging_benchmark_notes.md)
 
 Current backend:
 
-- `LittleFS`
+- shared microSD backend on `ESP_AIR`
 - binary `.tlog` session files in `/logs`
+- logger, `sdprobe`, `sdwrite`, and `sdcap1m` all use the same SD backend
 
 Current binary record:
 
@@ -483,6 +523,42 @@ Current buffering:
 - write buffer: `8192` bytes
 - batch write timeout: `500 ms`
 - writer task handles filesystem writes
+- SD block writer configuration used in bench work:
+  - `10000-byte` blocks
+  - `4` blocks in RAM
+  - writer task pinned to core `0`
+
+Current SD backend wiring and init behavior on `ESP_AIR`:
+
+- `CS=2`
+- `SCK=7`
+- `MISO=8`
+- `MOSI=9`
+- mount attempts `40 MHz` first
+- fallback mount at `26 MHz` if `40 MHz` does not mount
+
+Standalone SD logging benchmark state:
+
+- SD logging has been standalone benchmarked successfully and should be treated
+  as being at the same maturity level as the SPI/DMA transport prototype:
+  proven in isolation, not yet fully validated under the final integrated load
+- benchmark target in the AIR notes:
+  - `250-byte` records
+  - `400 Hz`
+  - about `97.7 KB/s`
+- observed SPI SD block-write behavior with a Mindstar `64 GB` card:
+  - `10000-byte` block writes
+  - average write time about `7 ms`
+  - worst write time about `9-10 ms`
+  - no slow flush events observed in the final standalone runs
+- implied instantaneous write bandwidth:
+  - about `1.4 MB/s`
+- this gives about `10-14x` margin against the original `~100 KB/s` AIR
+  recorder target
+- key conclusion from the standalone SD work:
+  - SD throughput itself is not the limiting factor
+  - the remaining risk is system interaction under real AIR load:
+    UART ingest, radio servicing, logging, and filesystem latency spikes
 
 Current operational rule:
 
@@ -491,9 +567,12 @@ Current operational rule:
 
 Important limitation:
 
-- current production logging is still `LittleFS`-based
-- SD logging is under development and should be treated as a separate backend
-  effort, not a small patch to the existing logger
+- the shared SD backend is working and benchmarked, but it is still an
+  experimental subsystem until it is validated under real integrated AIR load
+- file logging remains disabled by default at boot because quota / rotation /
+  download workflow is not yet finished
+- SD logging confidence should now come from integrated AIR validation rather
+  than further synthetic storage-only bench refinement
 
 ---
 
@@ -547,6 +626,38 @@ problem is solved unless explicitly revalidated.
 - magnetometer calibration verification
 - UART transport checks
 - logging throughput checks
+- startup-order and connectivity-recovery checks
+
+### Connectivity and startup recovery
+
+The project also has an explicit bench-validation concern around startup stalls
+and reconnect lockout behavior.
+
+Current connectivity validation intent:
+
+- startup order should not matter
+- temporary connectivity loss should not create permanent lockout
+- telemetry, UI, and logging should resume without manual reset
+
+Current practical acceptance targets:
+
+- `ESP_GND` AP ready within about `15 s`
+- `ESP_AIR` radio ready within about `10 s`
+- AIR <-> GND link ready within about `30 s` after both are booted
+- AIR <-> Teensy telemetry link ready within about `30 s`
+- live telemetry stall threshold about `4 s`
+
+Current recommended soak coverage:
+
+- full startup-order matrix across `GND`, `AIR`, and `Teensy`
+- reset and power-cycle interruption matrix for each unit
+- browser join/leave cycling while telemetry is active
+- logging on/off while telemetry is active
+
+Useful support artifact:
+
+- `scripts/monitor_stalls.ps1` can be used to capture multi-port serial logs,
+  `events.csv`, and `summary.json` during startup/recovery testing
 
 ### Controlled motion tests
 
@@ -748,6 +859,13 @@ Current working tree structure:
 - `ESP_GND/` - ground node firmware and web assets
 - `../SPI_DMA_Transport_Prototype/` - standalone transport benchmark and
   protocol prototype
+
+Reference-document intent:
+
+- `AI_AVIONICS_PROJECT_RECORD.md` is the project memory / history file
+- subsystem `README.md` files are live component references
+- pipeline spec / implementation plan files are design references, not the
+  canonical project history
 
 When resuming work:
 
