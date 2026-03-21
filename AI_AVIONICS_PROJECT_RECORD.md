@@ -3,7 +3,7 @@
 Version: 0.3
 Author: Carl Suttle
 Date: 2026
-Updated: 2026-03-15
+Updated: 2026-03-20
 
 This document is the architectural briefing and continuity record for an
 AI-assisted experimental avionics development project. It is intended to let a
@@ -318,7 +318,108 @@ Current browser transport split:
 
 ---
 
-## 7. Flight State Data Model
+## 7. Experimental SPI / DMA Transport Prototype
+
+This section records a standalone transport prototype developed outside the main
+avionics firmware tree. It is a transport experiment, not yet the production
+AIR/GND integration path.
+
+Prototype repository:
+
+- [SPI_DMA_Transport_Prototype](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype)
+
+Prototype roles:
+
+- ESP32-S3 is SPI master
+- Teensy 4.0 is SPI slave
+- one SPI bus carries fixed-size full-duplex framed transactions
+- a Teensy `READY` line requests service from the ESP master
+
+Important prototype source files:
+
+- [esp32_xiao_s3/include/config.h](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/esp32_xiao_s3/include/config.h)
+- [esp32_xiao_s3/include/protocol.h](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/esp32_xiao_s3/include/protocol.h)
+- [esp32_xiao_s3/src/spi_master_link.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/esp32_xiao_s3/src/spi_master_link.cpp)
+- [esp32_xiao_s3/src/main.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/esp32_xiao_s3/src/main.cpp)
+- [teensy_t40/include/config.h](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/teensy_t40/include/config.h)
+- [teensy_t40/include/protocol.h](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/teensy_t40/include/protocol.h)
+- [teensy_t40/src/spi_link.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/teensy_t40/src/spi_link.cpp)
+- [teensy_t40/src/main.cpp](c:/Users/dell/Platformio/esp32_crsf_telemetry/SPI_DMA_Transport_Prototype/teensy_t40/src/main.cpp)
+
+Current validated prototype characteristics:
+
+- SPI clock: `40 MHz`
+- fixed transaction size: `2048 bytes`
+- current benchmark record size: `160 bytes`
+- full-duplex framed messages with batching
+- current practical bulk setting tested: `100 Hz` transaction rate with about
+  `10` packed `160-byte` records per transaction per direction
+
+Observed clean benchmark points:
+
+- `mode 1` one-way Teensy -> ESP at `200 Hz`, about `10 x 160-byte` records per
+  transaction
+- `mode 2` one-way ESP -> Teensy at `200 Hz`, about `10 x 160-byte` records per
+  transaction
+- `mode 3` balanced full duplex at `100 Hz`, about `10 x 160-byte` records per
+  transaction per direction
+
+Approximate payload rates at the clean `mode 3` setting:
+
+- about `1000` records/s each way
+- about `160,000 bytes/s` each way
+- about `156 KiB/s` each way
+- about `312 KiB/s` combined useful payload
+
+Application notes:
+
+- at `100 Hz`, each transaction period is `10 ms`
+- at `10 x 160-byte` records, each direction carries about `1600 bytes` every
+  `10 ms`
+- this is favorable for SD logging because it is already batched
+- buffering two to four transactions before writing gives chunk sizes of about
+  `3200` to `6400 bytes`, which is far more SD-friendly than per-record writes
+
+Important problems that were overcome:
+
+- symmetric reverse bulk transfer was unreliable in the original burst-oriented
+  prototype
+- one-record-per-transaction framing created unnecessary overhead and allowed
+  Teensy TX backlog to build
+- the Teensy slave receive path had a race where a completed transaction could
+  be re-armed before the finished RX buffer was parsed
+- that race caused reverse replay frames to be lost without CRC or type errors
+
+Fixes that materially improved the prototype:
+
+- replaced the old burst-oriented protocol with fixed transaction-based framing
+- added batching so multiple records can be packed into one transaction
+- added explicit run-start synchronization and cleaner benchmark control
+- fixed the Teensy re-arm race so completed transactions are parsed before a new
+  transaction can overwrite the RX buffer
+
+Current interpretation:
+
+- the SPI/DMA transport prototype is now a valid candidate for high-rate bulk
+  transport
+- it is especially attractive where bounded latency is acceptable and batching
+  is desirable
+- it is not yet integrated into the production avionics codebase
+
+Integration guidance:
+
+- do not replace the current UART mirror path in one step
+- first integrate SPI transport as a separate experimental path while keeping
+  the existing UART link available as fallback
+- use SPI for bulk state / replay / logging-oriented transport, not as a casual
+  patch into unrelated code
+- any protocol change must be made on both prototype sides together
+- if SPI and SD share controller time on the same MCU, assume that SD latency
+  spikes still require a RAM buffer even when average throughput looks safe
+
+---
+
+## 8. Flight State Data Model
 
 Canonical record:
 
@@ -357,7 +458,7 @@ together, not one file at a time.
 
 ---
 
-## 8. Logging Architecture
+## 9. Logging Architecture
 
 Current authoritative implementation:
 
@@ -396,7 +497,7 @@ Important limitation:
 
 ---
 
-## 9. Coordinate Frames
+## 10. Coordinate Frames
 
 Reference frames used in the system:
 
@@ -437,7 +538,7 @@ problem is solved unless explicitly revalidated.
 
 ---
 
-## 10. Validation Approach
+## 11. Validation Approach
 
 ### Bench validation
 
@@ -474,10 +575,12 @@ Whenever possible compare against:
 - frame conventions still need a controlled synthetic magnetometer test
 - acceleration rejection behavior during roll and pitch is not fully explained
 - SD logging backend has not yet been validated under real transport load
+- SPI/DMA transport has been validated as a standalone prototype but not yet
+  integrated into the main avionics firmware path
 
 ---
 
-## 11. Current Development State
+## 12. Current Development State
 
 Known working or mostly working:
 
@@ -487,22 +590,27 @@ Known working or mostly working:
 - AIR <-> GND ESP-NOW link exists
 - GND web UI and WebSocket streaming exist
 - PFD / HSI generation by AI was highly effective for structure and data flow
+- standalone Teensy <-> ESP SPI/DMA prototype now works as a clean framed
+  bidirectional transport experiment
 
 Current areas under active investigation:
 
 - frame correctness for heading and tilt compensation
 - acceleration rejection during roll / pitch tests
 - SD card backend integration on ESP_AIR
+- integration strategy for the standalone SPI/DMA transport prototype
 - display refinement and pilot-facing presentation quality
 
 Current logging state:
 
 - filesystem logger exists on AIR using LittleFS
 - SD interface testing has begun but is not yet a reliable subsystem
+- SPI transport batching appears compatible with logger-friendly chunk sizes, but
+  this has not yet been tested in the integrated AIR logger path
 
 ---
 
-## 12. Known Risks And Questions
+## 13. Known Risks And Questions
 
 Known risks:
 
@@ -510,6 +618,7 @@ Known risks:
 - heading instability during roll / pitch
 - acceleration rejection during maneuvers
 - SD logging performance under load
+- SPI transport integration complexity versus keeping the current UART mirror
 - display logic being mistaken for sensor truth
 
 Open questions:
@@ -519,10 +628,12 @@ Open questions:
 - improved energy awareness displays
 - final earth/body/magnetic frame convention
 - best offline or on-ground binary-to-text conversion workflow
+- whether SPI should replace UART for bulk transfer or coexist as an optional
+  high-rate path
 
 ---
 
-## 13. Display Development Lessons
+## 14. Display Development Lessons
 
 The AI-generated PFD / HSI work was highly productive but exposed an important
 workflow limitation.
@@ -551,7 +662,7 @@ lesson learned.
 
 ---
 
-## 14. Engineering Philosophy Of This Project
+## 15. Engineering Philosophy Of This Project
 
 This is not primarily a product development effort.
 
@@ -569,7 +680,7 @@ The most valuable outcomes may be:
 
 ---
 
-## 15. AI Session Briefing
+## 16. AI Session Briefing
 
 Use the following as a starting brief for future AI sessions.
 
@@ -608,6 +719,8 @@ Goals:
 - new flight display concepts
 - deterministic flight processing
 - robust transport and logging
+- evaluate a standalone SPI/DMA bulk transport path without breaking the current
+  UART-based avionics stack
 
 Constraints:
 
@@ -621,16 +734,20 @@ Current caution:
 
 - coordinate-frame and heading behavior are still under investigation
 - do not treat current heading math as closed unless validated again
+- SPI/DMA transport results are promising but are still prototype results until
+  integrated and retested inside the avionics firmware
 
 ---
 
-## 16. Repository Structure
+## 17. Repository Structure
 
 Current working tree structure:
 
 - `Teensy/` - flight computer firmware
 - `ESP_AIR/` - airborne transport / logging firmware
 - `ESP_GND/` - ground node firmware and web assets
+- `../SPI_DMA_Transport_Prototype/` - standalone transport benchmark and
+  protocol prototype
 
 When resuming work:
 
@@ -640,7 +757,7 @@ When resuming work:
 
 ---
 
-## 17. Record Maintenance
+## 18. Record Maintenance
 
 Update this document when major changes occur in:
 
