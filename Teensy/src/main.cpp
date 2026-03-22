@@ -1025,12 +1025,12 @@ void baroPollAndFilter() {
   g_state.last_baro_ms = now;
 }
 
-void mirrorSendFastState() {
+void mirrorSendFastState(uint32_t seq, uint32_t t_us,
+                         const mirror::ReplayOutputMeta* replay_meta = nullptr,
+                         const imu_fusion::FusionReplayDebug* replay_diag = nullptr) {
 #if ENABLE_MIRROR
   if (g_mode == CommandMode::EspComTest) return;
-  const uint32_t seq = g_mirror_seq++;
-  const uint32_t t_us = micros();
-  const bool ok = mirror::sendFastState(g_state, seq, t_us);
+  const bool ok = mirror::sendFastState(g_state, seq, t_us, replay_meta, replay_diag);
   if (ok) {
     g_last_mirror_seq = seq;
     g_last_mirror_t_us = t_us;
@@ -1573,23 +1573,39 @@ void setup() {
 
 void loop() {
   handleCommandInputs();
-  mirror::pollRx();
+  mirror::pollRx(g_state);
+  const bool replayActive = mirror::replayActive();
   const bool imuDiagActive = (g_mode == CommandMode::ShowImuError) || (g_mode == CommandMode::TestImuRot);
 
   if (!imuDiagActive) {
-    gpsPollContinuous();
-    baroPollAndFilter();
+    if (!replayActive) {
+      gpsPollContinuous();
+      baroPollAndFilter();
+    } else if (!isnan(g_state.baro_alt_m)) {
+      g_last_baro_alt_m = g_state.baro_alt_m;
+    }
     telemetry_loop(g_state);
 
-    // IMU update is micros-scheduled at 400 Hz in imu_fusion::update400Hz(); call each loop.
+    // IMU update is micros-scheduled at 400 Hz in imu_fusion::update400Hz(); in replay mode
+    // it consumes injected SPI sensor samples instead of the live IMU.
     imu_fusion::update400Hz(g_state);
   }
 
   const uint32_t mirrorPeriodUs = mirror::streamPeriodUs();
-  while (g_mirror_timer_us >= mirrorPeriodUs) {
-    g_mirror_timer_us -= mirrorPeriodUs;
-    if (!imuDiagActive) {
-      mirrorSendFastState();
+  if (!imuDiagActive && replayActive) {
+    mirror::ReplayOutputMeta replay_meta = {};
+    while (mirror::takeReplayOutputMeta(replay_meta)) {
+      imu_fusion::FusionReplayDebug replay_diag = {};
+      const imu_fusion::FusionReplayDebug* replay_diag_ptr =
+          imu_fusion::takeReplayDebug(replay_diag) ? &replay_diag : nullptr;
+      mirrorSendFastState(replay_meta.seq, replay_meta.t_us, &replay_meta, replay_diag_ptr);
+    }
+  } else {
+    while (g_mirror_timer_us >= mirrorPeriodUs) {
+      g_mirror_timer_us -= mirrorPeriodUs;
+      if (!imuDiagActive) {
+        mirrorSendFastState(g_mirror_seq++, micros(), nullptr);
+      }
     }
   }
 

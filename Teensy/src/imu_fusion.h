@@ -27,6 +27,19 @@ struct FusionMagDebug {
   float earthFromFusionHeading;
 };
 
+struct FusionReplayDebug {
+  float accelBodyX;
+  float accelBodyY;
+  float accelBodyZ;
+  float magFusionX;
+  float magFusionY;
+  float magFusionZ;
+  float accelerationErrorDeg;
+  float magneticErrorDeg;
+  bool accelerometerIgnored;
+  bool magnetometerIgnored;
+};
+
 struct ImuConfig {
   uint8_t accOdr;
   uint8_t accRange;
@@ -41,6 +54,13 @@ struct ImuConfig {
 
 bool begin(Stream* dbg = &Serial);
 void update400Hz(State& s);
+void setReplayMode(bool active);
+bool replayMode();
+bool takeReplayDebug(FusionReplayDebug& out);
+bool submitReplaySample(float ax_mps2, float ay_mps2, float az_mps2,
+                        float gx_dps, float gy_dps, float gz_dps,
+                        float mx_uT, float my_uT, float mz_uT,
+                        uint32_t sample_t_us);
 
 bool readRawAccelGyro(float out6[6]);   // ax,ay,az[m/s^2], gx,gy,gz[dps]
 bool readCorrectedAccelGyro(float out6[6]); // calibration-corrected ax,ay,az[g], gx,gy,gz[dps]
@@ -70,6 +90,7 @@ float computeHeadingDeg(float magX, float magY);
 void getMagHeadingInputs(float& magX, float& magY, float& magZ);
 void getFusionHeadingDebug(float& eulerYaw, float& matrixColHeading, float& matrixRowHeading, float& tiltCompHeading);
 void getFusionMagDebug(FusionMagDebug& out);
+void getFusionReplayDebug(FusionReplayDebug& out);
 void setDebugMagLive();
 void setDebugMagSyntheticEarth(float north, float east, float down);
 DebugMagMode getDebugMagMode();

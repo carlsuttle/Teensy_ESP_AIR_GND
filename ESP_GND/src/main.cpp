@@ -233,10 +233,12 @@ void updateAirReadiness() {
 
 void printStats() {
   const auto snap = radio_link::snapshot();
+  const auto ws = ws_server::stats();
   Serial.printf(
       "STAT unit=GND seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
       "rx_bytes=%lu ok=%lu state_rx=%lu state_gap=%lu state_rewind=%lu "
-      "crc=%u cobs=%u len=%lu unk=%lu drop=%lu link_tx=%u link_rx=%lu link_drop=%u rtt=%lu\n",
+      "crc=%u cobs=%u len=%lu unk=%lu drop=%lu link_tx=%u link_rx=%lu link_drop=%u "
+      "rtt=%lu ws_clients=%lu ws_seq=%lu ws_state_seq=%lu ui_tx_ms=%lu ui_lat=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -257,7 +259,12 @@ void printStats() {
       0U,
       (unsigned long)snap.stats.rx_packets,
       0U,
-      (unsigned long)snap.radio_rtt_ms);
+      (unsigned long)snap.radio_rtt_ms,
+      (unsigned long)ws.clients,
+      (unsigned long)ws.ws_state_seq,
+      (unsigned long)ws.last_state_seq_sent,
+      (unsigned long)ws.last_ui_tx_ms,
+      (unsigned long)ws.last_ui_tx_latency_ms);
 }
 
 void printLinkMeta() {

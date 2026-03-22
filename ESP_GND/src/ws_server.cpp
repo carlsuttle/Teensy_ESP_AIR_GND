@@ -434,11 +434,44 @@ void begin() {
     doc["has_link_meta"] = snap.has_link_meta;
     doc["seq"] = snap.seq;
     doc["t_us"] = snap.t_us;
+    if (snap.has_state) {
+      JsonObject state = doc["state"].to<JsonObject>();
+      state["roll_deg"] = snap.state.roll_deg;
+      state["pitch_deg"] = snap.state.pitch_deg;
+      state["yaw_deg"] = snap.state.yaw_deg;
+      state["mag_heading_deg"] = snap.state.mag_heading_deg;
+      state["iTOW_ms"] = snap.state.iTOW_ms;
+      state["fixType"] = snap.state.fixType;
+      state["numSV"] = snap.state.numSV;
+      state["lat_1e7"] = snap.state.lat_1e7;
+      state["lon_1e7"] = snap.state.lon_1e7;
+      state["hMSL_mm"] = snap.state.hMSL_mm;
+      state["gSpeed_mms"] = snap.state.gSpeed_mms;
+      state["headMot_1e5deg"] = snap.state.headMot_1e5deg;
+      state["hAcc_mm"] = snap.state.hAcc_mm;
+      state["sAcc_mms"] = snap.state.sAcc_mms;
+      state["gps_parse_errors"] = snap.state.gps_parse_errors;
+      state["mirror_tx_ok"] = snap.state.mirror_tx_ok;
+      state["mirror_drop_count"] = snap.state.mirror_drop_count;
+      state["last_gps_ms"] = snap.state.last_gps_ms;
+      state["last_imu_ms"] = snap.state.last_imu_ms;
+      state["last_baro_ms"] = snap.state.last_baro_ms;
+      state["baro_temp_c"] = snap.state.baro_temp_c;
+      state["baro_press_hpa"] = snap.state.baro_press_hpa;
+      state["baro_alt_m"] = snap.state.baro_alt_m;
+      state["baro_vsi_mps"] = snap.state.baro_vsi_mps;
+      state["fusion_gain"] = snap.state.fusion_gain;
+      state["fusion_accel_rej"] = snap.state.fusion_accel_rej;
+      state["fusion_mag_rej"] = snap.state.fusion_mag_rej;
+      state["fusion_recovery_period"] = snap.state.fusion_recovery_period;
+      state["flags"] = snap.state.flags;
+    }
     doc["link_rx"] = snap.stats.rx_packets;
     doc["ok"] = snap.stats.frames_ok;
     doc["state_packets"] = snap.stats.state_packets;
     doc["state_seq_gap"] = snap.stats.state_seq_gap;
     doc["state_seq_rewind"] = snap.stats.state_seq_rewind;
+    doc["last_rx_ms"] = snap.stats.last_rx_ms;
     doc["len_err"] = snap.stats.len_err;
     doc["unknown_msg"] = snap.stats.unknown_msg;
     doc["drop"] = snap.stats.drop;
@@ -577,6 +610,17 @@ void loop() {
 
 uint32_t clientCount() {
   return g_ws_ctrl.count() + g_ws_state.count();
+}
+
+Stats stats() {
+  Stats out = {};
+  out.clients = clientCount();
+  out.ws_state_seq = g_ws_state_seq;
+  out.last_state_seq_sent = g_last_state_seq_sent;
+  out.last_ui_tx_ms = g_last_ui_tx_ms;
+  out.last_ui_tx_latency_ms = g_last_ui_tx_latency_ms;
+  out.max_ui_tx_latency_ms = g_max_ui_tx_latency_ms;
+  return out;
 }
 
 void resetCounters() {

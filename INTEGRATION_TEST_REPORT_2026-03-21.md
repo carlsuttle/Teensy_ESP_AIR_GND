@@ -230,6 +230,97 @@ Next steps from the current known-good baseline:
 4. Validate replay control/command handling back to Teensy
 5. If desired later, retest SD clock upward from `26 MHz` only as a controlled optimization task
 
+## Replay Addendum
+
+Follow-on validation after the original integrated bring-up completed the replay
+path using the main `Teensy_ESP_AIR_GND` firmware pair.
+
+### Key replay tooling now present on AIR
+
+- `verifylog`
+- `expandlogs`
+- `comparelogs <src> <dst>`
+- `replaycapture`
+- `replaycapfile <name>`
+- `latestlog`
+- `latestlogsession <n>`
+- `logstartid <n>`
+
+### Replay bug found and fixed
+
+A replay-specific structural bug was identified on the Teensy side:
+
+- replay IMU samples were entering the same frame queue as live IMU samples
+- replay mode was still using the normal frame-averaging path
+- the averaged frame path dropped the `processed_body` marker
+- replayed body-frame accel/mag samples could then be transformed a second time
+
+Fixes retained:
+
+- preserve `processed_body` through averaged frames
+- in replay mode, consume one queued replay frame at a time instead of averaging
+- preserve replay source `seq` / `t_us`
+- snapshot non-fusion source fields per replay record
+
+### Stationary replay validation
+
+Source / output pair:
+
+- `air_130_238447.tlog`
+- `air_131_316437.tlog`
+
+Result:
+
+- `dst_prefix=6`
+- `imu_mismatch=0`
+- `mag_mismatch=0`
+- `gps_mismatch=0`
+- `baro_mismatch=0`
+- `mask_mismatch=0`
+- `roll_mean_abs=0.018657`
+- `pitch_mean_abs=0.124635`
+- `yaw_mean_abs=0.132151`
+- `maghdg_mean_abs=0.019909`
+
+Interpretation:
+
+- replay is now correct for stationary data apart from the bounded startup
+  alignment prefix
+
+### Motion replay validation
+
+Source / output pair:
+
+- `air_140_478029.tlog`
+- `air_141_554078.tlog`
+
+Result:
+
+- `dst_prefix=7`
+- `imu_mismatch=0`
+- `mag_mismatch=0`
+- `gps_mismatch=0`
+- `baro_mismatch=0`
+- `mask_mismatch=0`
+- `roll_mean_abs=0.834425`
+- `pitch_mean_abs=0.722921`
+- `yaw_mean_abs=0.999702`
+- `maghdg_mean_abs=0.022302`
+
+Replay-fusion diagnostics:
+
+- replay accel input matched source closely:
+  - `accel_input_mean_abs=(0.000254,0.000253,0.000249)`
+- motion replay showed genuine filter behavior:
+  - `accel_ignored=23`
+  - `mag_ignored=331`
+
+Interpretation:
+
+- no remaining replay sign reversal was observed
+- remaining motion differences are now attributable to fusion/rejection behavior
+  rather than replay corruption
+
 ## Conclusion
 
 The system is no longer in a bench-only state. The integrated stack is functioning with:
@@ -238,8 +329,9 @@ The system is no longer in a bench-only state. The integrated stack is functioni
 - `spi_fail=0` in normal live operation
 - stable AIR SD capture at `26 MHz`
 - validated coexistence of transport and SD logging/capture paths
+- validated replay path suitable for offline fusion-algorithm development
 
 The main remaining work is now feature validation of:
-- live recording behavior
-- replay behavior
+- live recording behavior through the GUI
+- replay behavior through the GUI
 rather than basic transport bring-up.

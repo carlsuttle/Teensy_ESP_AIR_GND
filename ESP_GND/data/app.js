@@ -37,6 +37,9 @@ let lastBinarySeq = 0;
 let lastSourceSeq = 0;
 let lastSourceTus = 0;
 let lastEspRxMs = 0;
+let lastStateFromWs = false;
+let lastFallbackStateSeq = 0;
+let lastFallbackStateAt = 0;
 let lastStateGapTotal = 0;
 let lastStateDropTotal = 0;
 let dqiScore = null;
@@ -170,7 +173,7 @@ const STATE_HARD_STALE_COOLDOWN_MS = 5000;
 const FILE_OP_STALE_GRACE_MS = 5000;
 const RENDER_PERIOD_MS = 50;
 const LINK_RENDER_PERIOD_MS = 250;
-const LINK_STATUS_PERIOD_MS = 1000;
+const LINK_STATUS_PERIOD_MS = 250;
 const PING_AVG_WINDOW = 30;
 const CLIENT_EVENT_CAPACITY = 256;
 const FUSION_SAMPLE_RATE_HZ = 400;
@@ -611,6 +614,70 @@ function applyReplayStatus(replayStatus = null) {
   linkStatus.air_replay_last_change_ms = Number(replayStatus.last_change_ms ?? 0);
 }
 
+function applyPolledState(state = null, seq = 0, tUs = 0, espRxMs = 0) {
+  if (!state) return;
+  const now = Date.now();
+  if (seq !== 0 && seq !== lastFallbackStateSeq) {
+    if (lastFallbackStateAt > 0) {
+      const dtMs = now - lastFallbackStateAt;
+      if (dtMs > 0) clientStateFps = 1000 / dtMs;
+    }
+    lastFallbackStateSeq = seq;
+    lastFallbackStateAt = now;
+  }
+
+  lastStateAt = now;
+  lastStateFromWs = false;
+  lastSourceSeq = Number(seq ?? 0);
+  lastSourceTus = Number(tUs ?? 0);
+  lastEspRxMs = Number(espRxMs ?? 0);
+
+  latestAtt = {
+    r: Number(state.roll_deg ?? 0),
+    p: Number(state.pitch_deg ?? 0),
+    y: Number(state.yaw_deg ?? 0),
+    mh: Number(state.mag_heading_deg ?? 0)
+  };
+  latestGps = {
+    it: Number(state.iTOW_ms ?? 0),
+    fx: Number(state.fixType ?? 0),
+    sv: Number(state.numSV ?? 0),
+    la: Number(state.lat_1e7 ?? 0) * 1e-7,
+    lo: Number(state.lon_1e7 ?? 0) * 1e-7,
+    hm: Number(state.hMSL_mm ?? 0) / 1000.0,
+    gs: Number(state.gSpeed_mms ?? 0) / 1000.0,
+    cr: Number(state.headMot_1e5deg ?? 0) / 100000.0,
+    ha: Number(state.hAcc_mm ?? 0) / 1000.0,
+    sa: Number(state.sAcc_mms ?? 0) / 1000.0,
+    pe: Number(state.gps_parse_errors ?? 0),
+    lgm: Number(state.last_gps_ms ?? 0)
+  };
+  latestBaro = {
+    t: Number(state.baro_temp_c ?? 0),
+    p: Number(state.baro_press_hpa ?? 0),
+    a: Number(state.baro_alt_m ?? 0),
+    v: Number(state.baro_vsi_mps ?? 0),
+    lbm: Number(state.last_baro_ms ?? 0)
+  };
+  fusionLast = {
+    gain: Number(state.fusion_gain ?? 0),
+    accelerationRejection: Number(state.fusion_accel_rej ?? 0),
+    magneticRejection: Number(state.fusion_mag_rej ?? 0),
+    recoveryTriggerPeriod: Number(state.fusion_recovery_period ?? 0)
+  };
+  const stateFlags = Number(state.flags ?? 0);
+  fusionFlagsLast = {
+    initialising: (stateFlags & STATE_FLAG_FUSION_INITIALISING) !== 0,
+    angularRecovery: (stateFlags & STATE_FLAG_FUSION_ANGULAR_RECOVERY) !== 0,
+    accelerationRecovery: (stateFlags & STATE_FLAG_FUSION_ACCELERATION_RECOVERY) !== 0,
+    magneticRecovery: (stateFlags & STATE_FLAG_FUSION_MAGNETIC_RECOVERY) !== 0,
+    accelerationError: (stateFlags & STATE_FLAG_FUSION_ACCELERATION_ERROR) !== 0,
+    accelerometerIgnored: (stateFlags & STATE_FLAG_FUSION_ACCELEROMETER_IGNORED) !== 0,
+    magneticError: (stateFlags & STATE_FLAG_FUSION_MAGNETIC_ERROR) !== 0,
+    magnetometerIgnored: (stateFlags & STATE_FLAG_FUSION_MAGNETOMETER_IGNORED) !== 0
+  };
+}
+
 function setRecorderUi(enabled, known = true) {
   recEl.classList.remove("on", "off", "unknown");
   if (!known) {
@@ -642,32 +709,50 @@ function resetPingStats() {
   pingSamples = [];
 }
 
-function resetLocalCounters() {
-  resetPingStats();
+function resetUplinkTelemetryStats() {
+  uplinkDqiScore = null;
+  uplinkDqiSmoothed = null;
+  uplinkDqiDetail = null;
+  lastUplinkPingTimeout = 0;
+}
+
+function resetStateTelemetryStats() {
   wsLoss = 0;
   wsSeen = 0;
   lastWsSeq = 0;
+  lastStateAt = 0;
   binaryRxCount = 0;
   binaryParseFailCount = 0;
   clientStateFps = 0;
   binaryRxCountLast = 0;
   binaryRxFpsLastMs = 0;
+  radioStateFps = null;
+  lastRadioStatePackets = null;
+  lastRadioStatusAt = 0;
   lastBinarySeq = 0;
   lastSourceSeq = 0;
   lastSourceTus = 0;
   lastEspRxMs = 0;
+  lastStateFromWs = false;
+  lastFallbackStateSeq = 0;
+  lastFallbackStateAt = 0;
   lastStateGapTotal = 0;
   lastStateDropTotal = 0;
   dqiScore = null;
   dqiSmoothed = null;
   dqiDetail = null;
-  uplinkDqiScore = null;
-  uplinkDqiSmoothed = null;
-  uplinkDqiDetail = null;
-  lastUplinkPingTimeout = 0;
   lossWinStart = 0;
   lossWinSeen = 0;
   lossWinLost = 0;
+  forceStateRecoveryRender = true;
+  uiDirty = true;
+  linkDirty = true;
+}
+
+function resetLocalCounters() {
+  resetPingStats();
+  resetStateTelemetryStats();
+  resetUplinkTelemetryStats();
   ctrlCloseCode = "-";
   ctrlCloseReason = "-";
   ctrlCloseClean = "-";
@@ -759,12 +844,20 @@ async function fetchStatus() {
     const resp = await fetch("/api/status", { cache: "no-store" });
     if (!resp.ok) throw new Error(`status ${resp.status}`);
     const data = await resp.json();
+    const wasAirFresh = !!linkStatus.air_link_fresh;
+    const wasReplayActive = !!linkStatus.air_replay_active;
+    const priorStatePackets = Number(linkStatus.state_packets ?? 0);
     linkStatus = {
       ...linkStatus,
       ...data
     };
     const now = Date.now();
     const statePackets = Number(linkStatus.state_packets ?? 0);
+    if ((!wasAirFresh && !!linkStatus.air_link_fresh) ||
+        (priorStatePackets > 0 && statePackets < priorStatePackets) ||
+        (wasReplayActive && !linkStatus.air_replay_active)) {
+      resetUplinkTelemetryStats();
+    }
     if (lastRadioStatusAt > 0 && lastRadioStatePackets !== null && statePackets >= lastRadioStatePackets) {
       const dtMs = now - lastRadioStatusAt;
       if (dtMs > 0) {
@@ -772,6 +865,10 @@ async function fetchStatus() {
       }
     } else if (lastRadioStatePackets !== null && statePackets < lastRadioStatePackets) {
       radioStateFps = null;
+    }
+    const wsFresh = lastStateFromWs && isFresh(lastStateAt, STATE_STALE_MS);
+    if (data.has_state && data.state && !wsFresh) {
+      applyPolledState(data.state, Number(data.seq ?? 0), Number(data.t_us ?? 0), Number(data.last_rx_ms ?? 0));
     }
     updateDataQuality();
     updateUplinkDataQuality();
@@ -1446,12 +1543,14 @@ function renderStale() {
 
 function renderHeader() {
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
-  const headerDqi = dqiSmoothed === null
-    ? uplinkDqiSmoothed
-    : (uplinkDqiSmoothed === null ? dqiSmoothed : Math.min(dqiSmoothed, uplinkDqiSmoothed));
-  const dqiValueTxt = headerDqi === null ? "--" : String(headerDqi);
+  const linkDqi = uplinkDqiSmoothed;
+  const uiDqi = dqiSmoothed;
+  const linkDqiTxt = linkDqi === null ? "--" : String(linkDqi);
+  const uiDqiTxt = uiDqi === null ? "--" : String(uiDqi);
+  const linkBadge = `<span class="${dqiBadgeClass(linkDqi)}">LINK:${linkDqiTxt}</span>`;
+  const uiBadge = `<span class="${dqiBadgeClass(uiDqi)}">UI:${uiDqiTxt}</span>`;
   statsEl.innerHTML =
-    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span><span class="${dqiBadgeClass(headerDqi)}">DQI:${dqiValueTxt}</span></span>`;
+    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span>${linkBadge}${uiBadge}</span>`;
 }
 
 function renderGpsPanel() {
@@ -1717,6 +1816,7 @@ function handleBinaryStateMessage(buf) {
 
   binaryRxCount++;
   lastStateAt = Date.now();
+  lastStateFromWs = true;
   const wsSeq = Number(m.w || 0);
   lastBinarySeq = wsSeq;
   lastSourceSeq = Number(m.ss || 0);
@@ -1902,7 +2002,6 @@ function connectCtrl() {
     resetPingStats();
     updateStatus();
     requestFusionSnapshot();
-    requestLogStatus();
     requestReplayStatus();
     connectState();
     uiDirty = true;
@@ -1976,19 +2075,13 @@ function connectState() {
     recordClientEvent("state", "open");
     hasStateConnectedOnce = true;
     lastStateSocketOpenAt = Date.now();
-    lastStateAt = 0;
-    forceStateRecoveryRender = true;
+    resetStateTelemetryStats();
     lastForcedStateResetAt = 0;
     holdTelemetryFresh(STATE_STARTUP_GRACE_MS);
     stateCloseCode = "-";
     stateCloseReason = "-";
     stateCloseClean = "-";
-    wsLoss = 0;
-    wsSeen = 0;
-    lastWsSeq = 0;
     lossWinStart = Date.now();
-    lossWinSeen = 0;
-    lossWinLost = 0;
     updateStatus();
     uiDirty = true;
   };

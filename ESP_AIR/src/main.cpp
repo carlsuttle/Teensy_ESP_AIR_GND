@@ -41,13 +41,19 @@ uint32_t g_baseline_duration_ms = 0U;
 uint32_t g_baseline_started_ms = 0U;
 uint32_t g_baseline_stopped_ms = 0U;
 uint32_t g_console_log_session_id = 0U;
+struct ReplayCaptureRun {
+  bool active = false;
+  bool stop_requested = false;
+  uint32_t session_id = 0U;
+  uint32_t started_ms = 0U;
+} g_replay_capture = {};
 uint32_t g_last_radio_tx_packets = 0U;
 uint32_t g_last_radio_rx_packets = 0U;
 uint32_t g_last_source_seq_seen = 0U;
 uint32_t g_last_source_progress_ms = 0U;
 uint32_t g_last_radio_progress_ms = 0U;
 uint32_t g_last_radio_recovery_ms = 0U;
-constexpr bool kEnableAirFileLogging = false;
+constexpr bool kEnableAirFileLogging = true;
 constexpr size_t kStateTxReserveSlots = 4U;
 constexpr uint32_t kRadioProgressTimeoutMs = 6000U;
 constexpr uint32_t kRadioRecoveryCooldownMs = 10000U;
@@ -68,6 +74,18 @@ void beginBaselineBenchmark(uint32_t duration_ms);
 void stopBaselineBenchmark();
 void printBaselineImpactReport();
 void printAirLogStatus();
+bool beginReplayCapture(const String* source_override = nullptr);
+void serviceReplayCapture();
+
+String shortLogName(const String& path) {
+  return path.startsWith("/logs/") ? path.substring(6) : path;
+}
+
+uint32_t nextConsoleLogSessionId() {
+  g_console_log_session_id++;
+  if (g_console_log_session_id == 0U) g_console_log_session_id = 1U;
+  return g_console_log_session_id;
+}
 
 void stopGpioPulse() {
   if (!g_gpio_pulse_active) return;
@@ -159,8 +177,17 @@ void printConsoleHelp() {
   Serial.println("  sdcapstop     - stop active SD capture benchmark");
   Serial.println("  sdcapstat     - print SD capture benchmark status");
   Serial.println("  logstart      - start real AIR SD logging session");
+  Serial.println("  logstartid <n> - start real AIR SD logging with an explicit session id");
   Serial.println("  logstop       - stop real AIR SD logging session");
   Serial.println("  logstat       - print real AIR SD logging status");
+  Serial.println("  latestlog     - print latest .tlog on SD");
+  Serial.println("  latestlogsession <n> - print latest .tlog for a given session id");
+  Serial.println("  verifylog     - copy latest .tlog to *_copy.tlog and verify byte-exact match");
+  Serial.println("  expandlogs    - expand every .tlog on SD into a sibling .csv file");
+  Serial.println("  comparelogs a b - compare two .tlog files, ignoring fusion outputs");
+  Serial.println("  replaycapture - replay latest .tlog into Teensy while logging returned state");
+  Serial.println("  replaycapfile <name> - replay a specific .tlog into Teensy while logging returned state");
+  Serial.println("  replaycapstat - print replay-capture progress");
   Serial.println("  setpin <gpio> - drive a GPIO high for 5 seconds, then return it low");
   Serial.println("  tx1           - send current state once to GND");
   Serial.println("  linkclear     - clear AIR radio-link state and stop ESP-NOW");
@@ -342,6 +369,94 @@ void printAirLogStatus() {
                 (unsigned long)stats.max_write_bytes);
 }
 
+bool beginReplayCapture(const String* source_override) {
+  if (g_replay_capture.active) {
+    Serial.println("AIRREPLAYCAP START ok=0 reason=already_active");
+    return false;
+  }
+  if (log_store::busy()) {
+    Serial.println("AIRREPLAYCAP START ok=0 reason=logger_busy");
+    return false;
+  }
+  if (replay_bridge::active()) {
+    Serial.println("AIRREPLAYCAP START ok=0 reason=replay_busy");
+    return false;
+  }
+
+  String source_name;
+  if (source_override && !source_override->isEmpty()) {
+    source_name = *source_override;
+  } else if (!log_store::latestLogName(source_name)) {
+    Serial.println("AIRREPLAYCAP START ok=0 reason=no_source_log");
+    return false;
+  }
+
+  const uint32_t session_id = nextConsoleLogSessionId();
+  radio_link::setRecorderEnabled(true);
+  if (!log_store::startSession(session_id)) {
+    Serial.printf("AIRREPLAYCAP START ok=0 reason=logstart_failed session=%lu\r\n",
+                  (unsigned long)session_id);
+    return false;
+  }
+
+  const String capture_name = log_store::currentFileName();
+  if (!replay_bridge::startFile(source_name)) {
+    log_store::stopSession();
+    Serial.printf("AIRREPLAYCAP START ok=0 reason=replay_start_failed src=%s session=%lu\r\n",
+                  shortLogName(source_name).c_str(),
+                  (unsigned long)session_id);
+    return false;
+  }
+
+  g_replay_capture.active = true;
+  g_replay_capture.stop_requested = false;
+  g_replay_capture.session_id = session_id;
+  g_replay_capture.started_ms = millis();
+
+  const auto replay = replay_bridge::status();
+  Serial.printf("AIRREPLAYCAP START ok=1 src=%s dst=%s session=%lu records_total=%lu\r\n",
+                shortLogName(source_name).c_str(),
+                shortLogName(capture_name).c_str(),
+                (unsigned long)session_id,
+                (unsigned long)replay.records_total);
+  return true;
+}
+
+void serviceReplayCapture() {
+  if (!g_replay_capture.active) return;
+
+  const auto replay = replay_bridge::status();
+  if (!g_replay_capture.stop_requested && !replay_bridge::active()) {
+    g_replay_capture.stop_requested = true;
+    log_store::stopSession();
+    Serial.printf("AIRREPLAYCAP STOP requested=1 sent=%lu total=%lu last_error=%lu\r\n",
+                  (unsigned long)replay.records_sent,
+                  (unsigned long)replay.records_total,
+                  (unsigned long)replay.last_error);
+    return;
+  }
+
+  if (!g_replay_capture.stop_requested || log_store::busy()) return;
+
+  const auto recorder = log_store::recorderStatus();
+  const auto stats = log_store::stats();
+  const uint32_t elapsed_ms = millis() - g_replay_capture.started_ms;
+  String closed_name;
+  (void)log_store::latestLogNameForSession(g_replay_capture.session_id, closed_name);
+  Serial.printf(
+      "AIRREPLAYCAP RESULT ok=%u elapsed_ms=%lu dst=%s session=%lu sent=%lu total=%lu bytes=%lu written=%lu dropped=%lu\r\n",
+      (replay.last_error == 0U) ? 1U : 0U,
+      (unsigned long)elapsed_ms,
+      shortLogName(closed_name).c_str(),
+      (unsigned long)g_replay_capture.session_id,
+      (unsigned long)replay.records_sent,
+      (unsigned long)replay.records_total,
+      (unsigned long)recorder.bytes_written,
+      (unsigned long)stats.records_written,
+      (unsigned long)stats.dropped);
+  g_replay_capture = ReplayCaptureRun{};
+}
+
 void handleConsoleCommands() {
   while (Serial.available() > 0) {
     const char c = (char)Serial.read();
@@ -387,20 +502,82 @@ void handleConsoleCommands() {
         const auto cap = sd_capture_test::stats();
         sd_capture_test::printReport(Serial, cap);
       } else if (strcmp(g_console_line, "logstart") == 0) {
-        g_console_log_session_id++;
-        if (g_console_log_session_id == 0U) g_console_log_session_id = 1U;
+        const uint32_t session_id = nextConsoleLogSessionId();
         radio_link::setRecorderEnabled(true);
-        const bool ok = log_store::startSession(g_console_log_session_id);
+        const bool ok = log_store::startSession(session_id);
         Serial.printf("AIRLOG START ok=%u session=%lu\r\n",
                       ok ? 1U : 0U,
-                      (unsigned long)g_console_log_session_id);
+                      (unsigned long)session_id);
         printAirLogStatus();
+      } else if (strncmp(g_console_line, "logstartid ", 11) == 0) {
+        unsigned session_id = 0U;
+        if (sscanf(g_console_line + 11, "%u", &session_id) == 1 && session_id != 0U) {
+          g_console_log_session_id = (uint32_t)session_id;
+          radio_link::setRecorderEnabled(true);
+          const bool ok = log_store::startSession((uint32_t)session_id);
+          Serial.printf("AIRLOG START ok=%u session=%u\r\n", ok ? 1U : 0U, session_id);
+          printAirLogStatus();
+        } else {
+          Serial.println("AIRLOG usage: logstartid <session>");
+        }
       } else if (strcmp(g_console_line, "logstop") == 0) {
         log_store::stopSession();
         Serial.println("AIRLOG STOP requested=1");
         printAirLogStatus();
       } else if (strcmp(g_console_line, "logstat") == 0) {
         printAirLogStatus();
+      } else if (strcmp(g_console_line, "latestlog") == 0) {
+        String latest_name;
+        const bool ok = log_store::latestLogName(latest_name);
+        Serial.printf("AIRLOG latest_ok=%u file=%s\r\n",
+                      ok ? 1U : 0U,
+                      ok ? shortLogName(latest_name).c_str() : "(none)");
+      } else if (strncmp(g_console_line, "latestlogsession ", 17) == 0) {
+        unsigned session_id = 0U;
+        if (sscanf(g_console_line + 17, "%u", &session_id) == 1 && session_id != 0U) {
+          String latest_name;
+          const bool ok = log_store::latestLogNameForSession((uint32_t)session_id, latest_name);
+          Serial.printf("AIRLOG latest_session_ok=%u session=%u file=%s\r\n",
+                        ok ? 1U : 0U,
+                        session_id,
+                        ok ? shortLogName(latest_name).c_str() : "(none)");
+        } else {
+          Serial.println("AIRLOG usage: latestlogsession <session>");
+        }
+      } else if (strcmp(g_console_line, "verifylog") == 0 || strcmp(g_console_line, "copylog") == 0) {
+        const bool ok = log_store::copyLatestLogAndVerify(Serial);
+        Serial.printf("AIRVERIFY RESULT ok=%u\r\n", ok ? 1U : 0U);
+      } else if (strcmp(g_console_line, "expandlogs") == 0 || strcmp(g_console_line, "expandcsv") == 0) {
+        const bool ok = log_store::exportAllLogsToCsv(Serial);
+        Serial.printf("AIRCSV RESULT ok=%u\r\n", ok ? 1U : 0U);
+      } else if (strncmp(g_console_line, "comparelogs ", 12) == 0) {
+        char src_name[48] = {};
+        char dst_name[48] = {};
+        if (sscanf(g_console_line + 12, "%47s %47s", src_name, dst_name) == 2) {
+          const bool ok = log_store::compareLogs(Serial, String(src_name), String(dst_name));
+          Serial.printf("AIRCOMPARE RESULT ok=%u\r\n", ok ? 1U : 0U);
+        } else {
+          Serial.println("AIRCOMPARE usage: comparelogs <src.tlog> <dst.tlog>");
+        }
+      } else if (strcmp(g_console_line, "replaycapture") == 0 || strcmp(g_console_line, "replaycap") == 0) {
+        (void)beginReplayCapture(nullptr);
+      } else if (strncmp(g_console_line, "replaycapfile ", 14) == 0) {
+        String source_name = String(g_console_line + 14);
+        source_name.trim();
+        if (source_name.length() == 0) {
+          Serial.println("AIRREPLAYCAP usage: replaycapfile <file.tlog>");
+        } else {
+          (void)beginReplayCapture(&source_name);
+        }
+      } else if (strcmp(g_console_line, "replaycapstat") == 0) {
+        const auto replay = replay_bridge::status();
+        Serial.printf("AIRREPLAYCAP active=%u stop_requested=%u session=%lu sent=%lu total=%lu last_error=%lu\r\n",
+                      g_replay_capture.active ? 1U : 0U,
+                      g_replay_capture.stop_requested ? 1U : 0U,
+                      (unsigned long)g_replay_capture.session_id,
+                      (unsigned long)replay.records_sent,
+                      (unsigned long)replay.records_total,
+                      (unsigned long)replay.last_error);
       } else if (strncmp(g_console_line, "setpin ", 7) == 0) {
         unsigned pin = 0U;
         if (sscanf(g_console_line + 7, "%u", &pin) == 1 && pin <= 48U) {
@@ -687,6 +864,7 @@ void loop() {
   serviceGpioPulse();
   sd_capture_test::poll();
   log_store::poll();
+  serviceReplayCapture();
   if (g_baseline_active &&
       (uint32_t)(millis() - g_baseline_started_ms) >= g_baseline_duration_ms) {
     stopBaselineBenchmark();

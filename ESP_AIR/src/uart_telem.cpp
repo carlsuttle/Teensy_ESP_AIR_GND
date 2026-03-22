@@ -4,6 +4,7 @@
 
 #include "config_store.h"
 #include "log_store.h"
+#include "replay_bridge.h"
 #include "sd_capture_test.h"
 #include "spi_bridge.h"
 
@@ -28,7 +29,7 @@ uint32_t g_ack_rx_seq = 0U;
 uint16_t g_ack_command = 0U;
 bool g_ack_ok = false;
 uint32_t g_ack_code = 0U;
-constexpr uint16_t kPendingStateDepth = 256U;
+constexpr uint16_t kPendingStateDepth = 128U;
 PendingState g_pending_states[kPendingStateDepth] = {};
 uint16_t g_pending_head = 0U;
 uint16_t g_pending_tail = 0U;
@@ -125,8 +126,12 @@ void poll() {
   while (spi_bridge::popStateRecord(record, sizeof(record))) {
     telem::TelemetryFullStateV1 tmp = {};
     memcpy(&tmp, record, sizeof(tmp));
-    const uint32_t seq = ++g_local_state_seq;
-    const uint32_t t_us = micros();
+    uint32_t seq = 0U;
+    uint32_t t_us = 0U;
+    if (!replay_bridge::takeOutputSourceStamp(seq, t_us)) {
+      seq = ++g_local_state_seq;
+      t_us = micros();
+    }
 
     portENTER_CRITICAL(&g_mux);
     g_state = tmp;

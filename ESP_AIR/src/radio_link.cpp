@@ -783,6 +783,7 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
+      log_store::probeBackend();
       g_log_last_command = hdr.msg_type;
       sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
       break;

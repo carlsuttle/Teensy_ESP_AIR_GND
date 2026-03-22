@@ -19,9 +19,12 @@ struct Status {
 void begin();
 void poll();
 bool startLatest();
+bool startFile(const String& file_name);
 void stop();
 Status status();
 telem::ReplayStatusPayloadV1 currentPayload();
 bool takeStatusDirty();
+bool active();
+bool takeOutputSourceStamp(uint32_t& seq, uint32_t& t_us);
 
 }  // namespace replay_bridge

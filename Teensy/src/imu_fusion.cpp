@@ -17,6 +17,7 @@ bool readRawMag(float& mx, float& my, float& mz);
 namespace {
 BMI2_BMM1_Class g_imu(Wire);
 bool g_ready = false;
+bool g_replayMode = false;
 
 FusionOffset g_offset;
 FusionAhrs g_ahrs;
@@ -128,19 +129,66 @@ struct ImuFrame {
   float mx = 0.0f;
   float my = 0.0f;
   float mz = 0.0f;
+  uint32_t t_us = 0U;
   bool valid = false;
+  bool processed_body = false;
 };
 
 constexpr uint8_t kImuFrameQueueDepth = 4;
+constexpr uint8_t kReplayDebugQueueDepth = 64;
 constexpr bool kUseFrameAveraging = true;
 constexpr bool kUseGyroOffsetFilter = true;
 ImuFrame g_frameQueue[kImuFrameQueueDepth];
 uint8_t g_frameHead = 0;
 uint8_t g_frameTail = 0;
 uint8_t g_frameCount = 0;
+FusionReplayDebug g_replayDebugQueue[kReplayDebugQueueDepth] = {};
+uint8_t g_replayDebugHead = 0U;
+uint8_t g_replayDebugTail = 0U;
+uint8_t g_replayDebugCount = 0U;
 uint32_t g_nextReadUs = 0;
 uint32_t g_nextFusionUs = 0;
 uint32_t g_lastFusionUpdateUs = 0;
+
+void clearFrameQueue() {
+  g_frameHead = 0U;
+  g_frameTail = 0U;
+  g_frameCount = 0U;
+}
+
+void clearReplayDebugQueue() {
+  g_replayDebugHead = 0U;
+  g_replayDebugTail = 0U;
+  g_replayDebugCount = 0U;
+}
+
+void queueReplayDebug() {
+  FusionReplayDebug dbg = {};
+  const FusionAhrsInternalStates internal = FusionAhrsGetInternalStates(&g_ahrs);
+  dbg.accelBodyX = g_last_accel_body.axis.x;
+  dbg.accelBodyY = g_last_accel_body.axis.y;
+  dbg.accelBodyZ = g_last_accel_body.axis.z;
+  dbg.magFusionX = g_last_mag_fusion.axis.x;
+  dbg.magFusionY = g_last_mag_fusion.axis.y;
+  dbg.magFusionZ = g_last_mag_fusion.axis.z;
+  dbg.accelerationErrorDeg = internal.accelerationError;
+  dbg.magneticErrorDeg = internal.magneticError;
+  dbg.accelerometerIgnored = internal.accelerometerIgnored;
+  dbg.magnetometerIgnored = internal.magnetometerIgnored;
+  if (g_replayDebugCount >= kReplayDebugQueueDepth) {
+    g_replayDebugTail = (uint8_t)((g_replayDebugTail + 1U) % kReplayDebugQueueDepth);
+    g_replayDebugCount--;
+  }
+  g_replayDebugQueue[g_replayDebugHead] = dbg;
+  g_replayDebugHead = (uint8_t)((g_replayDebugHead + 1U) % kReplayDebugQueueDepth);
+  g_replayDebugCount++;
+}
+
+void resetFusionSchedulers() {
+  g_nextReadUs = 0U;
+  g_nextFusionUs = 0U;
+  g_lastFusionUpdateUs = 0U;
+}
 
 void queueFrame(const ImuFrame& f) {
   if (g_frameCount >= kImuFrameQueueDepth) {
@@ -158,14 +206,18 @@ bool takeAveragedFrame(ImuFrame& out) {
   double sumAx = 0.0, sumAy = 0.0, sumAz = 0.0;
   double sumGx = 0.0, sumGy = 0.0, sumGz = 0.0;
   double sumMx = 0.0, sumMy = 0.0, sumMz = 0.0;
+  uint32_t latest_t_us = 0U;
   uint8_t n = 0;
+  bool all_processed_body = true;
   while (g_frameCount > 0U) {
     const ImuFrame& f = g_frameQueue[g_frameTail];
     if (f.valid) {
       sumAx += f.ax; sumAy += f.ay; sumAz += f.az;
       sumGx += f.gx; sumGy += f.gy; sumGz += f.gz;
       sumMx += f.mx; sumMy += f.my; sumMz += f.mz;
+      latest_t_us = f.t_us;
       n++;
+      all_processed_body = all_processed_body && f.processed_body;
     }
     g_frameTail = (uint8_t)((g_frameTail + 1U) % kImuFrameQueueDepth);
     g_frameCount--;
@@ -181,8 +233,18 @@ bool takeAveragedFrame(ImuFrame& out) {
   out.mx = (float)(sumMx * invN);
   out.my = (float)(sumMy * invN);
   out.mz = (float)(sumMz * invN);
+  out.t_us = latest_t_us;
   out.valid = true;
+  out.processed_body = all_processed_body;
   return true;
+}
+
+bool takeQueuedFrame(ImuFrame& out) {
+  if (g_frameCount == 0U) return false;
+  out = g_frameQueue[g_frameTail];
+  g_frameTail = (uint8_t)((g_frameTail + 1U) % kImuFrameQueueDepth);
+  g_frameCount--;
+  return out.valid;
 }
 
 bool readImuFrame(ImuFrame& out) {
@@ -205,7 +267,9 @@ bool readImuFrame(ImuFrame& out) {
   out.mx = g_mx;
   out.my = g_my;
   out.mz = g_mz;
+  out.t_us = micros();
   out.valid = true;
+  out.processed_body = false;
   return true;
 }
 
@@ -318,6 +382,72 @@ FusionVector currentMagBodyVector(float mx, float my, float mz) {
   return calibratedMagSensorToBodyFrame({mx, my, mz});
 }
 
+void applyFrameToState(const ImuFrame& f, State& s) {
+  FusionVector gyro = {f.gx, f.gy, f.gz};
+  FusionVector accelBody = {f.ax, f.ay, f.az};
+  FusionVector magBody = {};
+
+  if (f.processed_body) {
+    magBody = {f.mx, f.my, f.mz};
+  } else {
+    magBody = currentMagBodyVector(f.mx, f.my, f.mz);
+    gyro = FusionCalibrationInertial(gyro, kGyroMisalignment, kGyroSensitivity, g_gyroOffset);
+    accelBody = FusionCalibrationInertial(accelBody, kAccelMisalignment, kAccelSensitivity, g_accelOffset);
+    gyro = sensorFrameToBodyFrame(gyro);
+    accelBody = sensorFrameToBodyFrame(accelBody);
+    accelBody.axis.x *= g_accelScale;
+    accelBody.axis.y *= g_accelScale;
+    accelBody.axis.z *= g_accelScale;
+  }
+
+  const FusionVector magFusion = magBodyToFusionNed(magBody);
+  g_last_accel_body = accelBody;
+  g_last_mag_body = magBody;
+  g_last_mag_fusion = magFusion;
+  FusionVector accel = accelBody;
+  accel.axis.x /= kGravityMps2;
+  accel.axis.y /= kGravityMps2;
+  accel.axis.z /= kGravityMps2;
+  if (!f.processed_body && kUseGyroOffsetFilter) {
+    gyro = FusionOffsetUpdate(&g_offset, gyro);
+  }
+
+  const uint32_t sample_t_us = (f.t_us != 0U) ? f.t_us : micros();
+  float dtSec = kFusionDtSec;
+  if (g_lastFusionUpdateUs != 0U) {
+    dtSec = (float)(sample_t_us - g_lastFusionUpdateUs) * 1.0e-6f;
+    if (!isfinite(dtSec) || dtSec < kMinFusionDtSec || dtSec > kMaxFusionDtSec) {
+      dtSec = kFusionDtSec;
+    }
+  }
+  g_lastFusionUpdateUs = sample_t_us;
+
+  const float headingDeg = computeHeadingDeg(magBody.axis.x, magBody.axis.y);
+  FusionAhrsUpdate(&g_ahrs, gyro, accel, magFusion, dtSec);
+  s.accel_x_mps2 = accelBody.axis.x;
+  s.accel_y_mps2 = accelBody.axis.y;
+  s.accel_z_mps2 = accelBody.axis.z;
+  s.gyro_x_dps = gyro.axis.x;
+  s.gyro_y_dps = gyro.axis.y;
+  s.gyro_z_dps = gyro.axis.z;
+  s.mag_x_uT = magBody.axis.x;
+  s.mag_y_uT = magBody.axis.y;
+  s.mag_z_uT = magBody.axis.z;
+  const FusionQuaternion q = FusionAhrsGetQuaternion(&g_ahrs);
+  const FusionEuler e = FusionQuaternionToEuler(q);
+  const FusionMatrix m = FusionQuaternionToMatrix(q);
+  const float fusionHeadingCol = wrapHeading360(FusionRadiansToDegrees(atan2f(m.element.yx, m.element.xx)));
+
+  s.roll = e.angle.roll;
+  s.pitch = e.angle.pitch;
+  s.yaw = wrapHeading180(fusionHeadingCol);
+  s.mag_heading = headingDeg;
+  s.last_imu_ms = millis();
+  if (g_replayMode && f.processed_body) {
+    queueReplayDebug();
+  }
+}
+
 bool begin(Stream* dbg) {
   Wire.setClock(I2C_BUS_HZ);
   const int rc = g_imu.begin(dbg);
@@ -349,6 +479,61 @@ bool begin(Stream* dbg) {
   FusionOffsetInitialise(&g_offset, g_sampleRate);
   FusionAhrsInitialise(&g_ahrs);
   FusionAhrsSetSettings(&g_ahrs, &g_settings);
+  g_replayMode = false;
+  clearFrameQueue();
+  resetFusionSchedulers();
+  return true;
+}
+
+void setReplayMode(bool active) {
+  if (g_replayMode == active) return;
+  g_replayMode = active;
+  if (active) {
+    // Start replay from a clean estimator state so the replayed sensor stream
+    // is not blended with whatever live attitude/bias history was present.
+    FusionOffsetInitialise(&g_offset, g_sampleRate);
+    FusionAhrsInitialise(&g_ahrs);
+    FusionAhrsSetSettings(&g_ahrs, &g_settings);
+  }
+  clearFrameQueue();
+  clearReplayDebugQueue();
+  resetFusionSchedulers();
+}
+
+bool replayMode() {
+  return g_replayMode;
+}
+
+bool takeReplayDebug(FusionReplayDebug& out) {
+  if (g_replayDebugCount == 0U) return false;
+  out = g_replayDebugQueue[g_replayDebugTail];
+  g_replayDebugTail = (uint8_t)((g_replayDebugTail + 1U) % kReplayDebugQueueDepth);
+  g_replayDebugCount--;
+  return true;
+}
+
+bool submitReplaySample(float ax_mps2, float ay_mps2, float az_mps2,
+                        float gx_dps, float gy_dps, float gz_dps,
+                        float mx_uT, float my_uT, float mz_uT,
+                        uint32_t sample_t_us) {
+  if (!g_ready) return false;
+  if (!g_replayMode) {
+    setReplayMode(true);
+  }
+  ImuFrame f = {};
+  f.ax = ax_mps2;
+  f.ay = ay_mps2;
+  f.az = az_mps2;
+  f.gx = gx_dps;
+  f.gy = gy_dps;
+  f.gz = gz_dps;
+  f.mx = mx_uT;
+  f.my = my_uT;
+  f.mz = mz_uT;
+  f.t_us = sample_t_us;
+  f.valid = true;
+  f.processed_body = true;
+  queueFrame(f);
   return true;
 }
 
@@ -625,6 +810,20 @@ void getFusionMagDebug(FusionMagDebug& out) {
   out.earthFromFusionHeading = computeHeadingDeg(magEarthFromFusion.axis.x, magEarthFromFusion.axis.y);
 }
 
+void getFusionReplayDebug(FusionReplayDebug& out) {
+  const FusionAhrsInternalStates internal = FusionAhrsGetInternalStates(&g_ahrs);
+  out.accelBodyX = g_last_accel_body.axis.x;
+  out.accelBodyY = g_last_accel_body.axis.y;
+  out.accelBodyZ = g_last_accel_body.axis.z;
+  out.magFusionX = g_last_mag_fusion.axis.x;
+  out.magFusionY = g_last_mag_fusion.axis.y;
+  out.magFusionZ = g_last_mag_fusion.axis.z;
+  out.accelerationErrorDeg = internal.accelerationError;
+  out.magneticErrorDeg = internal.magneticError;
+  out.accelerometerIgnored = internal.accelerometerIgnored;
+  out.magnetometerIgnored = internal.magnetometerIgnored;
+}
+
 void setDebugMagLive() {
   g_debugMagMode = DebugMagMode::Live;
 }
@@ -652,77 +851,30 @@ void update400Hz(State& s) {
     g_nextFusionUs = nowUs;
   }
 
-  uint32_t readGuard = 0;
-  while ((int32_t)(nowUs - g_nextReadUs) >= 0 && readGuard < 4U) {
-    ImuFrame f{};
-    if (readImuFrame(f)) {
-      queueFrame(f);
+  if (!g_replayMode) {
+    uint32_t readGuard = 0;
+    while ((int32_t)(nowUs - g_nextReadUs) >= 0 && readGuard < 4U) {
+      ImuFrame f{};
+      if (readImuFrame(f)) {
+        queueFrame(f);
+      }
+      g_nextReadUs += kFusionPeriodUs;
+      readGuard++;
     }
-    g_nextReadUs += kFusionPeriodUs;
-    readGuard++;
   }
 
   uint32_t fuseGuard = 0;
-  while ((int32_t)(nowUs - g_nextFusionUs) >= 0 && fuseGuard < 4U) {
+  while (((g_replayMode && g_frameCount > 0U) || (!g_replayMode && (int32_t)(nowUs - g_nextFusionUs) >= 0)) &&
+         fuseGuard < 4U) {
     ImuFrame f{};
-    const bool haveFrame = kUseFrameAveraging ? takeAveragedFrame(f) : takeLatestFrame(f);
+    const bool haveFrame = g_replayMode ? takeQueuedFrame(f)
+                                        : (kUseFrameAveraging ? takeAveragedFrame(f) : takeLatestFrame(f));
     if (haveFrame) {
-      FusionVector gyro = {f.gx, f.gy, f.gz};
-      FusionVector accel = {f.ax, f.ay, f.az};
-      const FusionVector magBody = currentMagBodyVector(f.mx, f.my, f.mz);
-
-      gyro = FusionCalibrationInertial(gyro, kGyroMisalignment, kGyroSensitivity, g_gyroOffset);
-      accel = FusionCalibrationInertial(accel, kAccelMisalignment, kAccelSensitivity, g_accelOffset);
-      gyro = sensorFrameToBodyFrame(gyro);
-      accel = sensorFrameToBodyFrame(accel);
-      const FusionVector magFusion = magBodyToFusionNed(magBody);
-      g_last_accel_body = accel;
-      g_last_mag_body = magBody;
-      g_last_mag_fusion = magFusion;
-      accel.axis.x *= g_accelScale;
-      accel.axis.y *= g_accelScale;
-      accel.axis.z *= g_accelScale;
-      accel.axis.x /= kGravityMps2;
-      accel.axis.y /= kGravityMps2;
-      accel.axis.z /= kGravityMps2;
-      if (kUseGyroOffsetFilter) {
-        gyro = FusionOffsetUpdate(&g_offset, gyro);
-      }
-      const uint32_t fusionNowUs = micros();
-      float dtSec = kFusionDtSec;
-      if (g_lastFusionUpdateUs != 0U) {
-        dtSec = (float)(fusionNowUs - g_lastFusionUpdateUs) * 1.0e-6f;
-        if (!isfinite(dtSec) || dtSec < kMinFusionDtSec || dtSec > kMaxFusionDtSec) {
-          dtSec = kFusionDtSec;
-        }
-      }
-      g_lastFusionUpdateUs = fusionNowUs;
-
-      const float headingDeg = computeHeadingDeg(magBody.axis.x, magBody.axis.y);
-      FusionAhrsUpdate(&g_ahrs, gyro, accel, magFusion, dtSec);
-      s.accel_x_mps2 = accel.axis.x;
-      s.accel_y_mps2 = accel.axis.y;
-      s.accel_z_mps2 = accel.axis.z;
-      s.gyro_x_dps = gyro.axis.x;
-      s.gyro_y_dps = gyro.axis.y;
-      s.gyro_z_dps = gyro.axis.z;
-      s.mag_x_uT = magBody.axis.x;
-      s.mag_y_uT = magBody.axis.y;
-      s.mag_z_uT = magBody.axis.z;
-      const FusionQuaternion q = FusionAhrsGetQuaternion(&g_ahrs);
-      const FusionEuler e = FusionQuaternionToEuler(q);
-      const FusionMatrix m = FusionQuaternionToMatrix(q);
-      const float fusionHeadingCol = wrapHeading360(FusionRadiansToDegrees(atan2f(m.element.yx, m.element.xx)));
-
-      s.roll = e.angle.roll;
-      s.pitch = e.angle.pitch;
-      // Publish compass heading, not raw Euler yaw. Euler yaw couples badly under
-      // large roll/pitch, while the rotation-matrix heading stays stable.
-      s.yaw = wrapHeading180(fusionHeadingCol);
-      s.mag_heading = headingDeg;
-      s.last_imu_ms = millis();
+      applyFrameToState(f, s);
     }
-    g_nextFusionUs += kFusionPeriodUs;
+    if (!g_replayMode) {
+      g_nextFusionUs += kFusionPeriodUs;
+    }
     fuseGuard++;
   }
 }

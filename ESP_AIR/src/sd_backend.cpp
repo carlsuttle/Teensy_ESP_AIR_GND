@@ -13,6 +13,8 @@ constexpr uint8_t kSdMosiPin = 9;
 constexpr uint32_t kInitFrequenciesHz[] = {
     26000000UL,
     20000000UL,
+    10000000UL,
+    4000000UL,
 };
 
 bool g_mounted = false;
@@ -55,8 +57,12 @@ bool beginAtFrequency(uint32_t hz) {
   SD.end();
   g_sd_spi->end();
   prepareSpiPinsForSdInit();
+  delay(5);
   g_sd_spi->begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
+  digitalWrite(kSdCsPin, HIGH);
+  delay(5);
   if (!SD.begin(kSdCsPin, *g_sd_spi, hz)) {
+    g_sd_spi->end();
     g_mounted = false;
     g_init_hz = 0U;
     return false;

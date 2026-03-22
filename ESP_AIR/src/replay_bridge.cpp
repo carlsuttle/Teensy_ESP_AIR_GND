@@ -9,8 +9,8 @@ namespace replay_bridge {
 namespace {
 
 constexpr char kLogDir[] = "/logs";
-constexpr uint32_t kReplayRateHz = 400U;
-constexpr uint32_t kReplayPeriodUs = 1000000UL / kReplayRateHz;
+constexpr uint32_t kReplayMinPeriodUs = 2500U;
+constexpr uint32_t kReplayMaxPeriodUs = 100000U;
 constexpr uint32_t kReplayErrorOpenFailed = 1U;
 constexpr uint32_t kReplayErrorNoLogFound = 2U;
 constexpr uint32_t kReplayErrorShortRead = 3U;
@@ -40,6 +40,16 @@ BinaryLogRecordV2 g_pending = {};
 uint32_t g_next_send_us = 0U;
 uint32_t g_next_session_id = 1U;
 uint32_t g_last_progress_report_ms = 0U;
+uint32_t g_last_record_t_us = 0U;
+struct OutputSourceStamp {
+  uint32_t seq = 0U;
+  uint32_t t_us = 0U;
+};
+constexpr uint8_t kOutputSourceDepth = 8U;
+OutputSourceStamp g_output_source_queue[kOutputSourceDepth] = {};
+uint8_t g_output_source_head = 0U;
+uint8_t g_output_source_tail = 0U;
+uint8_t g_output_source_count = 0U;
 
 void markStatusChanged() {
   g_status.last_change_ms = millis();
@@ -54,6 +64,10 @@ void resetRuntime(bool preserve_session = true) {
   g_pending = {};
   g_next_send_us = 0U;
   g_last_progress_report_ms = 0U;
+  g_last_record_t_us = 0U;
+  g_output_source_head = 0U;
+  g_output_source_tail = 0U;
+  g_output_source_count = 0U;
   const uint32_t session_id = preserve_session ? g_status.session_id : 0U;
   g_status = {};
   g_status.session_id = session_id;
@@ -97,6 +111,23 @@ bool openLatestLog(String& out_name) {
   if (g_file) g_file.close();
   g_file = best_file;
   out_name = best_name;
+  return true;
+}
+
+bool openLogByName(const String& requested_name, String& out_name) {
+  if (!sd_backend::mounted()) {
+    sd_backend::Status backend = {};
+    if (!sd_backend::begin(&backend)) return false;
+  }
+
+  String full_name = requested_name;
+  if (!full_name.startsWith("/")) full_name = String(kLogDir) + "/" + full_name;
+  File file = SD.open(full_name, FILE_READ);
+  if (!file) return false;
+
+  if (g_file) g_file.close();
+  g_file = file;
+  out_name = full_name;
   return true;
 }
 
@@ -163,6 +194,9 @@ bool fillReplayInput(const BinaryLogRecordV2& record, telem::ReplayInputRecord16
   replay.payload.baro_press_milli_hpa = (int32_t)lroundf(state.baro_press_hpa * 1000.0f);
   replay.payload.baro_alt_mm = (int32_t)lroundf(state.baro_alt_m * 1000.0f);
   replay.payload.baro_vsi_milli_mps = (int32_t)lroundf(state.baro_vsi_mps * 1000.0f);
+  memcpy(replay.payload.reserved + 0, &state.last_gps_ms, sizeof(state.last_gps_ms));
+  memcpy(replay.payload.reserved + 4, &state.last_imu_ms, sizeof(state.last_imu_ms));
+  memcpy(replay.payload.reserved + 8, &state.last_baro_ms, sizeof(state.last_baro_ms));
   return true;
 }
 
@@ -180,6 +214,14 @@ bool sendPendingRecord() {
         g_status.last_error = kReplayErrorSendFailed;
         return false;
       }
+      if (g_output_source_count >= kOutputSourceDepth) {
+        g_output_source_tail = (uint8_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
+        g_output_source_count--;
+      }
+      g_output_source_queue[g_output_source_head].seq = g_pending.seq;
+      g_output_source_queue[g_output_source_head].t_us = g_pending.t_us;
+      g_output_source_head = (uint8_t)((g_output_source_head + 1U) % kOutputSourceDepth);
+      g_output_source_count++;
       break;
     }
     case telem::LogRecordKind::ReplayControl160: {
@@ -198,6 +240,13 @@ bool sendPendingRecord() {
 
   g_have_pending = false;
   g_status.records_sent++;
+  uint32_t next_period_us = kReplayMinPeriodUs;
+  if (g_last_record_t_us != 0U && g_pending.t_us > g_last_record_t_us) {
+    const uint32_t delta_us = g_pending.t_us - g_last_record_t_us;
+    next_period_us = constrain(delta_us, kReplayMinPeriodUs, kReplayMaxPeriodUs);
+  }
+  g_last_record_t_us = g_pending.t_us;
+  g_next_send_us = micros() + next_period_us;
   const uint32_t now_ms = millis();
   if (g_last_progress_report_ms == 0U || (uint32_t)(now_ms - g_last_progress_report_ms) >= 250U) {
     g_last_progress_report_ms = now_ms;
@@ -225,11 +274,6 @@ void poll() {
       markStatusChanged();
       break;
     }
-    if (g_next_send_us == 0U) {
-      g_next_send_us = now_us + kReplayPeriodUs;
-    } else {
-      g_next_send_us += kReplayPeriodUs;
-    }
     burst_guard++;
   }
 }
@@ -238,6 +282,27 @@ bool startLatest() {
   resetRuntime(false);
   String file_name;
   if (!openLatestLog(file_name)) {
+    g_status.last_error = sd_backend::mounted() ? kReplayErrorNoLogFound : kReplayErrorOpenFailed;
+    markStatusChanged();
+    return false;
+  }
+
+  g_status.session_id = g_next_session_id++;
+  g_status.records_total = (uint32_t)(g_file.size() / sizeof(BinaryLogRecordV2));
+  g_status.records_sent = 0U;
+  g_status.last_error = 0U;
+  g_status.last_command = telem::CMD_REPLAY_START;
+  g_status.flags = telem::kReplayStatusFlagActive | telem::kReplayStatusFlagFileOpen;
+  g_have_pending = false;
+  g_next_send_us = micros();
+  markStatusChanged();
+  return true;
+}
+
+bool startFile(const String& file_name) {
+  resetRuntime(false);
+  String opened_name;
+  if (!openLogByName(file_name, opened_name)) {
     g_status.last_error = sd_backend::mounted() ? kReplayErrorNoLogFound : kReplayErrorOpenFailed;
     markStatusChanged();
     return false;
@@ -288,6 +353,19 @@ bool takeStatusDirty() {
   const bool dirty = g_status_dirty;
   g_status_dirty = false;
   return dirty;
+}
+
+bool active() {
+  return (g_status.flags & telem::kReplayStatusFlagActive) != 0U;
+}
+
+bool takeOutputSourceStamp(uint32_t& seq, uint32_t& t_us) {
+  if (g_output_source_count == 0U) return false;
+  seq = g_output_source_queue[g_output_source_tail].seq;
+  t_us = g_output_source_queue[g_output_source_tail].t_us;
+  g_output_source_tail = (uint8_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
+  g_output_source_count--;
+  return true;
 }
 
 }  // namespace replay_bridge

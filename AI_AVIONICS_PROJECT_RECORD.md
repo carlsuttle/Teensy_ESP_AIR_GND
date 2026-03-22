@@ -681,10 +681,11 @@ Whenever possible compare against:
 
 ### Current validation gaps
 
-- frame conventions still need a controlled synthetic magnetometer test
-- acceleration rejection behavior during roll and pitch is not fully explained
+- frame conventions still need a controlled synthetic magnetometer test for final sign / earth-body closure
+- acceleration rejection behavior during aggressive motion is now observable in replay, but final tuning is still open
 - SD logging backend has now been validated under integrated transport load at a stable `26 MHz` SD clock
 - SPI/DMA transport has now been integrated into the main avionics firmware path and validated with live web display plus AIR SD capture
+- replay source -> Teensy -> rerecorded file integrity has now been validated for both stationary and motion sessions
 
 ---
 
@@ -703,9 +704,8 @@ Known working or mostly working:
 Current areas under active investigation:
 
 - frame correctness for heading and tilt compensation
-- acceleration rejection during roll / pitch tests
-- replay-path validation from recorded data
-- live record and replay workflow validation in the integrated stack
+- acceleration rejection during roll / pitch tests and later tuning work
+- live record and replay workflow validation in the integrated stack over the web controls
 - display refinement and pilot-facing presentation quality
 
 Current logging state:
@@ -933,4 +933,141 @@ Current integrated operating point after this validation:
 Practical conclusion:
 
 - the work has moved from prototype-only transport validation into a functioning integrated system
-- the next major verification steps are live record workflow and replay workflow validation rather than basic transport bring-up
+- the next major verification steps are live record workflow and replay workflow validation through the web GUI rather than basic transport bring-up
+
+---
+
+## 16. Replay Validation Addendum
+
+This section records the direct replay-integrity work completed after the initial
+integrated SPI/DMA + SD bring-up.
+
+### Objective
+
+Verify that recorded source sensor/state data can be:
+
+- written to AIR SD
+- replayed from AIR back into the Teensy
+- rerecorded on AIR
+- compared against the original source log
+
+with all non-fusion fields preserved, while allowing the fusion outputs to be
+recomputed.
+
+### AIR replay/log tools added
+
+The AIR console now includes tools to support this workflow:
+
+- `verifylog`
+- `expandlogs`
+- `comparelogs <src> <dst>`
+- `replaycapture`
+- `replaycapfile <name>`
+- `latestlog`
+- `latestlogsession <n>`
+- `logstartid <n>`
+
+These support deterministic source selection, byte-exact SD verification, and
+direct source-vs-rerecorded comparison.
+
+### Root cause found in replay path
+
+A structural replay bug was found in the Teensy replay IMU path:
+
+- replay IMU samples were being queued into the same frame path as live IMU
+- the live frame-averaging logic did not preserve `processed_body`
+- replayed body-frame samples could therefore be transformed a second time
+- replay mode was also averaging queued replay samples instead of consuming them
+  one-by-one
+
+That bug produced very large replay fusion errors, including apparent roll sign
+reversal and large `mag_heading` mismatch, even when the copied raw fields were
+correct.
+
+The fix was:
+
+- preserve `processed_body` through averaged frames
+- bypass averaging in replay mode and consume one queued replay sample at a time
+- preserve replay source `seq` / `t_us`
+- use per-record source shadows for the non-fusion output fields
+
+### Stationary replay result after fix
+
+Validated pair:
+
+- source: `air_130_238447.tlog`
+- replay output: `air_131_316437.tlog`
+
+Result:
+
+- bounded startup prefix only:
+  - `dst_prefix=6`
+  - `seq_mismatch=7`
+  - `ts_mismatch=7`
+- copied raw fields all matched:
+  - `imu_mismatch=0`
+  - `mag_mismatch=0`
+  - `gps_mismatch=0`
+  - `baro_mismatch=0`
+  - `mask_mismatch=0`
+- replay fusion input matched source very closely:
+  - `accel_input_mean_abs=(0.000247,0.000250,0.000251)`
+- fusion outputs were very close:
+  - `roll_mean_abs=0.018657`
+  - `pitch_mean_abs=0.124635`
+  - `yaw_mean_abs=0.132151`
+  - `maghdg_mean_abs=0.019909`
+
+Interpretation:
+
+- the replay path is now correct for stationary data apart from the known
+  startup alignment prefix
+
+### Motion replay result after fix
+
+Validated pair:
+
+- source: `air_140_478029.tlog`
+- replay output: `air_141_554078.tlog`
+
+Result:
+
+- bounded startup prefix only:
+  - `dst_prefix=7`
+  - `seq_mismatch=6`
+  - `ts_mismatch=6`
+- copied raw fields all matched:
+  - `imu_mismatch=0`
+  - `mag_mismatch=0`
+  - `gps_mismatch=0`
+  - `baro_mismatch=0`
+  - `mask_mismatch=0`
+- replay fusion input again matched source very closely:
+  - `accel_input_mean_abs=(0.000254,0.000253,0.000249)`
+- fusion outputs stayed sane under motion:
+  - `roll_mean_abs=0.834425`
+  - `pitch_mean_abs=0.722921`
+  - `yaw_mean_abs=0.999702`
+  - `maghdg_mean_abs=0.022302`
+- motion replay showed real filter behavior rather than replay corruption:
+  - `accel_ignored=23`
+  - `mag_ignored=331`
+
+Interpretation:
+
+- no remaining replay sign reversal was observed
+- the remaining differences are now normal fusion / rejection behavior under
+  dynamic motion, not transport or replay corruption
+
+### Practical conclusion
+
+The replay loop is now credible for algorithm development:
+
+- record a real source session
+- replay the exact source file into the Teensy
+- rerecord the returned state
+- compare source vs rerecorded logs
+- study fusion-output changes after code or tuning changes
+
+This moves replay validation out of the "open transport risk" category and into
+the "usable tuning workflow" category.

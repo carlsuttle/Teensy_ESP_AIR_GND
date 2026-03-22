@@ -53,6 +53,7 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1
 void enqueueReplayControl(uint16_t command_id, uint32_t seq, uint32_t t_us,
                           const void* payload, uint16_t payload_len, uint32_t apply_flags);
 bool active();
+void probeBackend();
 RecorderStatus recorderStatus();
 Stats stats();
 void resetStats();
@@ -60,5 +61,12 @@ void resetStats();
 String filesJson();
 bool deleteFileByName(const String& name);
 bool isSafeName(const String& name);
+bool exportAllLogsToCsv(Stream& out);
+bool busy();
+String currentFileName();
+bool latestLogName(String& out_name);
+bool latestLogNameForSession(uint32_t session_id, String& out_name);
+bool copyLatestLogAndVerify(Stream& out);
+bool compareLogs(Stream& out, const String& src_name, const String& dst_name);
 
 }  // namespace log_store
