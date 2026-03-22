@@ -11,6 +11,8 @@
 #include "sd_card_test.h"
 #include "uart_telem.h"
 #include "radio_link.h"
+#include "spi_bridge.h"
+#include "replay_bridge.h"
 
 namespace {
 
@@ -175,10 +177,11 @@ void printConsoleHelp() {
 void printStats(const uart_telem::Snapshot& snap) {
   const auto link = radio_link::stats();
   const auto cap = sd_capture_test::stats();
+  const auto spi = spi_bridge::stats();
   Serial.printf(
       "STAT unit=AIR seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
       "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu "
-      "link_tx=%lu link_rx=%lu link_drop=%lu sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
+      "link_tx=%lu link_rx=%lu link_drop=%lu spi_txn=%lu spi_fail=%lu spi_state=%lu spi_replay=%lu spi_crc=%lu spi_type=%lu spi_rxof=%lu spi_txof=%lu spi_hdr=%08lX/%u/%u/%u sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -196,6 +199,18 @@ void printStats(const uart_telem::Snapshot& snap) {
       (unsigned long)link.tx_packets,
       (unsigned long)link.rx_packets,
       (unsigned long)link.tx_drop,
+      (unsigned long)spi.transactions_completed,
+      (unsigned long)spi.transaction_failures,
+      (unsigned long)spi.state_records_received,
+      (unsigned long)spi.replay_records_sent,
+      (unsigned long)spi.rx_crc_errors,
+      (unsigned long)spi.rx_type_errors,
+      (unsigned long)spi.rx_overflows,
+      (unsigned long)spi.tx_overflows,
+      (unsigned long)spi.last_magic,
+      (unsigned)spi.last_version,
+      (unsigned)spi.last_type,
+      (unsigned)spi.last_len,
       cap.active ? 1U : 0U,
       (unsigned long)cap.dropped,
       (unsigned long)cap.queue_max);
@@ -654,6 +669,7 @@ void setup() {
 
   uart_telem::begin(cfg);
   radio_link::begin(cfg);
+  replay_bridge::begin();
   sd_capture_test::begin();
   log_store::begin(cfg, air_file_logging_enabled);
   radio_link::setRecorderEnabled(air_file_logging_enabled);
@@ -680,6 +696,7 @@ void loop() {
   }
   uart_telem::poll();
   radio_link::poll();
+  replay_bridge::poll();
   updateWifiReadiness();
 
   const auto snap = uart_telem::snapshot();
@@ -731,3 +748,7 @@ void loop() {
     printStats(snap);
   }
 }
+
+
+
+

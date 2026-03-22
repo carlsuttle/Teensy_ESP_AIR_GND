@@ -11,12 +11,13 @@ constexpr uint8_t kSdMisoPin = 8;
 constexpr uint8_t kSdMosiPin = 9;
 
 constexpr uint32_t kInitFrequenciesHz[] = {
-    40000000UL,
     26000000UL,
+    20000000UL,
 };
 
 bool g_mounted = false;
 uint32_t g_init_hz = 0U;
+SPIClass* g_sd_spi = nullptr;
 
 void prepareSpiPinsForSdInit() {
   // Bias lines to known idle states before handing them to the SPI peripheral.
@@ -45,11 +46,17 @@ bool populateStatus(Status& status) {
 }
 
 bool beginAtFrequency(uint32_t hz) {
+  if (!g_sd_spi) g_sd_spi = new SPIClass(HSPI);
+  if (!g_sd_spi) {
+    g_mounted = false;
+    g_init_hz = 0U;
+    return false;
+  }
   SD.end();
-  SPI.end();
+  g_sd_spi->end();
   prepareSpiPinsForSdInit();
-  SPI.begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
-  if (!SD.begin(kSdCsPin, SPI, hz)) {
+  g_sd_spi->begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
+  if (!SD.begin(kSdCsPin, *g_sd_spi, hz)) {
     g_mounted = false;
     g_init_hz = 0U;
     return false;
@@ -111,9 +118,13 @@ uint32_t mountedFrequencyHz() { return g_init_hz; }
 
 void end() {
   SD.end();
-  SPI.end();
+  if (g_sd_spi) g_sd_spi->end();
   g_mounted = false;
   g_init_hz = 0U;
 }
 
 }  // namespace sd_backend
+
+
+
+

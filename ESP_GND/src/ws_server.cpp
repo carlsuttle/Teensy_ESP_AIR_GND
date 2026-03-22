@@ -70,6 +70,20 @@ void appendLogStatus(JsonDocument& doc, const telem::LogStatusPayloadV1& status)
   log["last_change_ms"] = status.last_change_ms;
 }
 
+void appendReplayStatus(JsonDocument& doc, const telem::ReplayStatusPayloadV1& status) {
+  JsonObject replay = doc["replay_status"].to<JsonObject>();
+  replay["active"] = (status.flags & telem::kReplayStatusFlagActive) != 0U;
+  replay["file_open"] = (status.flags & telem::kReplayStatusFlagFileOpen) != 0U;
+  replay["at_eof"] = (status.flags & telem::kReplayStatusFlagAtEof) != 0U;
+  replay["teensy_seen"] = (status.flags & telem::kReplayStatusFlagTeensyReplaySeen) != 0U;
+  replay["last_command"] = status.last_command;
+  replay["session_id"] = status.session_id;
+  replay["records_total"] = status.records_total;
+  replay["records_sent"] = status.records_sent;
+  replay["last_error"] = status.last_error;
+  replay["last_change_ms"] = status.last_change_ms;
+}
+
 void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
   const AppConfig& cfg = config_store::get();
   JsonDocument doc;
@@ -98,7 +112,8 @@ void sendAck(AsyncWebSocketClient* client,
              bool ok,
              uint32_t code = 0,
              const telem::FusionSettingsV1* fusion = nullptr,
-             const telem::LogStatusPayloadV1* log_status = nullptr) {
+             const telem::LogStatusPayloadV1* log_status = nullptr,
+             const telem::ReplayStatusPayloadV1* replay_status = nullptr) {
   JsonDocument doc;
   doc["type"] = "ack";
   doc["cmd"] = cmd ? cmd : "";
@@ -113,6 +128,9 @@ void sendAck(AsyncWebSocketClient* client,
   }
   if (log_status) {
     appendLogStatus(doc, *log_status);
+  }
+  if (replay_status) {
+    appendReplayStatus(doc, *replay_status);
   }
   sendCtrlJson(client, doc);
 }
@@ -157,6 +175,19 @@ void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t le
             snap.has_log_status ? 0U : 1U,
             nullptr,
             snap.has_log_status ? &snap.log_status : nullptr);
+    return;
+  }
+
+  if (strcmp(type, "get_replay_status") == 0) {
+    const bool requested = radio_link::sendGetReplayStatus();
+    const auto snap = radio_link::snapshot();
+    sendAck(client,
+            "get_replay_status",
+            requested,
+            snap.has_replay_status ? 0U : 1U,
+            nullptr,
+            nullptr,
+            snap.has_replay_status ? &snap.replay_status : nullptr);
     return;
   }
 
@@ -214,6 +245,18 @@ void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t le
       (void)radio_link::sendGetLogStatus();
     }
     sendAck(client, "stop_log", ok, ok ? 0U : 1U, nullptr);
+    return;
+  }
+
+  if (strcmp(type, "start_replay") == 0) {
+    const bool ok = radio_link::sendReplayStart();
+    sendAck(client, "start_replay", ok, ok ? 0U : 1U, nullptr, nullptr, nullptr);
+    return;
+  }
+
+  if (strcmp(type, "stop_replay") == 0) {
+    const bool ok = radio_link::sendReplayStop();
+    sendAck(client, "stop_replay", ok, ok ? 0U : 1U, nullptr, nullptr, nullptr);
     return;
   }
 }
@@ -429,6 +472,16 @@ void begin() {
     doc["air_log_bytes_written"] = snap.log_status.bytes_written;
     doc["air_log_free_bytes"] = snap.log_status.free_bytes;
     doc["air_log_last_change_ms"] = snap.log_status.last_change_ms;
+    doc["has_replay_status"] = snap.has_replay_status;
+    doc["air_replay_active"] = (snap.replay_status.flags & telem::kReplayStatusFlagActive) != 0U;
+    doc["air_replay_file_open"] = (snap.replay_status.flags & telem::kReplayStatusFlagFileOpen) != 0U;
+    doc["air_replay_at_eof"] = (snap.replay_status.flags & telem::kReplayStatusFlagAtEof) != 0U;
+    doc["air_replay_last_command"] = snap.replay_status.last_command;
+    doc["air_replay_session_id"] = snap.replay_status.session_id;
+    doc["air_replay_records_total"] = snap.replay_status.records_total;
+    doc["air_replay_records_sent"] = snap.replay_status.records_sent;
+    doc["air_replay_last_error"] = snap.replay_status.last_error;
+    doc["air_replay_last_change_ms"] = snap.replay_status.last_change_ms;
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);

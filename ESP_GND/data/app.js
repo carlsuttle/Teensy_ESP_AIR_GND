@@ -140,6 +140,16 @@ let linkStatus = {
   air_log_bytes_written: 0,
   air_log_free_bytes: null,
   air_log_last_change_ms: null,
+  has_replay_status: false,
+  air_replay_active: false,
+  air_replay_file_open: false,
+  air_replay_at_eof: false,
+  air_replay_last_command: 0,
+  air_replay_session_id: 0,
+  air_replay_records_total: 0,
+  air_replay_records_sent: 0,
+  air_replay_last_error: 0,
+  air_replay_last_change_ms: null,
   state_packets: 0,
   state_seq_gap: 0,
   state_seq_rewind: 0,
@@ -330,6 +340,11 @@ function requestLogStatus() {
   wsCtrl.send(JSON.stringify({ type: "get_log_status", req_id: allocCtrlReqId() }));
 }
 
+function requestReplayStatus() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "get_replay_status", req_id: allocCtrlReqId() }));
+}
+
 function sendLogStart() {
   if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
   wsCtrl.send(JSON.stringify({ type: "start_log", req_id: allocCtrlReqId() }));
@@ -338,6 +353,16 @@ function sendLogStart() {
 function sendLogStop() {
   if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
   wsCtrl.send(JSON.stringify({ type: "stop_log", req_id: allocCtrlReqId() }));
+}
+
+function sendReplayStart() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "start_replay", req_id: allocCtrlReqId() }));
+}
+
+function sendReplayStop() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  wsCtrl.send(JSON.stringify({ type: "stop_replay", req_id: allocCtrlReqId() }));
 }
 
 function sendFusion(partial = {}) {
@@ -533,6 +558,9 @@ function logCommandText(command) {
   if (command === 104) return "start";
   if (command === 105) return "stop";
   if (command === 106) return "status";
+  if (command === 109) return "replay_start";
+  if (command === 110) return "replay_stop";
+  if (command === 111) return "replay_status";
   return command ? String(command) : "-";
 }
 
@@ -567,6 +595,20 @@ function applyLogStatus(logStatus = null) {
   linkStatus.air_log_bytes_written = Number(logStatus.bytes_written ?? 0);
   linkStatus.air_log_free_bytes = Number(logStatus.free_bytes ?? 0xFFFFFFFF);
   linkStatus.air_log_last_change_ms = Number(logStatus.last_change_ms ?? 0);
+}
+
+function applyReplayStatus(replayStatus = null) {
+  if (!replayStatus) return;
+  linkStatus.has_replay_status = true;
+  linkStatus.air_replay_active = !!replayStatus.active;
+  linkStatus.air_replay_file_open = !!replayStatus.file_open;
+  linkStatus.air_replay_at_eof = !!replayStatus.at_eof;
+  linkStatus.air_replay_last_command = Number(replayStatus.last_command ?? 0);
+  linkStatus.air_replay_session_id = Number(replayStatus.session_id ?? 0);
+  linkStatus.air_replay_records_total = Number(replayStatus.records_total ?? 0);
+  linkStatus.air_replay_records_sent = Number(replayStatus.records_sent ?? 0);
+  linkStatus.air_replay_last_error = Number(replayStatus.last_error ?? 0);
+  linkStatus.air_replay_last_change_ms = Number(replayStatus.last_change_ms ?? 0);
 }
 
 function setRecorderUi(enabled, known = true) {
@@ -746,6 +788,19 @@ async function fetchStatus() {
         bytes_written: data.air_log_bytes_written,
         free_bytes: data.air_log_free_bytes,
         last_change_ms: data.air_log_last_change_ms
+      });
+    }
+    if (data.has_replay_status) {
+      applyReplayStatus({
+        active: data.air_replay_active,
+        file_open: data.air_replay_file_open,
+        at_eof: data.air_replay_at_eof,
+        last_command: data.air_replay_last_command,
+        session_id: data.air_replay_session_id,
+        records_total: data.air_replay_records_total,
+        records_sent: data.air_replay_records_sent,
+        last_error: data.air_replay_last_error,
+        last_change_ms: data.air_replay_last_change_ms
       });
     }
     setRecorderUi(!!linkStatus.air_recorder_on, !!linkStatus.has_link_meta);
@@ -1538,6 +1593,9 @@ function renderLogsPanel() {
   const requestedTxt = linkStatus.has_log_status ? (linkStatus.air_log_requested ? "on" : "off") : "-";
   const backendTxt = linkStatus.has_log_status ? (linkStatus.air_log_backend_ready ? "ready" : "not ready") : "-";
   const mediaTxt = linkStatus.has_log_status ? (linkStatus.air_log_media_present ? "present" : "missing") : "-";
+  const replayActiveTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_active ? "on" : "off") : "-";
+  const replayFileTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_file_open ? "open" : "closed") : "-";
+  const replayEofTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_at_eof ? "yes" : "no") : "-";
   logsEl.textContent =
 `status: ${activeTxt}
 requested: ${requestedTxt}
@@ -1547,7 +1605,17 @@ session_id: ${dash(linkStatus.air_log_session_id)}
 bytes_written: ${fmtBytes(linkStatus.air_log_bytes_written)}
 free_bytes: ${fmtBytes(linkStatus.air_log_free_bytes)}
 last_command: ${logCommandText(linkStatus.air_log_last_command)}
-last_change_ms: ${dash(linkStatus.air_log_last_change_ms)}`;
+last_change_ms: ${dash(linkStatus.air_log_last_change_ms)}
+
+replay_active: ${replayActiveTxt}
+replay_file: ${replayFileTxt}
+replay_eof: ${replayEofTxt}
+replay_session_id: ${dash(linkStatus.air_replay_session_id)}
+replay_records_sent: ${dash(linkStatus.air_replay_records_sent)}
+replay_records_total: ${dash(linkStatus.air_replay_records_total)}
+replay_last_command: ${logCommandText(linkStatus.air_replay_last_command)}
+replay_last_error: ${dash(linkStatus.air_replay_last_error)}
+replay_last_change_ms: ${dash(linkStatus.air_replay_last_change_ms)}`;
 }
 
 function renderActiveTab() {
@@ -1747,6 +1815,9 @@ function handleCtrlMessage(text) {
     if (m.log_status) {
       applyLogStatus(m.log_status);
     }
+    if (m.replay_status) {
+      applyReplayStatus(m.replay_status);
+    }
     if (m.cmd === "get_fusion" && m.fusion) {
       fusionLast = {
         gain: Number(m.fusion.gain ?? FUSION_DEFAULTS.gain),
@@ -1775,6 +1846,10 @@ function handleCtrlMessage(text) {
     }
     if (m.cmd === "start_log" || m.cmd === "stop_log" || m.cmd === "get_log_status") {
       setTimeout(requestLogStatus, 150);
+      setTimeout(fetchStatus, 250);
+    }
+    if (m.cmd === "start_replay" || m.cmd === "stop_replay" || m.cmd === "get_replay_status") {
+      setTimeout(requestReplayStatus, 150);
       setTimeout(fetchStatus, 250);
     }
     uiDirty = true;
@@ -1828,6 +1903,7 @@ function connectCtrl() {
     updateStatus();
     requestFusionSnapshot();
     requestLogStatus();
+    requestReplayStatus();
     connectState();
     uiDirty = true;
   };
@@ -2145,6 +2221,19 @@ document.getElementById("startLog").addEventListener("click", () => {
 
 document.getElementById("stopLog").addEventListener("click", () => {
   sendLogStop();
+});
+
+document.getElementById("refreshReplayStatus").addEventListener("click", () => {
+  requestReplayStatus();
+  fetchStatus();
+});
+
+document.getElementById("startReplay").addEventListener("click", () => {
+  sendReplayStart();
+});
+
+document.getElementById("stopReplay").addEventListener("click", () => {
+  sendReplayStop();
 });
 
 document.getElementById("resetAirNetwork").addEventListener("click", async () => {

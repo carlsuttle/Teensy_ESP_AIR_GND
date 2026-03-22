@@ -700,6 +700,15 @@ void update400Hz(State& s) {
 
       const float headingDeg = computeHeadingDeg(magBody.axis.x, magBody.axis.y);
       FusionAhrsUpdate(&g_ahrs, gyro, accel, magFusion, dtSec);
+      s.accel_x_mps2 = accel.axis.x;
+      s.accel_y_mps2 = accel.axis.y;
+      s.accel_z_mps2 = accel.axis.z;
+      s.gyro_x_dps = gyro.axis.x;
+      s.gyro_y_dps = gyro.axis.y;
+      s.gyro_z_dps = gyro.axis.z;
+      s.mag_x_uT = magBody.axis.x;
+      s.mag_y_uT = magBody.axis.y;
+      s.mag_z_uT = magBody.axis.z;
       const FusionQuaternion q = FusionAhrsGetQuaternion(&g_ahrs);
       const FusionEuler e = FusionQuaternionToEuler(q);
       const FusionMatrix m = FusionQuaternionToMatrix(q);

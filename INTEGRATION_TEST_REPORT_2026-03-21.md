@@ -1,0 +1,245 @@
+# Integration Test Report - March 21, 2026
+
+## Scope
+
+This report summarizes the hardware bring-up, standalone bench validation, SPI/DMA plus SPI/SD integration work, fault isolation, and final verified operating state for the Teensy/ESP AIR/GND stack.
+
+Tested system components:
+- Teensy 4.0 avionics unit
+- ESP_AIR on XIAO ESP32-S3
+- ESP_GND on XIAO ESP32-S3
+- SPI/DMA link between Teensy and AIR
+- SD logging/capture on AIR
+- ESP-NOW AIR to GND path
+- IMU over I2C on Teensy
+- GPS UBX binary parser over UART on Teensy
+
+Date of testing:
+- March 21, 2026
+
+Serial ports used during validation:
+- Teensy: `COM10`
+- ESP_AIR: `COM7`
+- ESP_GND: `COM9`
+
+## Wiring Verified
+
+### Teensy 4.0 to ESP_AIR SPI transport
+- Teensy pin `13` -> ESP `GPIO5` (`SCK`)
+- Teensy pin `12` -> ESP `GPIO1` (slave `SDI` from master `MOSI`)
+- Teensy pin `11` -> ESP `GPIO6` (slave `SDO` to master `MISO`)
+- Teensy pin `10` -> ESP `GPIO44` (`CS`)
+- Teensy pin `2` -> ESP `GPIO4` (`READY`)
+- Common ground required
+
+### ESP_AIR to SD card
+- ESP `GPIO7` -> SD `SCK`
+- ESP `GPIO8` -> SD `MISO`
+- ESP `GPIO9` -> SD `MOSI`
+- ESP `GPIO2` -> SD `CS`
+- `3V3` -> SD `VCC`
+- `GND` -> SD `GND`
+
+### Teensy sensor wiring confirmed
+- I2C: `SDA=18`, `SCL=19`
+- GPS UART: `RX1=0`, `TX1=1`
+- GPS uses UBX binary data path, not NMEA text
+
+## Standalone Bench Validation
+
+### 1. SPI/DMA prototype benchmark
+Project:
+- `SPI_DMA_Transport_Prototype`
+
+Result:
+- Proven working at `40 MHz` full duplex
+- Highest-speed stress test passed cleanly
+- No replay misses, no duplicates, no CRC errors, no queue overflow during the validated prototype stress run
+
+Interpretation:
+- The physical Teensy-to-AIR transport wiring was good
+- The SPI protocol and DMA design were fundamentally sound before full-stack integration
+
+### 2. Standalone ESP_AIR SD test
+Project:
+- `Teensy_ESP_AIR_GND/ESP_AIR`
+
+Result:
+- SD probe and small write test succeeded on pins `7/8/9/2`
+- Card was detected and writable
+
+Interpretation:
+- The AIR SD wiring and base SD software path were functional before combined integration load
+
+### 3. Teensy IMU and GPS BIT
+Project:
+- `FAST_Teensy_Avionics`
+
+Built-in test added and run on hardware.
+
+Result:
+- IMU on I2C passed
+- GPS UBX binary parser path passed
+- Valid GPS UART traffic and NAV-PVT frames were observed
+
+Interpretation:
+- Teensy sensor stack was healthy before integrated transport work
+
+## Full-Stack Integration Work
+
+Target stack:
+- `Teensy_ESP_AIR_GND/Teensy`
+- `Teensy_ESP_AIR_GND/ESP_AIR`
+- `Teensy_ESP_AIR_GND/ESP_GND`
+
+Integrated behavior now in place:
+- Teensy publishes telemetry state over SPI/DMA instead of the old UART mirror path
+- AIR receives Teensy state over SPI, forwards live data to GND, and can capture/log to SD
+- AIR replay/control traffic is sent back to Teensy over the SPI reverse path
+- GND remains on the radio/web side and receives live state from AIR
+
+## Faults Found During Integration
+
+### Fault 1. Teensy SPI clock pin was being stolen by LED logic
+Symptom:
+- AIR clocked SPI transactions but got no valid data
+- Teensy armed one transaction and never completed it
+
+Root cause:
+- In the full Teensy application, CRSF LED activity used `LED_BUILTIN`
+- On Teensy 4.0, `LED_BUILTIN` is pin `13`
+- Pin `13` is also the SPI transport `SCK`
+- That remuxed the clock pin away from the SPI slave path after bring-up
+
+Fix applied:
+- Disabled the LED path while SPI mirror/transport is enabled
+
+Result after fix:
+- Teensy transaction arm and completion counters matched
+- AIR immediately began receiving valid SPI state frames
+
+### Fault 2. AIR SD backend was stealing the SPI transport host
+Symptom:
+- SPI transport worked until SD capture started
+- Then the Teensy side got stranded with an armed transaction and AIR stopped advancing correctly
+
+Root cause:
+- AIR SD backend used Arduino default `SPI`
+- On this ESP32-S3 environment, Arduino default `SPI` maps to the same hardware host used by the custom SPI transport master
+- Starting SD capture reconfigured the same controller the transport depended on
+
+Fix applied:
+- Moved AIR SD access onto a dedicated SPI controller using a separate `SPIClass(HSPI)` instance
+
+Result after fix:
+- SD activity no longer destabilized the transport host
+- SPI transport remained alive while SD capture was active
+
+### Fault 3. `spi_fail` was counting normal not-ready gaps as failures
+Symptom:
+- `spi_fail` climbed even while the web client showed valid live data
+
+Root cause:
+- AIR counted normal `READY` wait misses as transport failures
+- These were scheduler/readiness timing gaps, not actual bus-transfer errors
+
+Fix applied:
+- AIR master loop now waits more realistically for `READY`
+- Normal not-ready gaps are retried instead of being counted as SPI failures
+- Only real transaction problems should increment `spi_fail`
+
+Result after fix:
+- `spi_fail=0` during normal live streaming
+
+### Fault 4. AIR SD long capture unstable at 40 MHz
+Symptom:
+- SD probe and small write tests passed
+- Long capture under sustained load failed at `40 MHz`
+- Repeated SD status errors were observed during capture
+
+Root cause:
+- SD bus signal margin/stability issue under sustained write load at `40 MHz`
+- This was not a transport bug
+
+Fault-finding method:
+- Temporary SD clock reduction only for diagnosis
+- `20 MHz` test completed successfully for full 60-second capture
+- `26 MHz` test also completed successfully for full 60-second capture
+- This isolated the issue to SD bus speed margin rather than queueing or SPI/DMA transport logic
+
+Result:
+- `26 MHz` is the currently verified stable AIR SD operating point
+- Current AIR SD init order uses `26 MHz` first, then `20 MHz` fallback
+
+## Final Verified Results
+
+### Live telemetry and web display
+Result:
+- Live data is arriving at the web client and displaying correctly
+
+Interpretation:
+- End-to-end Teensy -> AIR -> GND -> web path is operational
+
+### SPI transport current state
+Result:
+- AIR receives live state frames continuously
+- `spi_fail=0` in normal streaming after fix
+- Teensy SPI transaction progression remained healthy during validation
+
+Interpretation:
+- The integrated SPI/DMA link is now operating correctly in the full stack
+
+### AIR SD capture current state
+Stable verified configuration:
+- AIR SD bus at `26 MHz`
+- Separate SPI controller from transport host
+
+Validated capture result:
+- Command: `sdcap1m`
+- Duration: `60 s`
+- Result: success
+- `records=3000`
+- `bytes=528000`
+- `dropped=0`
+- `queue_max=2`
+- `err=(none)`
+- `init_hz=26000000`
+
+Interpretation:
+- SPI transport and SPI/SD can coexist under live capture load in the integrated stack
+- `26 MHz` is currently the highest verified stable AIR SD setting from this session
+
+## Current Firmware State
+
+Key fixes retained in the codebase:
+- Teensy pin-13 LED conflict removed while SPI mirror is enabled
+- AIR SD moved to separate SPI host
+- AIR SPI fail accounting corrected
+- AIR SD frequency set to tested stable `26 MHz` first, `20 MHz` fallback
+
+Temporary debug instrumentation status:
+- Temporary Teensy-side deep SPI debug summary was removed after verification
+- Functional fixes remain in place
+
+## Recommended Next Test Sequence
+
+Next steps from the current known-good baseline:
+1. Test live record using the current integrated system
+2. Verify recorded file integrity and session behavior
+3. Test replay path from recorded data
+4. Validate replay control/command handling back to Teensy
+5. If desired later, retest SD clock upward from `26 MHz` only as a controlled optimization task
+
+## Conclusion
+
+The system is no longer in a bench-only state. The integrated stack is functioning with:
+- live telemetry visible in the web client
+- stable SPI/DMA transport
+- `spi_fail=0` in normal live operation
+- stable AIR SD capture at `26 MHz`
+- validated coexistence of transport and SD logging/capture paths
+
+The main remaining work is now feature validation of:
+- live recording behavior
+- replay behavior
+rather than basic transport bring-up.

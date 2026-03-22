@@ -534,14 +534,12 @@ Current SD backend wiring and init behavior on `ESP_AIR`:
 - `SCK=7`
 - `MISO=8`
 - `MOSI=9`
-- mount attempts `40 MHz` first
-- fallback mount at `26 MHz` if `40 MHz` does not mount
+- mount attempts `26 MHz` first
+- fallback mount at `20 MHz` if `26 MHz` does not mount
 
 Standalone SD logging benchmark state:
 
-- SD logging has been standalone benchmarked successfully and should be treated
-  as being at the same maturity level as the SPI/DMA transport prototype:
-  proven in isolation, not yet fully validated under the final integrated load
+- SD logging was standalone benchmarked successfully and has now also been validated in the integrated AIR capture path at `26 MHz` for a full `60 s` run with live transport active
 - benchmark target in the AIR notes:
   - `250-byte` records
   - `400 Hz`
@@ -685,9 +683,8 @@ Whenever possible compare against:
 
 - frame conventions still need a controlled synthetic magnetometer test
 - acceleration rejection behavior during roll and pitch is not fully explained
-- SD logging backend has not yet been validated under real transport load
-- SPI/DMA transport has been validated as a standalone prototype but not yet
-  integrated into the main avionics firmware path
+- SD logging backend has now been validated under integrated transport load at a stable `26 MHz` SD clock
+- SPI/DMA transport has now been integrated into the main avionics firmware path and validated with live web display plus AIR SD capture
 
 ---
 
@@ -701,23 +698,21 @@ Known working or mostly working:
 - AIR <-> GND ESP-NOW link exists
 - GND web UI and WebSocket streaming exist
 - PFD / HSI generation by AI was highly effective for structure and data flow
-- standalone Teensy <-> ESP SPI/DMA prototype now works as a clean framed
-  bidirectional transport experiment
+- integrated Teensy <-> AIR SPI/DMA transport is now running in the main stack and feeding the live AIR -> GND -> web path
 
 Current areas under active investigation:
 
 - frame correctness for heading and tilt compensation
 - acceleration rejection during roll / pitch tests
-- SD card backend integration on ESP_AIR
-- integration strategy for the standalone SPI/DMA transport prototype
+- replay-path validation from recorded data
+- live record and replay workflow validation in the integrated stack
 - display refinement and pilot-facing presentation quality
 
 Current logging state:
 
 - filesystem logger exists on AIR using LittleFS
-- SD interface testing has begun but is not yet a reliable subsystem
-- SPI transport batching appears compatible with logger-friendly chunk sizes, but
-  this has not yet been tested in the integrated AIR logger path
+- AIR SD capture is now reliable at `26 MHz` using a dedicated SPI host
+- integrated `sdcap1m` has completed successfully with `3000` records, `528000` bytes, and `0` dropped records
 
 ---
 
@@ -889,3 +884,53 @@ Update this document when major changes occur in:
 
 If a new AI session had to rediscover an important fact from code or chat, this
 document is missing something and should be updated.
+
+---
+
+## 19. Integrated Transport And SD Validation (2026-03-21)
+
+A dedicated integrated test session was completed on March 21, 2026. Full detail is recorded in:
+
+- `INTEGRATION_TEST_REPORT_2026-03-21.md`
+
+Verified hardware during this session:
+
+- Teensy 4.0 on `COM10`
+- `ESP_AIR` on `COM7`
+- `ESP_GND` on `COM9`
+- Teensy IMU over I2C
+- Teensy GPS using UBX binary parsing over UART
+- Teensy <-> AIR SPI/DMA transport
+- AIR SD logging/capture path
+- AIR <-> GND radio/web path
+
+Integrated issues found and resolved:
+
+- Teensy pin `13` LED activity conflicted with SPI `SCK` in the full firmware and had to be disabled while SPI mirror/transport is enabled
+- AIR SD originally reused the same ESP SPI host as the transport and had to be moved onto a separate SPI controller
+- AIR `spi_fail` originally counted normal `READY` wait gaps as failures and was corrected so that normal streaming now runs with `spi_fail=0`
+- AIR SD sustained capture at `40 MHz` was not stable even though simple probe/write tests succeeded
+
+Integrated results verified during this session:
+
+- live telemetry reached the GND web client and displayed correctly
+- integrated SPI/DMA transport stayed up in the full stack
+- AIR `spi_fail=0` in normal live streaming after timing/accounting fix
+- `sdcap1m` completed successfully for `60 s` at `26 MHz`
+- successful integrated capture result:
+  - `records=3000`
+  - `bytes=528000`
+  - `dropped=0`
+  - `queue_max=2`
+  - `err=(none)`
+
+Current integrated operating point after this validation:
+
+- AIR SD should currently be treated as stable at `26 MHz`
+- AIR SD fallback is `20 MHz`
+- `40 MHz` should be treated as standalone-capable but not yet integrated-capture-stable
+
+Practical conclusion:
+
+- the work has moved from prototype-only transport validation into a functioning integrated system
+- the next major verification steps are live record workflow and replay workflow validation rather than basic transport bring-up

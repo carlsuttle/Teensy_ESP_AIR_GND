@@ -50,6 +50,8 @@ bool startSession(uint32_t session_id);
 void stopSession();
 void poll();
 void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state);
+void enqueueReplayControl(uint16_t command_id, uint32_t seq, uint32_t t_us,
+                          const void* payload, uint16_t payload_len, uint32_t apply_flags);
 bool active();
 RecorderStatus recorderStatus();
 Stats stats();

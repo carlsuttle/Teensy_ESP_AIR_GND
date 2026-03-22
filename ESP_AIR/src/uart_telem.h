@@ -61,6 +61,8 @@ LoopbackResult runLoopbackTest(uint32_t timeout_ms = 120U);
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd);
 bool sendGetFusionSettings();
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd);
+bool sendReplayInputRecord(const telem::ReplayInputRecord160& record);
+bool sendReplayControlRecord(const telem::ReplayControlRecord160& record);
 bool probeRxPin(uint8_t rx_pin, uint32_t baud, uint32_t dwell_ms, uint32_t& out_bytes);
 
 }  // namespace uart_telem

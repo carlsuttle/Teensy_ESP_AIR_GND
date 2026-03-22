@@ -26,6 +26,16 @@ struct State {
   uint32_t last_gps_ms;
   uint32_t last_imu_ms;
 
+  float accel_x_mps2;
+  float accel_y_mps2;
+  float accel_z_mps2;
+  float gyro_x_dps;
+  float gyro_y_dps;
+  float gyro_z_dps;
+  float mag_x_uT;
+  float mag_y_uT;
+  float mag_z_uT;
+
   float baro_temp_c;
   float baro_press_hpa;
   float baro_alt_m;

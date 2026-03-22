@@ -80,7 +80,7 @@ uint32_t g_last_gps_ms = 0;
 
 void telemetry_setup() {
   CRSF_SERIAL.begin(CRSF_BAUD);
-#ifdef LED_BUILTIN
+#if defined(LED_BUILTIN) && !ENABLE_MIRROR
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 #endif
@@ -106,8 +106,8 @@ void telemetry_loop(const State& s) {
     }
   }
 
-#ifdef LED_BUILTIN
   const uint32_t now_ms = millis();
+#if defined(LED_BUILTIN) && !ENABLE_MIRROR
   if (got_crsf_frame && ((uint32_t)(now_ms - g_led_gap_ms) >= CRSF_LED_MIN_GAP_MS)) {
     digitalWrite(LED_BUILTIN, HIGH);
     g_led_on = true;
@@ -172,3 +172,5 @@ void telemetry_getCrsfRxStats(CrsfRxStats& out) {
   out.lastType = g_rx_last_type;
   out.lastFrameMs = g_rx_last_frame_ms;
 }
+
+

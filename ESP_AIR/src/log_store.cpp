@@ -19,18 +19,20 @@ constexpr size_t kBlockBytes = 10000U;
 constexpr size_t kBlockCount = 4U;
 constexpr uint32_t kMaxReportableFreeBytes = telem::kLogBytesUnknown - 1U;
 constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
-constexpr uint16_t kLogVersion = 1U;
+constexpr uint16_t kLogVersion = 2U;
 constexpr uint8_t kWriteRetryCount = 8U;
 constexpr uint32_t kWriteRetryDelayMs = 2U;
 
 #pragma pack(push, 1)
-struct BinaryLogRecordV1 {
+struct BinaryLogRecordV2 {
   uint32_t magic;
   uint16_t version;
   uint16_t record_size;
+  uint16_t record_kind;
+  uint16_t reserved;
   uint32_t seq;
   uint32_t t_us;
-  telem::TelemetryFullStateV1 state;
+  uint8_t payload[telem::kReplayRecordBytes];
 };
 #pragma pack(pop)
 
@@ -205,6 +207,47 @@ bool queueBlockForWrite(int block_index) {
   return true;
 }
 
+bool enqueueRecord(const BinaryLogRecordV2& record) {
+  LockGuard lock(g_state_mutex);
+  if (!g_recorder.active) return false;
+
+  if (g_active_block_index < 0) {
+    if (!acquireFreeBlock(g_active_block_index)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return false;
+    }
+  }
+
+  const size_t record_size = sizeof(record);
+  if ((g_blocks[g_active_block_index].used_bytes + record_size) > sizeof(g_blocks[g_active_block_index].data)) {
+    const int full_block_index = g_active_block_index;
+    g_active_block_index = -1;
+    if (!queueBlockForWrite(full_block_index)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return false;
+    }
+    if (!acquireFreeBlock(g_active_block_index)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return false;
+    }
+  }
+
+  Block& block = g_blocks[g_active_block_index];
+  memcpy(block.data + block.used_bytes, &record, sizeof(record));
+  block.used_bytes += sizeof(record);
+  block.record_count++;
+  portENTER_CRITICAL(&g_stats_mux);
+  g_stats.enqueued++;
+  portEXIT_CRITICAL(&g_stats_mux);
+  return true;
+}
+
 bool writeBlock(Block& block) {
   if (!block.used_bytes) return true;
   if (!openCurrentLog()) return false;
@@ -365,51 +408,47 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1
   if (seq == g_last_seq) return;
   g_last_seq = seq;
 
-  BinaryLogRecordV1 record = {};
+  BinaryLogRecordV2 record = {};
   record.magic = kLogMagic;
   record.version = kLogVersion;
   record.record_size = (uint16_t)sizeof(record);
+  record.record_kind = (uint16_t)telem::LogRecordKind::State160;
   record.seq = seq;
   record.t_us = t_us;
-  record.state = state;
+  memcpy(record.payload, &state, sizeof(state));
+  (void)enqueueRecord(record);
+}
 
-  LockGuard lock(g_state_mutex);
-  if (!g_recorder.active) return;
+void enqueueReplayControl(uint16_t command_id, uint32_t seq, uint32_t t_us,
+                          const void* payload, uint16_t payload_len, uint32_t apply_flags) {
+  if (!g_recorder.feature_enabled || !g_recorder.active) return;
 
-  if (g_active_block_index < 0) {
-    if (!acquireFreeBlock(g_active_block_index)) {
-      portENTER_CRITICAL(&g_stats_mux);
-      g_stats.dropped++;
-      portEXIT_CRITICAL(&g_stats_mux);
-      return;
-    }
+  telem::ReplayControlRecord160 replay = {};
+  replay.hdr.magic = telem::kReplayMagic;
+  replay.hdr.version = telem::kReplayVersion;
+  replay.hdr.kind = (uint8_t)telem::ReplayRecordKind::Control;
+  replay.hdr.flags = 0U;
+  replay.hdr.seq = seq;
+  replay.hdr.t_us = t_us;
+  replay.payload.command_id = command_id;
+  replay.payload.payload_len =
+      (payload_len > sizeof(replay.payload.payload)) ? (uint16_t)sizeof(replay.payload.payload) : payload_len;
+  replay.payload.command_seq = seq;
+  replay.payload.received_t_us = t_us;
+  replay.payload.apply_flags = apply_flags;
+  if (replay.payload.payload_len > 0U && payload) {
+    memcpy(replay.payload.payload, payload, replay.payload.payload_len);
   }
 
-  const size_t record_size = sizeof(record);
-  if ((g_blocks[g_active_block_index].used_bytes + record_size) > sizeof(g_blocks[g_active_block_index].data)) {
-    const int full_block_index = g_active_block_index;
-    g_active_block_index = -1;
-    if (!queueBlockForWrite(full_block_index)) {
-      portENTER_CRITICAL(&g_stats_mux);
-      g_stats.dropped++;
-      portEXIT_CRITICAL(&g_stats_mux);
-      return;
-    }
-    if (!acquireFreeBlock(g_active_block_index)) {
-      portENTER_CRITICAL(&g_stats_mux);
-      g_stats.dropped++;
-      portEXIT_CRITICAL(&g_stats_mux);
-      return;
-    }
-  }
-
-  Block& block = g_blocks[g_active_block_index];
-  memcpy(block.data + block.used_bytes, &record, sizeof(record));
-  block.used_bytes += sizeof(record);
-  block.record_count++;
-  portENTER_CRITICAL(&g_stats_mux);
-  g_stats.enqueued++;
-  portEXIT_CRITICAL(&g_stats_mux);
+  BinaryLogRecordV2 record = {};
+  record.magic = kLogMagic;
+  record.version = kLogVersion;
+  record.record_size = (uint16_t)sizeof(record);
+  record.record_kind = (uint16_t)telem::LogRecordKind::ReplayControl160;
+  record.seq = seq;
+  record.t_us = t_us;
+  memcpy(record.payload, &replay, sizeof(replay));
+  (void)enqueueRecord(record);
 }
 
 bool active() {

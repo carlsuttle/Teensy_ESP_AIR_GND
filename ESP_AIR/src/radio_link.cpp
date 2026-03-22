@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "log_store.h"
+#include "replay_bridge.h"
 #include "types_shared.h"
 
 namespace radio_link {
@@ -128,6 +129,7 @@ String macToString(const uint8_t* mac) {
 bool initEspNow();
 void clearPeerState();
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us);
+void sendReplayStatusFrame();
 
 uint8_t desiredProtocol() {
   const uint8_t kNormalMask = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -643,6 +645,11 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uin
   return sendFrameTo(g_gnd_mac, type, payload, payload_len, seq, t_us);
 }
 
+void sendReplayStatusFrame() {
+  const telem::ReplayStatusPayloadV1 payload = replay_bridge::currentPayload();
+  (void)sendFrame(telem::TELEM_REPLAY_STATUS, &payload, sizeof(payload), g_tx_seq + 1U, micros());
+}
+
 void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint32_t t_us) {
   if (stateOnlyModeEnabled()) {
     if (command != telem::CMD_SET_STREAM_RATE && command != telem::CMD_SET_RADIO_MODE) return;
@@ -687,7 +694,10 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdSetFusionSettingsV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      (void)uart_telem::sendSetFusionSettings(cmd);
+      if (uart_telem::sendSetFusionSettings(cmd)) {
+        log_store::enqueueReplayControl(hdr.msg_type, hdr.seq, hdr.t_us, &cmd, sizeof(cmd),
+                                        telem::kReplayControlFlagSourceGui | telem::kReplayControlFlagSourceRadio);
+      }
       break;
     }
     case telem::CMD_GET_FUSION_SETTINGS:
@@ -704,7 +714,10 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdSetStreamRateV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      (void)uart_telem::sendSetStreamRate(cmd);
+      if (uart_telem::sendSetStreamRate(cmd)) {
+        log_store::enqueueReplayControl(hdr.msg_type, hdr.seq, hdr.t_us, &cmd, sizeof(cmd),
+                                        telem::kReplayControlFlagSourceGui | telem::kReplayControlFlagSourceRadio);
+      }
       break;
     }
     case telem::CMD_SET_RADIO_MODE: {
@@ -780,6 +793,38 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         return;
       }
       sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      break;
+    case telem::CMD_REPLAY_START:
+      if (hdr.payload_len != 0U) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      if (replay_bridge::startLatest()) {
+        sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      } else {
+        sendCommandAck(hdr.msg_type, false, 2U, hdr.seq, micros());
+      }
+      sendReplayStatusFrame();
+      break;
+    case telem::CMD_REPLAY_STOP:
+      if (hdr.payload_len != 0U) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      replay_bridge::stop();
+      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      sendReplayStatusFrame();
+      break;
+    case telem::CMD_GET_REPLAY_STATUS:
+      if (hdr.payload_len != 0U) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      sendReplayStatusFrame();
       break;
     case telem::CMD_RESET_NETWORK:
       if (hdr.payload_len != 0U) {
@@ -895,6 +940,9 @@ void poll() {
 
 void publish(const uart_telem::Snapshot& snap) {
   captureSnapshotAck(snap);
+  if (replay_bridge::takeStatusDirty()) {
+    sendReplayStatusFrame();
+  }
   if (stateOnlyModeEnabled()) return;
   (void)maybeSendUnifiedDownlink(snap);
 }

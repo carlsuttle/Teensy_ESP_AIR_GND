@@ -561,6 +561,16 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.last_rx_ms = millis();
       break;
+    case telem::TELEM_REPLAY_STATUS:
+      if (hdr.payload_len != sizeof(telem::ReplayStatusPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      memcpy(&g_snapshot.replay_status, payload, sizeof(g_snapshot.replay_status));
+      g_snapshot.has_replay_status = true;
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
     case telem::TELEM_CONTROL_STATUS: {
       if (hdr.payload_len != sizeof(telem::ControlStatusPayloadV1)) {
         g_snapshot.stats.len_err++;
@@ -722,6 +732,12 @@ bool sendLogStart() { return sendFrame(telem::CMD_LOG_START, nullptr, 0U); }
 bool sendLogStop() { return sendFrame(telem::CMD_LOG_STOP, nullptr, 0U); }
 
 bool sendGetLogStatus() { return sendFrame(telem::CMD_GET_LOG_STATUS, nullptr, 0U); }
+
+bool sendReplayStart() { return sendFrame(telem::CMD_REPLAY_START, nullptr, 0U); }
+
+bool sendReplayStop() { return sendFrame(telem::CMD_REPLAY_STOP, nullptr, 0U); }
+
+bool sendGetReplayStatus() { return sendFrame(telem::CMD_GET_REPLAY_STATUS, nullptr, 0U); }
 
 bool hasLearnedSender() { return g_has_air_mac; }
 

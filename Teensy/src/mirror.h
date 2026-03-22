@@ -15,6 +15,8 @@ struct RxDebugStats {
   uint32_t cmdSetFusion;
   uint32_t cmdGetFusion;
   uint32_t cmdSetStreamRate;
+  uint32_t replayInputFrames;
+  uint32_t replayControlFrames;
   uint32_t ackSent;
   uint32_t nackSent;
   uint16_t lastMsgType;
