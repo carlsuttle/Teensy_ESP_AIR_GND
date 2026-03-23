@@ -32,6 +32,7 @@ void fillPinStatus(Status& status);
 bool begin(Status* status = nullptr);
 bool refreshStatus(Status& status);
 bool mounted();
+bool mediaPresent();
 uint32_t mountedFrequencyHz();
 void end();
 

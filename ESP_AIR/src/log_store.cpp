@@ -22,6 +22,9 @@ constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
 constexpr uint16_t kLogVersion = 2U;
 constexpr uint8_t kWriteRetryCount = 8U;
 constexpr uint32_t kWriteRetryDelayMs = 2U;
+constexpr uint32_t kMountedStatusRefreshMs = 1000U;
+constexpr uint32_t kMissingMediaProbeIntervalMs = 5000U;
+constexpr uint32_t kIdleMediaCheckMs = 1000U;
 
 #pragma pack(push, 1)
 struct BinaryLogRecordV2 {
@@ -69,6 +72,8 @@ int g_active_block_index = -1;
 bool g_close_pending = false;
 uint32_t g_last_seq = 0U;
 uint32_t g_last_status_refresh_ms = 0U;
+uint32_t g_last_probe_attempt_ms = 0U;
+uint32_t g_last_idle_media_check_ms = 0U;
 portMUX_TYPE g_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void recordDuration(uint32_t elapsed_ms, uint32_t& last_ms, uint32_t& max_ms) {
@@ -94,7 +99,9 @@ void noteFreeDepth(UBaseType_t free_depth) {
 
 void refreshBackendStatus(bool force = false) {
   const uint32_t now = millis();
-  if (!force && (uint32_t)(now - g_last_status_refresh_ms) < 1000U) return;
+  const bool logger_busy = g_recorder.active || g_close_pending || (bool)g_file;
+  const uint32_t refresh_interval_ms = sd_backend::mounted() ? kMountedStatusRefreshMs : kMissingMediaProbeIntervalMs;
+  if (!force && (uint32_t)(now - g_last_status_refresh_ms) < refresh_interval_ms) return;
   g_last_status_refresh_ms = now;
 
   sd_backend::Status backend = {};
@@ -102,10 +109,12 @@ void refreshBackendStatus(bool force = false) {
   if (g_recorder.feature_enabled) {
     if (sd_backend::mounted()) {
       ready = sd_backend::refreshStatus(backend);
-    } else if (force || g_recorder.active) {
+    } else if (force || logger_busy) {
+      g_last_probe_attempt_ms = now;
       ready = sd_backend::begin(&backend);
     }
   }
+  if (ready) g_last_probe_attempt_ms = 0U;
 
   g_recorder.backend_ready = ready;
   g_recorder.media_present = ready && backend.card_type != CARD_NONE;
@@ -604,6 +613,10 @@ void abortSessionNoMedia() {
   g_active_block_index = -1;
   abandonCurrentLog();
   resetBlockQueues();
+  g_recorder.backend_ready = false;
+  g_recorder.media_present = false;
+  g_recorder.free_bytes = telem::kLogBytesUnknown;
+  g_recorder.init_hz = 0U;
 }
 
 bool acquireFreeBlock(int& block_index) {
@@ -759,6 +772,8 @@ void begin(const AppConfig& cfg, bool enabled) {
   g_recorder.feature_enabled = enabled;
   g_last_seq = 0U;
   g_last_status_refresh_ms = 0U;
+  g_last_probe_attempt_ms = 0U;
+  g_last_idle_media_check_ms = 0U;
 
   if (!g_state_mutex) g_state_mutex = xSemaphoreCreateMutex();
   if (!g_free_block_queue) g_free_block_queue = xQueueCreate(kBlockCount, sizeof(int));
@@ -834,10 +849,32 @@ void stopSession() {
 
 void poll() {
   LockGuard lock(g_state_mutex);
-  refreshBackendStatus(false);
-  if ((!g_recorder.backend_ready || !g_recorder.media_present) &&
-      (g_recorder.active || g_close_pending || (bool)g_file)) {
-    abortSessionNoMedia();
+  const uint32_t now = millis();
+  const bool logger_busy = g_recorder.active || g_close_pending || (bool)g_file;
+  if (logger_busy) {
+    refreshBackendStatus(false);
+    if (!g_recorder.backend_ready || !g_recorder.media_present) {
+      abortSessionNoMedia();
+    }
+  } else if (!sd_backend::mounted()) {
+    g_recorder.backend_ready = false;
+    g_recorder.media_present = false;
+    g_recorder.free_bytes = telem::kLogBytesUnknown;
+    g_recorder.init_hz = 0U;
+  } else if (sd_backend::mounted() && (uint32_t)(now - g_last_idle_media_check_ms) >= kIdleMediaCheckMs) {
+    g_last_idle_media_check_ms = now;
+    if (!sd_backend::mediaPresent()) {
+      g_recorder.backend_ready = false;
+      g_recorder.media_present = false;
+      g_recorder.free_bytes = telem::kLogBytesUnknown;
+      g_recorder.init_hz = 0U;
+    } else {
+      g_recorder.backend_ready = true;
+      g_recorder.media_present = true;
+      if (g_recorder.init_hz == 0U) {
+        g_recorder.init_hz = sd_backend::mountedFrequencyHz();
+      }
+    }
   }
   g_recorder.bytes_written = g_stats.bytes_written;
   if (!g_recorder.active && g_close_pending && g_writer_task) {

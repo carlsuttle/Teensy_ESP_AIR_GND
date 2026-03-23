@@ -1155,3 +1155,25 @@ is the clean separation required to keep:
 
 - normal Wi-Fi from GND to the phone/browser
 - LR-only radio behavior between AIR and GND
+
+### SD removal follow-up
+
+Additional live validation on March 23, 2026 refined the AIR SD-removal
+behavior further:
+
+- AIR now detects missing media while idle without permanently wedging the
+  recorder state
+- when the SD card is removed, the top recorder control greys out and the
+  replay library becomes unavailable as intended
+- live telemetry now recovers correctly when the card is reinserted, with
+  library/recorder availability restored by explicit user refresh
+- a small, temporary FPS/DQI dip still occurs for roughly `2-3 s` at the
+  moment of physical card removal because AIR still performs one real SD health
+  check (`cardType` / root open) before declaring media missing
+
+Practical decision:
+
+- this remaining dip is considered acceptable for now because it is brief,
+  bounded, understandable, and far less risky than reintroducing aggressive
+  background remount/reprobe behavior that previously destabilized the live
+  telemetry path

@@ -361,3 +361,18 @@ Important radio note:
   user-facing GND AP
 - true bidirectional LR remains a future architecture task requiring a cleaner
   separation between the GND web AP and the AIR radio leg
+
+Additional SD-removal behavior validated on March 23, 2026:
+
+- removing the AIR SD card while idle now correctly reports `media missing`,
+  greys the recorder control, and hides the replay library
+- reinserting the card restores normal operation; recorder/library availability
+  can be refreshed explicitly from the UI
+- the remaining observed side effect is a brief `2-3 s` FPS/DQI dip at the
+  instant of physical card removal, attributed to the final real SD health
+  probe used to confirm media loss
+
+Operational conclusion:
+
+- this remaining transient is acceptable for now because telemetry fully
+  recovers and the system no longer enters the earlier reconnect/wedge state

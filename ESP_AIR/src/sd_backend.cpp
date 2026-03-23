@@ -21,6 +21,13 @@ bool g_mounted = false;
 uint32_t g_init_hz = 0U;
 SPIClass* g_sd_spi = nullptr;
 
+void markUnmounted() {
+  SD.end();
+  if (g_sd_spi) g_sd_spi->end();
+  g_mounted = false;
+  g_init_hz = 0U;
+}
+
 void prepareSpiPinsForSdInit() {
   // Bias lines to known idle states before handing them to the SPI peripheral.
   pinMode(kSdCsPin, OUTPUT);
@@ -28,6 +35,23 @@ void prepareSpiPinsForSdInit() {
   pinMode(kSdSckPin, INPUT_PULLUP);
   pinMode(kSdMisoPin, INPUT_PULLUP);
   pinMode(kSdMosiPin, INPUT_PULLUP);
+}
+
+bool mountedMediaHealthy() {
+  if (!g_mounted) return false;
+  const uint8_t card_type = SD.cardType();
+  if (card_type == CARD_NONE) {
+    markUnmounted();
+    return false;
+  }
+  File root = SD.open("/");
+  const bool ok = root && root.isDirectory();
+  if (root) root.close();
+  if (!ok) {
+    markUnmounted();
+    return false;
+  }
+  return true;
 }
 
 bool populateStatus(Status& status) {
@@ -40,6 +64,12 @@ bool populateStatus(Status& status) {
   status.total_bytes = 0;
   status.used_bytes = 0;
   if (!g_mounted) return false;
+  if (!mountedMediaHealthy()) {
+    status.init_hz = 0U;
+    status.spi_configured = false;
+    status.begin_ok = false;
+    return false;
+  }
   status.card_type = SD.cardType();
   status.card_size_bytes = SD.cardSize();
   status.total_bytes = SD.totalBytes();
@@ -50,12 +80,10 @@ bool populateStatus(Status& status) {
 bool beginAtFrequency(uint32_t hz) {
   if (!g_sd_spi) g_sd_spi = new SPIClass(HSPI);
   if (!g_sd_spi) {
-    g_mounted = false;
-    g_init_hz = 0U;
+    markUnmounted();
     return false;
   }
-  SD.end();
-  g_sd_spi->end();
+  markUnmounted();
   prepareSpiPinsForSdInit();
   delay(5);
   g_sd_spi->begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
@@ -120,13 +148,14 @@ bool refreshStatus(Status& status) {
 
 bool mounted() { return g_mounted; }
 
+bool mediaPresent() {
+  return mountedMediaHealthy();
+}
+
 uint32_t mountedFrequencyHz() { return g_init_hz; }
 
 void end() {
-  SD.end();
-  if (g_sd_spi) g_sd_spi->end();
-  g_mounted = false;
-  g_init_hz = 0U;
+  markUnmounted();
 }
 
 }  // namespace sd_backend

@@ -446,6 +446,37 @@ function replayModeEngaged() {
     !!linkStatus.air_replay_current_file;
 }
 
+function recorderControlState() {
+  const ctrlReady = !!wsCtrl && wsCtrl.readyState === WebSocket.OPEN;
+  const replayMode = replayModeEngaged();
+  const logBusy = !!linkStatus.air_log_busy;
+  const logBlocking = logBusy && !linkStatus.air_log_active;
+  const logUnavailable = !!linkStatus.has_log_status &&
+    (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present) &&
+    !linkStatus.air_log_active && !logBusy;
+  return {
+    ctrlReady,
+    replayMode,
+    logBusy,
+    logBlocking,
+    logUnavailable,
+    disabled: !ctrlReady || replayMode || logBlocking || logUnavailable
+  };
+}
+
+function syncRecorderControl() {
+  if (!recEl) return;
+  const state = recorderControlState();
+  recEl.disabled = state.disabled;
+  if (state.replayMode) {
+    recEl.title = "Stop replay from the Logs page before starting a new recording";
+  } else if (state.logBlocking) {
+    recEl.title = "AIR recorder is still opening or closing the current file";
+  } else if (state.logUnavailable) {
+    recEl.title = "Recording is unavailable because the AIR SD card is missing or not ready";
+  }
+}
+
 function nudgeReplayUiRefresh() {
   requestReplayStatus();
   fetchStatus();
@@ -791,16 +822,22 @@ function renderReplayFilesPanel() {
   const files = sortReplayFiles(replayFilesState.files);
   const selectedName = selectedReplayFile;
   const currentName = String(linkStatus.air_replay_current_file || "");
-  let meta = replayFilesState.refresh_inflight ? "Refreshing..." : `${replayFilesState.total_files} files`;
+  const mediaUnavailable = !!linkStatus.has_log_status &&
+    (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present);
+  let meta = mediaUnavailable
+    ? "AIR SD unavailable"
+    : (replayFilesState.refresh_inflight ? "Refreshing..." : `${replayFilesState.total_files} files`);
   if (replayFilesState.truncated) meta += " | cache clipped";
-  if (!replayFilesState.complete && !replayFilesState.refresh_inflight) meta += " | waiting for AIR";
+  if (!mediaUnavailable && !replayFilesState.complete && !replayFilesState.refresh_inflight) meta += " | waiting for AIR";
   replayFileMetaEl.textContent = meta;
 
   replayFilesEl.innerHTML = "";
-  if (!files.length) {
+  if (mediaUnavailable || !files.length) {
     const empty = document.createElement("div");
     empty.className = "file-empty";
-    empty.textContent = replayFilesState.refresh_inflight ? "Waiting for AIR file list..." : "No replay files cached yet.";
+    empty.textContent = mediaUnavailable
+      ? "Replay library unavailable while AIR SD card is missing. Reinsert the card, then refresh files or reload."
+      : (replayFilesState.refresh_inflight ? "Waiting for AIR file list..." : "No replay files cached yet.");
     replayFilesEl.appendChild(empty);
     replayFilesPanelDirty = false;
     return;
@@ -882,11 +919,7 @@ function syncReplayTransportUi() {
   const recordsTotal = Number(linkStatus.air_replay_records_total ?? 0);
   const currentFile = String(linkStatus.air_replay_current_file || "");
   const selectedFile = String(selectedReplayFile || "");
-  const logBusy = !!linkStatus.air_log_busy;
-  const logBlocking = logBusy && !linkStatus.air_log_active;
-  const logUnavailable = !!linkStatus.has_log_status &&
-    (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present) &&
-    !linkStatus.air_log_active && !logBusy;
+  const recorderState = recorderControlState();
 
   replayTransportStateEl.classList.remove("idle", "ready", "active", "complete");
   if (replayActive) {
@@ -930,16 +963,7 @@ function syncReplayTransportUi() {
   if (pauseReplayBtn) pauseReplayBtn.disabled = !ctrlReady || !replayActive;
   if (rewindReplayBtn) rewindReplayBtn.disabled = !ctrlReady || !replayMode;
   if (fastForwardReplayBtn) fastForwardReplayBtn.disabled = !ctrlReady || !replayMode;
-  if (recEl) {
-    recEl.disabled = !ctrlReady || replayMode || logBlocking || logUnavailable;
-    if (replayMode) {
-      recEl.title = "Stop replay from the Logs page before starting a new recording";
-    } else if (logBlocking) {
-      recEl.title = "AIR recorder is still opening or closing the current file";
-    } else if (logUnavailable) {
-      recEl.title = "Recording is unavailable because the AIR SD card is missing or not ready";
-    }
-  }
+  syncRecorderControl();
   if (refreshReplayFilesBtn) refreshReplayFilesBtn.disabled = logRefreshDeferred();
   if (deleteReplayFilesBtn) deleteReplayFilesBtn.disabled = logRefreshDeferred() || !selectedFile || !replayFilePresent(selectedFile);
   if (!editingReplayFile || replayFilesPanelDirty) {
@@ -1225,6 +1249,25 @@ function applyLogStatus(logStatus = null) {
   linkStatus.air_log_bytes_written = Number(logStatus.bytes_written ?? 0);
   linkStatus.air_log_free_bytes = Number(logStatus.free_bytes ?? 0xFFFFFFFF);
   linkStatus.air_log_last_change_ms = Number(logStatus.last_change_ms ?? 0);
+  if (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present) {
+    replayFilesState = {
+      files: [],
+      complete: true,
+      refresh_inflight: false,
+      truncated: false,
+      total_files: 0,
+      stored_files: 0,
+      revision: replayFilesState.revision,
+      last_update_ms: Date.now()
+    };
+    selectedReplayFile = "";
+    replayFilesPanelDirty = true;
+  }
+  setRecorderUi(
+    linkStatus.has_log_status ? !!linkStatus.air_log_active : !!linkStatus.air_recorder_on,
+    !!linkStatus.has_log_status || !!linkStatus.has_link_meta
+  );
+  syncRecorderControl();
   if ((wasActive || wasBusy) && !linkStatus.air_log_active && !linkStatus.air_log_busy) {
     maybeFlushDeferredReplayFilesRefresh();
   }
@@ -1317,6 +1360,7 @@ function setRecorderUi(enabled, known = true) {
     recEl.innerHTML = "&#9210;";
     recEl.title = "Recorder status is not available yet";
     airLoggerTextEl.textContent = "Waiting for AIR recorder status...";
+    syncRecorderControl();
     return;
   }
   if (enabled) {
@@ -1324,6 +1368,7 @@ function setRecorderUi(enabled, known = true) {
     recEl.innerHTML = "&#9209;";
     recEl.title = "Stop recording";
     airLoggerTextEl.textContent = "AIR recorder is on";
+    syncRecorderControl();
     return;
   }
   if (linkStatus.has_log_status && (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present)) {
@@ -1331,6 +1376,7 @@ function setRecorderUi(enabled, known = true) {
     recEl.innerHTML = "&#9210;";
     recEl.title = "Recording is unavailable because the AIR SD card is missing or not ready";
     airLoggerTextEl.textContent = "AIR recorder unavailable";
+    syncRecorderControl();
     return;
   }
   if (linkStatus.air_log_busy) {
@@ -1338,6 +1384,7 @@ function setRecorderUi(enabled, known = true) {
     recEl.innerHTML = "&#9209;";
     recEl.title = "AIR recorder is still opening or closing the current file";
     airLoggerTextEl.textContent = "AIR recorder is finalizing the current file";
+    syncRecorderControl();
     return;
   }
   if (replayModeEngaged()) {
@@ -1345,12 +1392,14 @@ function setRecorderUi(enabled, known = true) {
     recEl.innerHTML = "&#9210;";
     recEl.title = "Stop replay from the Logs page before starting a new recording";
     airLoggerTextEl.textContent = "AIR replay is active";
+    syncRecorderControl();
     return;
   }
   recEl.classList.add("ready");
   recEl.innerHTML = "&#9210;";
   recEl.title = "Start a new recording";
   airLoggerTextEl.textContent = "AIR live telemetry";
+  syncRecorderControl();
 }
 
 function allocCtrlReqId() {
@@ -2380,6 +2429,13 @@ function renderLogsPanel() {
   const requestedTxt = linkStatus.has_log_status ? (linkStatus.air_log_requested ? "on" : "off") : "-";
   const backendTxt = linkStatus.has_log_status ? (linkStatus.air_log_backend_ready ? "ready" : "not ready") : "-";
   const mediaTxt = linkStatus.has_log_status ? (linkStatus.air_log_media_present ? "present" : "missing") : "-";
+  const recorderNoticeTxt = linkStatus.has_log_status
+    ? ((!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present)
+      ? "recording unavailable - AIR SD card missing or not ready; reinsert card then refresh files or reload"
+      : (linkStatus.air_log_busy
+        ? "recorder busy - AIR is opening or closing a file"
+        : "none"))
+    : "-";
   const replayActiveTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_active ? "on" : "off") : "-";
   const replayPausedTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_paused ? "yes" : "no") : "-";
   const replayFileTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_file_open ? "open" : "closed") : "-";
@@ -2388,7 +2444,8 @@ function renderLogsPanel() {
   const fileOpAgeTxt = lastReplayFileOp ? String(Date.now() - lastReplayFileOp.at_ms) : "-";
   const uiDqiReasonTxt = topPenaltySummary(dqiDetail);
   logsEl.textContent =
-`status: ${activeTxt}
+`notice: ${recorderNoticeTxt}
+status: ${activeTxt}
 requested: ${requestedTxt}
 backend_ready: ${backendTxt}
 media_present: ${mediaTxt}
