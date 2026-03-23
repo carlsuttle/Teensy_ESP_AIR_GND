@@ -17,13 +17,11 @@ const appShellEl = document.getElementById("appShell");
 const airLoggerTextEl = document.getElementById("airLoggerText");
 const fusionAngularLightEl = document.getElementById("fusionAngularLight");
 const fusionMagLightEl = document.getElementById("fusionMagLight");
-const refreshReplayStatusBtn = document.getElementById("refreshReplayStatus");
 const rewindReplayBtn = document.getElementById("rewindReplay");
 const startReplayBtn = document.getElementById("startReplay");
 const pauseReplayBtn = document.getElementById("pauseReplay");
 const stopReplayBtn = document.getElementById("stopReplay");
 const fastForwardReplayBtn = document.getElementById("fastForwardReplay");
-const recordLogBtn = document.getElementById("recordLog");
 const refreshReplayFilesBtn = document.getElementById("refreshReplayFiles");
 const deleteReplayFilesBtn = document.getElementById("deleteReplayFiles");
 
@@ -70,7 +68,7 @@ const TARGET_STATE_FPS = 30;
 let lossWinStart = 0;
 let lossWinSeen = 0;
 let lossWinLost = 0;
-let activeTab = "gps";
+let activeTab = "pfd";
 let latestGps = null;
 let latestAtt = null;
 let latestBaro = null;
@@ -125,12 +123,14 @@ let clientEventLog = [];
 let statusFetchInFlight = false;
 let replayFilesFetchTimer = null;
 let replayFilesRefreshNonce = 0;
+let pendingReplayFilesRefresh = false;
 let selectedReplayFile = "";
 let editingReplayFile = "";
 let editingReplayDraft = "";
 let pendingReplayEditFocus = false;
 let replayFilesPanelDirty = true;
 let lastReplayFileOp = null;
+let controlImpactGraceUntilMs = 0;
 let replayFilesState = {
   files: [],
   complete: false,
@@ -167,6 +167,7 @@ let linkStatus = {
   last_uplink_ack_ms: 0,
   has_log_status: false,
   air_log_active: false,
+  air_log_busy: false,
   air_log_requested: false,
   air_log_backend_ready: false,
   air_log_media_present: false,
@@ -400,6 +401,13 @@ function sendReplayStart() {
   wsCtrl.send(JSON.stringify({ type: "start_replay", req_id: allocCtrlReqId() }));
 }
 
+function sendReplayStartFile(name = "") {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  const payload = { type: "start_replay", req_id: allocCtrlReqId() };
+  if (name) payload.name = String(name);
+  wsCtrl.send(JSON.stringify(payload));
+}
+
 function sendReplayStop() {
   if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
   wsCtrl.send(JSON.stringify({ type: "stop_replay", req_id: allocCtrlReqId() }));
@@ -421,6 +429,40 @@ function sortReplayFiles(files = []) {
     if (byName !== 0) return byName;
     return Number(b.size || 0) - Number(a.size || 0);
   });
+}
+
+function preferredReplayFileName() {
+  const selected = String(selectedReplayFile || "");
+  if (selected) return selected;
+  const files = sortReplayFiles(replayFilesState.files);
+  return files.length ? String(files[0].name || "") : "";
+}
+
+function replayModeEngaged() {
+  return !!linkStatus.air_replay_active ||
+    !!linkStatus.air_replay_paused ||
+    !!linkStatus.air_replay_file_open ||
+    !!linkStatus.air_replay_at_eof ||
+    !!linkStatus.air_replay_current_file;
+}
+
+function nudgeReplayUiRefresh() {
+  requestReplayStatus();
+  fetchStatus();
+  window.setTimeout(() => {
+    requestReplayStatus();
+    fetchStatus();
+  }, 350);
+  window.setTimeout(() => {
+    requestReplayStatus();
+    fetchStatus();
+  }, 1000);
+}
+
+function driveReplayStopToLive() {
+  setStatus("Con / return to live");
+  sendReplayStop();
+  nudgeReplayUiRefresh();
 }
 
 function applyReplayFilesPayload(payload = null) {
@@ -544,6 +586,27 @@ async function requestReplayFilesPayload({ refresh = true } = {}) {
   return resp.json();
 }
 
+function holdControlImpact(ms = 2500) {
+  const until = Date.now() + Math.max(0, Number(ms || 0));
+  if (until > controlImpactGraceUntilMs) controlImpactGraceUntilMs = until;
+  holdTelemetryFresh(ms);
+}
+
+function logRefreshDeferred() {
+  return !!linkStatus.air_log_active || !!linkStatus.air_log_busy;
+}
+
+function maybeFlushDeferredReplayFilesRefresh() {
+  if (!pendingReplayFilesRefresh) return;
+  if (logRefreshDeferred()) return;
+  if (activeTab !== "logs") return;
+  pendingReplayFilesRefresh = false;
+  holdControlImpact(2000);
+  window.setTimeout(() => {
+    fetchReplayFiles({ refresh: true });
+  }, 250);
+}
+
 function applyReplayFileOpResult(op, payload = null, target = "", nextTarget = "") {
   lastReplayFileOp = {
     at_ms: Date.now(),
@@ -579,6 +642,10 @@ function queueReplayFilesRefresh(pollOnly = false, attempt = 0, nonce = replayFi
 async function fetchReplayFiles({ refresh = true, attempt = 0, nonce = null } = {}) {
   const activeNonce = nonce ?? ++replayFilesRefreshNonce;
   if (nonce === null) replayFilesRefreshNonce = activeNonce;
+  if (refresh && logRefreshDeferred()) {
+    pendingReplayFilesRefresh = true;
+    refresh = false;
+  }
   try {
     const payload = await requestReplayFilesPayload({ refresh });
     if (activeNonce !== replayFilesRefreshNonce) return;
@@ -815,7 +882,11 @@ function syncReplayTransportUi() {
   const recordsTotal = Number(linkStatus.air_replay_records_total ?? 0);
   const currentFile = String(linkStatus.air_replay_current_file || "");
   const selectedFile = String(selectedReplayFile || "");
-  const recordActive = !!linkStatus.air_log_active;
+  const logBusy = !!linkStatus.air_log_busy;
+  const logBlocking = logBusy && !linkStatus.air_log_active;
+  const logUnavailable = !!linkStatus.has_log_status &&
+    (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present) &&
+    !linkStatus.air_log_active && !logBusy;
 
   replayTransportStateEl.classList.remove("idle", "ready", "active", "complete");
   if (replayActive) {
@@ -826,10 +897,10 @@ function syncReplayTransportUi() {
     replayTransportStateEl.textContent = "PAUSED";
   } else if (replayKnown && atEof) {
     replayTransportStateEl.classList.add("complete");
-    replayTransportStateEl.textContent = "COMPLETE";
-  } else if (replayKnown) {
+    replayTransportStateEl.textContent = "DONE";
+  } else if (replayKnown && currentFile) {
     replayTransportStateEl.classList.add("ready");
-    replayTransportStateEl.textContent = "READY";
+    replayTransportStateEl.textContent = "STOPPED";
   } else {
     replayTransportStateEl.classList.add("idle");
     replayTransportStateEl.textContent = "IDLE";
@@ -853,22 +924,61 @@ function syncReplayTransportUi() {
     replayTransportHintEl.textContent = "";
   }
 
-  if (refreshReplayStatusBtn) refreshReplayStatusBtn.disabled = !ctrlReady;
+  const replayMode = replayModeEngaged();
   if (startReplayBtn) startReplayBtn.disabled = !ctrlReady || replayActive;
-  if (stopReplayBtn) stopReplayBtn.disabled = !ctrlReady || !fileOpen;
+  if (stopReplayBtn) stopReplayBtn.disabled = !ctrlReady || !replayMode;
   if (pauseReplayBtn) pauseReplayBtn.disabled = !ctrlReady || !replayActive;
-  if (rewindReplayBtn) rewindReplayBtn.disabled = !ctrlReady || !fileOpen;
-  if (fastForwardReplayBtn) fastForwardReplayBtn.disabled = !ctrlReady || !fileOpen;
-  if (recordLogBtn) {
-    recordLogBtn.disabled = !ctrlReady;
-    recordLogBtn.classList.toggle("on", recordActive);
-    recordLogBtn.title = recordActive ? "Stop live recording" : "Start live recording";
+  if (rewindReplayBtn) rewindReplayBtn.disabled = !ctrlReady || !replayMode;
+  if (fastForwardReplayBtn) fastForwardReplayBtn.disabled = !ctrlReady || !replayMode;
+  if (recEl) {
+    recEl.disabled = !ctrlReady || replayMode || logBlocking || logUnavailable;
+    if (replayMode) {
+      recEl.title = "Stop replay from the Logs page before starting a new recording";
+    } else if (logBlocking) {
+      recEl.title = "AIR recorder is still opening or closing the current file";
+    } else if (logUnavailable) {
+      recEl.title = "Recording is unavailable because the AIR SD card is missing or not ready";
+    }
   }
-  if (refreshReplayFilesBtn) refreshReplayFilesBtn.disabled = false;
-  if (deleteReplayFilesBtn) deleteReplayFilesBtn.disabled = !selectedFile || !replayFilePresent(selectedFile);
+  if (refreshReplayFilesBtn) refreshReplayFilesBtn.disabled = logRefreshDeferred();
+  if (deleteReplayFilesBtn) deleteReplayFilesBtn.disabled = logRefreshDeferred() || !selectedFile || !replayFilePresent(selectedFile);
   if (!editingReplayFile || replayFilesPanelDirty) {
     renderReplayFilesPanel();
   }
+}
+
+function toggleHeaderRecording() {
+  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
+  const replayMode = replayModeEngaged();
+  if (replayMode) {
+    setStatus("Con / stop replay in Logs first");
+    return;
+  }
+  if (linkStatus.air_log_busy && !linkStatus.air_log_active) {
+    setStatus("Con / recorder busy");
+    return;
+  }
+  holdControlImpact(3000);
+  if (linkStatus.air_log_active) {
+    pendingReplayFilesRefresh = true;
+    setStatus("Con / stop recording");
+    sendLogStop();
+    requestLogStatus();
+    fetchStatus();
+    window.setTimeout(() => {
+      requestLogStatus();
+      fetchStatus();
+    }, 500);
+    return;
+  }
+  setStatus("Con / starting new recording");
+  sendLogStart();
+  requestLogStatus();
+  fetchStatus();
+  window.setTimeout(() => {
+    requestLogStatus();
+    fetchStatus();
+  }, 500);
 }
 
 function sendFusion(partial = {}) {
@@ -933,14 +1043,16 @@ function dqiBadgeClass(score) {
 
 function updateDataQuality() {
   const startupGraceActive = Date.now() < suppressStaleUntilMs;
-  const startupSettleActive = startupGraceActive || (lastStateSocketOpenAt > 0 && (Date.now() - lastStateSocketOpenAt) < DQI_STARTUP_SETTLE_MS);
+  const controlGraceActive = Date.now() < controlImpactGraceUntilMs;
+  const startupSettleActive = startupGraceActive || controlGraceActive ||
+    (lastStateSocketOpenAt > 0 && (Date.now() - lastStateSocketOpenAt) < DQI_STARTUP_SETTLE_MS);
   const staleMs = lastStateAt ? (Date.now() - lastStateAt) : Infinity;
   const stateFresh = isFresh(lastStateAt, STATE_STALE_MS);
   const radioFresh = !!linkStatus.air_link_fresh;
   const rateNow = stateFresh ? clientStateFps : 0;
   const haveClientRate = stateFresh && Number.isFinite(clientStateFps) && clientStateFps > 0;
-  const rateRatio = startupSettleActive && !haveClientRate ? 1 : clamp(rateNow / TARGET_STATE_FPS, 0, 1);
-  const radioRateRatio = startupSettleActive && (radioStateFps === null || radioStateFps <= 0 || !radioFresh)
+  const rateRatio = (controlGraceActive || (startupSettleActive && !haveClientRate)) ? 1 : clamp(rateNow / TARGET_STATE_FPS, 0, 1);
+  const radioRateRatio = (controlGraceActive || (startupSettleActive && (radioStateFps === null || radioStateFps <= 0 || !radioFresh)))
     ? 1
     : ((radioStateFps === null || !radioFresh) ? 0 : clamp(radioStateFps / TARGET_STATE_FPS, 0, 1));
   const radioRtt = Number(linkStatus.radio_rtt_ms ?? 0);
@@ -956,7 +1068,7 @@ function updateDataQuality() {
   // `state_seq_gap` tracks skipped source states from the faster upstream mirror stream,
   // not just missing radio deliveries, so treating it as radio loss permanently depresses DQI.
   const radioLossRatio = 0;
-  const wsLossRatio = clamp(Number(lossWinLost) / Math.max(1, Number(lossWinSeen) + Number(lossWinLost)), 0, 1);
+  const wsLossRatio = controlGraceActive ? 0 : clamp(Number(lossWinLost) / Math.max(1, Number(lossWinSeen) + Number(lossWinLost)), 0, 1);
 
   let score = 100;
   const penaltyRadioFresh = !radioFresh ? 30 : 0;
@@ -1100,8 +1212,11 @@ function renderFusionLights() {
 
 function applyLogStatus(logStatus = null) {
   if (!logStatus) return;
+  const wasActive = !!linkStatus.air_log_active;
+  const wasBusy = !!linkStatus.air_log_busy;
   linkStatus.has_log_status = true;
   linkStatus.air_log_active = !!logStatus.active;
+  linkStatus.air_log_busy = !!logStatus.busy;
   linkStatus.air_log_requested = !!logStatus.requested;
   linkStatus.air_log_backend_ready = !!logStatus.backend_ready;
   linkStatus.air_log_media_present = !!logStatus.media_present;
@@ -1110,6 +1225,9 @@ function applyLogStatus(logStatus = null) {
   linkStatus.air_log_bytes_written = Number(logStatus.bytes_written ?? 0);
   linkStatus.air_log_free_bytes = Number(logStatus.free_bytes ?? 0xFFFFFFFF);
   linkStatus.air_log_last_change_ms = Number(logStatus.last_change_ms ?? 0);
+  if ((wasActive || wasBusy) && !linkStatus.air_log_active && !linkStatus.air_log_busy) {
+    maybeFlushDeferredReplayFilesRefresh();
+  }
 }
 
 function applyReplayStatus(replayStatus = null) {
@@ -1193,27 +1311,45 @@ function applyPolledState(state = null, seq = 0, tUs = 0, espRxMs = 0) {
 }
 
 function setRecorderUi(enabled, known = true) {
-  recEl.classList.remove("live", "record", "replay", "unknown");
+  recEl.classList.remove("ready", "recording", "unknown");
   if (!known) {
     recEl.classList.add("unknown");
-    recEl.textContent = "MODE --";
+    recEl.innerHTML = "&#9210;";
+    recEl.title = "Recorder status is not available yet";
     airLoggerTextEl.textContent = "Waiting for AIR recorder status...";
     return;
   }
-  if (linkStatus.air_replay_active) {
-    recEl.classList.add("replay");
-    recEl.textContent = "REPLAY";
-    airLoggerTextEl.textContent = "AIR replay is active";
-    return;
-  }
   if (enabled) {
-    recEl.classList.add("record");
-    recEl.textContent = "RECORD";
+    recEl.classList.add("recording");
+    recEl.innerHTML = "&#9209;";
+    recEl.title = "Stop recording";
     airLoggerTextEl.textContent = "AIR recorder is on";
     return;
   }
-  recEl.classList.add("live");
-  recEl.textContent = "LIVE";
+  if (linkStatus.has_log_status && (!linkStatus.air_log_backend_ready || !linkStatus.air_log_media_present)) {
+    recEl.classList.add("unknown");
+    recEl.innerHTML = "&#9210;";
+    recEl.title = "Recording is unavailable because the AIR SD card is missing or not ready";
+    airLoggerTextEl.textContent = "AIR recorder unavailable";
+    return;
+  }
+  if (linkStatus.air_log_busy) {
+    recEl.classList.add("ready");
+    recEl.innerHTML = "&#9209;";
+    recEl.title = "AIR recorder is still opening or closing the current file";
+    airLoggerTextEl.textContent = "AIR recorder is finalizing the current file";
+    return;
+  }
+  if (replayModeEngaged()) {
+    recEl.classList.add("ready");
+    recEl.innerHTML = "&#9210;";
+    recEl.title = "Stop replay from the Logs page before starting a new recording";
+    airLoggerTextEl.textContent = "AIR replay is active";
+    return;
+  }
+  recEl.classList.add("ready");
+  recEl.innerHTML = "&#9210;";
+  recEl.title = "Start a new recording";
   airLoggerTextEl.textContent = "AIR live telemetry";
 }
 
@@ -1414,6 +1550,7 @@ async function fetchStatus() {
     if (data.has_log_status) {
       applyLogStatus({
         active: data.air_log_active,
+        busy: data.air_log_busy,
         requested: data.air_log_requested,
         backend_ready: data.air_log_backend_ready,
         media_present: data.air_log_media_present,
@@ -1439,7 +1576,10 @@ async function fetchStatus() {
         current_file: data.air_replay_current_file
       });
     }
-    setRecorderUi(!!linkStatus.air_recorder_on, !!linkStatus.has_link_meta);
+    setRecorderUi(
+      linkStatus.has_log_status ? !!linkStatus.air_log_active : !!linkStatus.air_recorder_on,
+      !!linkStatus.has_log_status || !!linkStatus.has_link_meta
+    );
     uiDirty = true;
     linkDirty = true;
   } catch (_err) {
@@ -2085,12 +2225,11 @@ function renderHeader() {
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
   const linkDqi = uplinkDqiSmoothed;
   const uiDqi = dqiSmoothed;
-  const linkDqiTxt = linkDqi === null ? "--" : String(linkDqi);
-  const uiDqiTxt = uiDqi === null ? "--" : String(uiDqi);
-  const linkBadge = `<span class="${dqiBadgeClass(linkDqi)}">LINK:${linkDqiTxt}</span>`;
-  const uiBadge = `<span class="${dqiBadgeClass(uiDqi)}">UI:${uiDqiTxt}</span>`;
+  const combinedDqi = (linkDqi === null) ? uiDqi : ((uiDqi === null) ? linkDqi : Math.min(linkDqi, uiDqi));
+  const combinedDqiTxt = combinedDqi === null ? "--" : String(combinedDqi);
+  const dqiBadge = `<span class="${dqiBadgeClass(combinedDqi)}">DQI:${combinedDqiTxt}</span>`;
   statsEl.innerHTML =
-    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span>${linkBadge}${uiBadge}</span>`;
+    `<span class="stats-line"><span>fps: ${stateFpsTxt}</span>${dqiBadge}</span>`;
 }
 
 function renderGpsPanel() {
@@ -2102,6 +2241,11 @@ function renderGpsPanel() {
 lat: ${fmt(gps.la, 7)} lon: ${fmt(gps.lo, 7)}
 speed: ${fmt(gps.gs, 2)} m/s course: ${fmt(gps.cr, 2)} deg
 hAcc: ${fmt(gps.ha, 2)} m sAcc: ${fmt(gps.sa, 2)} m/s`;
+}
+
+function renderPositionPanel() {
+  latestGps ? renderGpsPanel() : renderGpsStale();
+  latestBaro ? renderBaroPanel() : renderBaroStale();
 }
 
 function renderAttPanel() {
@@ -2280,12 +2424,10 @@ function renderActiveTab() {
   }
   if (activeTab === "pfd") {
     renderPfdPanel();
-  } else if (activeTab === "gps") {
-    renderGpsPanel();
+  } else if (activeTab === "position") {
+    renderPositionPanel();
   } else if (activeTab === "att") {
     renderAttPanel();
-  } else if (activeTab === "baro") {
-    renderBaroPanel();
   } else if (activeTab === "link") {
     renderLinkPanel();
   } else if (activeTab === "logs") {
@@ -2306,9 +2448,8 @@ function renderNow() {
     linkDirty = false;
   }
   if (activeTab === "pfd") (latestAtt || latestGps || latestBaro) ? renderPfdPanel() : renderPfdStale();
-  if (activeTab === "gps") latestGps ? renderGpsPanel() : renderGpsStale();
+  if (activeTab === "position") renderPositionPanel();
   if (activeTab === "att") latestAtt ? renderAttPanel() : renderAttStale();
-  if (activeTab === "baro") latestBaro ? renderBaroPanel() : renderBaroStale();
   uiDirty = false;
 }
 
@@ -2394,7 +2535,8 @@ function handleBinaryStateMessage(buf) {
       lossWinLost = 0;
     } else if (wsSeq > lastWsSeq + 1) {
       const gap = (wsSeq - lastWsSeq - 1);
-      const treatAsReset = staleGap || wasStale || (nowMs - lastStateSocketOpenAt) < 2000 || gap > (TARGET_STATE_FPS * 3);
+      const treatAsReset = staleGap || wasStale || (nowMs - lastStateSocketOpenAt) < 2000 ||
+        nowMs < controlImpactGraceUntilMs || gap > (TARGET_STATE_FPS * 3);
       if (!treatAsReset) {
         wsLoss += gap;
         lossWinLost += gap;
@@ -2764,6 +2906,7 @@ document.querySelectorAll(".tabs button").forEach((b) => {
     document.getElementById(`tab-${b.dataset.tab}`).classList.add("active");
     activeTab = b.dataset.tab;
     uiDirty = true;
+    if (activeTab === "logs") maybeFlushDeferredReplayFilesRefresh();
     renderNow();
   });
 });
@@ -2878,37 +3021,18 @@ document.getElementById("applyRate").addEventListener("click", async () => {
   }
 });
 
-document.getElementById("refreshLogStatus").addEventListener("click", () => {
-  requestLogStatus();
-  fetchStatus();
-});
-
-document.getElementById("startLog").addEventListener("click", () => {
-  sendLogStart();
-});
-
-document.getElementById("stopLog").addEventListener("click", () => {
-  sendLogStop();
-});
-
-refreshReplayStatusBtn.addEventListener("click", () => {
-  requestReplayStatus();
-  fetchStatus();
-});
-
 startReplayBtn.addEventListener("click", () => {
-  if (!wsCtrl || wsCtrl.readyState !== WebSocket.OPEN) return;
-  const payload = { type: "start_replay", req_id: allocCtrlReqId() };
-  if (selectedReplayFile) payload.name = selectedReplayFile;
-  wsCtrl.send(JSON.stringify(payload));
+  sendReplayStartFile(preferredReplayFileName());
+  nudgeReplayUiRefresh();
 });
 
 stopReplayBtn.addEventListener("click", () => {
-  sendReplayStop();
+  driveReplayStopToLive();
 });
 
 pauseReplayBtn.addEventListener("click", () => {
   sendReplayPause();
+  nudgeReplayUiRefresh();
 });
 
 rewindReplayBtn.addEventListener("click", () => {
@@ -2919,15 +3043,12 @@ fastForwardReplayBtn.addEventListener("click", () => {
   sendReplaySeek(100);
 });
 
-recordLogBtn.addEventListener("click", () => {
-  if (linkStatus.air_log_active) {
-    sendLogStop();
-  } else {
-    sendLogStart();
-  }
+recEl.addEventListener("click", () => {
+  toggleHeaderRecording();
 });
 
 refreshReplayFilesBtn.addEventListener("click", () => {
+  holdControlImpact(2000);
   fetchReplayFiles({ refresh: true });
 });
 

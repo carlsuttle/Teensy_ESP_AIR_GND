@@ -335,3 +335,29 @@ The main remaining work is now feature validation of:
 - live recording behavior through the GUI
 - replay behavior through the GUI
 rather than basic transport bring-up.
+
+## Follow-on Notes (March 23, 2026)
+
+Subsequent integrated work on March 23, 2026 produced these additional
+practical findings:
+
+- a new motion log was recorded through the live system and replayed
+  successfully through the web workflow
+- the replay/file-management UI on GND was substantially simplified and made
+  more operationally useful
+- AIR/GND log status now exposes a distinct `busy` state so the browser can
+  defer file refresh until log open/close/finalization work is complete
+- AIR logging now aborts cleanly if SD media disappears during an active
+  session, instead of leaving the recorder path wedged
+- GND remote file tracking was expanded to support larger AIR file libraries
+  and AIR file-list transmission is now paced to avoid chunk loss during large
+  refreshes
+
+Important radio note:
+
+- attempting to enable ESP-NOW LR mode on the GND SoftAP path caused the
+  `Telemetry` Wi-Fi network to disappear for normal client devices
+- the working system therefore remains on normal Wi-Fi protocol for the
+  user-facing GND AP
+- true bidirectional LR remains a future architecture task requiring a cleaner
+  separation between the GND web AP and the AIR radio leg

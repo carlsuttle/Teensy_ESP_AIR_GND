@@ -27,6 +27,7 @@ static constexpr uint8_t kLogStatusFlagActive = 1U << 0;
 static constexpr uint8_t kLogStatusFlagRequested = 1U << 1;
 static constexpr uint8_t kLogStatusFlagBackendReady = 1U << 2;
 static constexpr uint8_t kLogStatusFlagMediaPresent = 1U << 3;
+static constexpr uint8_t kLogStatusFlagBusy = 1U << 4;
 static constexpr uint32_t kLogBytesUnknown = 0xFFFFFFFFUL;
 static constexpr uint16_t kTelemetryStateRecordBytes = 160U;
 static constexpr uint16_t kReplayRecordBytes = 160U;

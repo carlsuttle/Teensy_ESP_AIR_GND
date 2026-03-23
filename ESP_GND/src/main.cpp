@@ -349,10 +349,11 @@ void setup() {
   }
   configureDhcpLeaseRange();
 
-  Serial.printf("AP ssid=%s ip=%s channel=%d lr=%u\n",
+  Serial.printf("AP ssid=%s ip=%s channel=%d ap_lr=%u air_lr_req=%u\n",
                 cfg.ap_ssid,
                 WiFi.softAPIP().toString().c_str(),
                 kApChannel,
+                0U,
                 (unsigned)(cfg.radio_lr_mode != 0U));
 
   if (!LittleFS.begin(true)) {

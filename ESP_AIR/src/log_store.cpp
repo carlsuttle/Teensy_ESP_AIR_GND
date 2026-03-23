@@ -591,6 +591,21 @@ void closeCurrentLog() {
   refreshBackendStatus(false);
 }
 
+void abandonCurrentLog() {
+  if (g_file) {
+    g_file.close();
+  }
+  g_current_name = "";
+}
+
+void abortSessionNoMedia() {
+  g_recorder.active = false;
+  g_close_pending = false;
+  g_active_block_index = -1;
+  abandonCurrentLog();
+  resetBlockQueues();
+}
+
 bool acquireFreeBlock(int& block_index) {
   if (!g_free_block_queue) return false;
   if (xQueueReceive(g_free_block_queue, &block_index, 0) != pdTRUE) {
@@ -818,7 +833,12 @@ void stopSession() {
 }
 
 void poll() {
+  LockGuard lock(g_state_mutex);
   refreshBackendStatus(false);
+  if ((!g_recorder.backend_ready || !g_recorder.media_present) &&
+      (g_recorder.active || g_close_pending || (bool)g_file)) {
+    abortSessionNoMedia();
+  }
   g_recorder.bytes_written = g_stats.bytes_written;
   if (!g_recorder.active && g_close_pending && g_writer_task) {
     xTaskNotifyGive(g_writer_task);

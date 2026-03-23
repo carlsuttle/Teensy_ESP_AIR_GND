@@ -1071,3 +1071,87 @@ The replay loop is now credible for algorithm development:
 
 This moves replay validation out of the "open transport risk" category and into
 the "usable tuning workflow" category.
+
+---
+
+## 17. Web Workflow / Recorder / Radio Follow-on Notes (March 23, 2026)
+
+This section records the integrated web-control and radio-link work completed
+after replay integrity had already been validated.
+
+### Results verified in the live stack
+
+- replay can now be started from GND and exercised through the web GUI using
+  actual AIR log files
+- a newly recorded motion session was replayed successfully and the web
+  instruments responded correctly
+- the default tab is now `PFD`
+- the old separate `GPS` and `Baro` tabs were merged into a single
+  `Position` tab with barometric data rendered below GPS data
+- the top header recorder control was simplified into a single start/stop
+  recorder button with `1 Hz` flash while active
+- the replay library now returns the full file list again after scaling the
+  GND-side file cache and chunk tracking and pacing AIR file-list chunks
+
+### Techniques that worked
+
+- the recorder UI is now driven from explicit AIR log-status flags rather than
+  inferred link metadata
+- a dedicated `busy` log-status flag was added so the browser can distinguish
+  "actively recording" from "opening/closing/finalizing a file"
+- replay-file refresh is now deferred while AIR is actively recording or
+  finalizing a log, then flushed when the logger becomes idle
+- AIR now aborts the active log session cleanly if SD media/backend disappear,
+  rather than wedging the whole recorder state
+- the browser DQI path now suppresses false penalties during deliberate control
+  transitions such as replay and record start/stop
+- GND remote file tracking was expanded from the earlier small cache to a
+  chunked, scalable `256`-file model, and AIR file-list transmission is now
+  lightly paced between chunks
+
+### Difficulties found
+
+- replay/control activity initially made the browser look broken even when the
+  backend transport path was healthy; page reloads helped expose that this was a
+  client-state/DQI issue rather than a Teensy/AIR telemetry failure
+- file operations were difficult to reason about because browser, GND, AIR, and
+  SD behavior were all asynchronous; rename/delete correctness and file-list
+  freshness had to be separated as different problems
+- start/stop recording could temporarily depress FPS/DQI because intentional
+  control-side discontinuities were being scored as telemetry quality failures
+- SD removal during recording originally left the recorder in a bad state and
+  could stall the UI until the recorder/session-abort logic was hardened
+
+### ESP-NOW LR finding
+
+An important radio compatibility finding was made during this session:
+
+- enabling `WIFI_PROTOCOL_LR` on GND's SoftAP made the `Telemetry` Wi-Fi
+  network disappear to normal client devices
+- the web server remains on GND and must continue to present a normal Wi-Fi AP
+  to the iPhone/browser
+- LR is therefore not currently active end-to-end on the working AIR <-> GND
+  radio path
+
+Current practical status:
+
+- GND SoftAP is back on normal `11b/g/n` so the web client can connect
+- AIR can still request LR on its STA side
+- true bidirectional LR between AIR and GND remains a follow-on task and will
+  require a cleaner GND AP/STA split so the user-facing AP is not the same path
+  carrying the AIR radio leg
+
+### Practical conclusion
+
+The integrated system is now substantially easier to operate from the browser:
+
+- live recording is controlled from a single top-bar recorder button
+- replay management is concentrated in the `Logs` tab
+- file-list completeness is restored
+- recorder/media failures are handled more explicitly
+
+The main remaining radio architecture task is no longer basic link bring-up. It
+is the clean separation required to keep:
+
+- normal Wi-Fi from GND to the phone/browser
+- LR-only radio behavior between AIR and GND

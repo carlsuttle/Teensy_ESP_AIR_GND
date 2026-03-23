@@ -12,14 +12,18 @@ namespace {
 constexpr uint8_t kUnitAir = 1U;
 constexpr uint8_t kUnitGnd = 2U;
 constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
-constexpr size_t kRxQueueCapacity = 32U;
+constexpr size_t kRxQueueCapacity = 128U;
 constexpr uint8_t kSendFailThreshold = 6U;
 constexpr uint32_t kHelloIntervalMs = 1000U;
 constexpr uint32_t kPeerStaleMs = 3000U;
 constexpr uint32_t kRadioPingIntervalMs = 1000U;
 constexpr uint32_t kRadioPingTimeoutMs = 1000U;
 constexpr uint8_t kRadioRttSampleCount = 8U;
-constexpr uint16_t kRemoteFileCapacity = 64U;
+constexpr uint16_t kRemoteFileCapacity = 256U;
+constexpr uint16_t kRemoteFileChunkCapacity =
+    (uint16_t)((kRemoteFileCapacity + telem::kLogFileChunkEntries - 1U) / telem::kLogFileChunkEntries);
+constexpr uint8_t kRemoteFileChunkWordCount =
+    (uint8_t)((kRemoteFileChunkCapacity + 31U) / 32U);
 constexpr uint32_t kRemoteFilesRefreshTimeoutMs = 2500U;
 constexpr uint32_t kRemoteFilesRefreshDebounceMs = 750U;
 
@@ -63,9 +67,11 @@ telem::LogFileInfoV1 g_remote_files[kRemoteFileCapacity] = {};
 uint16_t g_remote_file_total = 0U;
 uint16_t g_remote_file_count = 0U;
 uint16_t g_remote_file_chunk_count = 0U;
-uint32_t g_remote_file_chunk_mask = 0U;
+uint16_t g_remote_file_chunk_seen_count = 0U;
+uint32_t g_remote_file_chunk_seen[kRemoteFileChunkWordCount] = {};
 bool g_remote_files_complete = false;
 bool g_remote_files_refresh_inflight = false;
+bool g_remote_files_truncated = false;
 uint32_t g_remote_files_revision = 0U;
 uint32_t g_remote_files_last_update_ms = 0U;
 
@@ -77,9 +83,11 @@ void resetRemoteFiles(uint16_t total_files = 0U, uint16_t chunk_count = 0U) {
   memset(g_remote_files, 0, sizeof(g_remote_files));
   g_remote_file_total = total_files;
   g_remote_file_count = 0U;
-  g_remote_file_chunk_count = chunk_count;
-  g_remote_file_chunk_mask = 0U;
+  g_remote_file_chunk_count = chunk_count > kRemoteFileChunkCapacity ? kRemoteFileChunkCapacity : chunk_count;
+  g_remote_file_chunk_seen_count = 0U;
+  memset(g_remote_file_chunk_seen, 0, sizeof(g_remote_file_chunk_seen));
   g_remote_files_complete = false;
+  g_remote_files_truncated = (total_files > kRemoteFileCapacity) || (chunk_count > kRemoteFileChunkCapacity);
 }
 
 void beginRemoteFilesRefresh() {
@@ -96,11 +104,16 @@ void normalizeRemoteFilesRefreshState() {
 }
 
 uint8_t desiredProtocol() {
-  return (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  const uint8_t kNormalMask = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  return g_radio_lr_mode ? (uint8_t)(kNormalMask | WIFI_PROTOCOL_LR) : kNormalMask;
 }
 
 void applyRadioProtocol() {
-  (void)esp_wifi_set_protocol(WIFI_IF_AP, desiredProtocol());
+  // Keep the user-facing SoftAP on standard Wi-Fi rates so phones/tablets
+  // can still see and join the telemetry network. GND currently runs ESP-NOW
+  // over the AP interface, so LR on GND has to wait for a cleaner AP/STA split.
+  (void)esp_wifi_set_protocol(WIFI_IF_AP, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+  (void)esp_wifi_set_protocol(WIFI_IF_STA, desiredProtocol());
 }
 
 bool isBroadcastMac(const uint8_t* mac) {
@@ -655,6 +668,13 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
           chunk.total_files != g_remote_file_total) {
         resetRemoteFiles(chunk.total_files, chunk_count);
       }
+      if (chunk.chunk_index >= g_remote_file_chunk_count) {
+        g_remote_files_last_update_ms = millis();
+        g_remote_files_refresh_inflight = false;
+        g_snapshot.stats.frames_ok++;
+        g_snapshot.stats.last_rx_ms = millis();
+        break;
+      }
       const uint16_t base_index = (uint16_t)(chunk.chunk_index * telem::kLogFileChunkEntries);
       const uint16_t copy_count =
           (chunk.entries_in_chunk < telem::kLogFileChunkEntries) ? chunk.entries_in_chunk : telem::kLogFileChunkEntries;
@@ -666,13 +686,15 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
           g_remote_file_count = (uint16_t)(dst_index + 1U);
         }
       }
-      if (chunk.chunk_index < 32U) {
-        g_remote_file_chunk_mask |= (1UL << chunk.chunk_index);
+      const uint16_t chunk_word = (uint16_t)(chunk.chunk_index / 32U);
+      const uint32_t chunk_bit = (1UL << (chunk.chunk_index % 32U));
+      if ((g_remote_file_chunk_seen[chunk_word] & chunk_bit) == 0U) {
+        g_remote_file_chunk_seen[chunk_word] |= chunk_bit;
+        g_remote_file_chunk_seen_count++;
       }
       g_remote_files_last_update_ms = millis();
       g_remote_files_refresh_inflight = false;
-      const uint32_t expected_mask = chunk_count >= 32U ? 0xFFFFFFFFUL : ((1UL << chunk_count) - 1UL);
-      if (g_remote_file_chunk_mask == expected_mask) {
+      if (g_remote_file_chunk_seen_count >= g_remote_file_chunk_count) {
         g_remote_files_complete = true;
         g_remote_files_revision++;
       }
@@ -900,7 +922,7 @@ RemoteFilesStatus remoteFilesStatus() {
   out.last_update_ms = g_remote_files_last_update_ms;
   out.complete = g_remote_files_complete;
   out.refresh_inflight = g_remote_files_refresh_inflight;
-  out.truncated = g_remote_file_total > kRemoteFileCapacity;
+  out.truncated = g_remote_files_truncated;
   return out;
 }
 
@@ -921,7 +943,7 @@ String remoteFilesJson(bool refresh_requested) {
   json += ",\"stored_files\":";
   json += String(g_remote_file_count);
   json += ",\"truncated\":";
-  json += (g_remote_file_total > kRemoteFileCapacity) ? "true" : "false";
+  json += g_remote_files_truncated ? "true" : "false";
   json += ",\"last_update_ms\":";
   json += String(g_remote_files_last_update_ms);
   json += ",\"files\":[";

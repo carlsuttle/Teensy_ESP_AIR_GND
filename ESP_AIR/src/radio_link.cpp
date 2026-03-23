@@ -464,6 +464,7 @@ uint8_t currentLogFlags() {
   if (g_log_requested) flags |= telem::kLogStatusFlagRequested;
   if (recorder.backend_ready) flags |= telem::kLogStatusFlagBackendReady;
   if (recorder.media_present) flags |= telem::kLogStatusFlagMediaPresent;
+  if (!recorder.active && log_store::busy()) flags |= telem::kLogStatusFlagBusy;
   return flags;
 }
 
@@ -681,6 +682,9 @@ void sendLogFileListFrames() {
     chunk.chunk_count = chunk_count;
     chunk.entries_in_chunk = returned_files;
     (void)sendFrame(telem::TELEM_LOG_FILE_LIST, &chunk, sizeof(chunk), 0U, micros());
+    if ((uint16_t)(chunk_index + 1U) < chunk_count) {
+      delay(2);
+    }
   }
 }
 

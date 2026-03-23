@@ -63,6 +63,7 @@ void appendLogStatus(JsonDocument& doc, const telem::LogStatusPayloadV1& status)
   log["requested"] = (status.flags & telem::kLogStatusFlagRequested) != 0U;
   log["backend_ready"] = (status.flags & telem::kLogStatusFlagBackendReady) != 0U;
   log["media_present"] = (status.flags & telem::kLogStatusFlagMediaPresent) != 0U;
+  log["busy"] = (status.flags & telem::kLogStatusFlagBusy) != 0U;
   log["last_command"] = status.last_command;
   log["session_id"] = status.session_id;
   log["bytes_written"] = status.bytes_written;
@@ -586,6 +587,7 @@ void begin() {
     doc["air_log_requested"] = (snap.log_status.flags & telem::kLogStatusFlagRequested) != 0U;
     doc["air_log_backend_ready"] = (snap.log_status.flags & telem::kLogStatusFlagBackendReady) != 0U;
     doc["air_log_media_present"] = (snap.log_status.flags & telem::kLogStatusFlagMediaPresent) != 0U;
+    doc["air_log_busy"] = (snap.log_status.flags & telem::kLogStatusFlagBusy) != 0U;
     doc["air_log_last_command"] = snap.log_status.last_command;
     doc["air_log_session_id"] = snap.log_status.session_id;
     doc["air_log_bytes_written"] = snap.log_status.bytes_written;
@@ -665,7 +667,9 @@ void begin() {
 
   g_server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* request) {
     const bool refresh_requested = !request->hasParam("refresh") || request->getParam("refresh")->value() != "0";
-    if (refresh_requested) {
+    const radio_link::Snapshot snap = radio_link::snapshot();
+    const bool logger_busy = (snap.log_status.flags & telem::kLogStatusFlagBusy) != 0U;
+    if (refresh_requested && !logger_busy) {
       (void)radio_link::sendGetLogFileList();
     }
     request->send(200, "application/json", radio_link::remoteFilesJson(refresh_requested));
