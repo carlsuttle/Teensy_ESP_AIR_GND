@@ -75,6 +75,7 @@ void appendReplayStatus(JsonDocument& doc, const telem::ReplayStatusPayloadV1& s
   replay["active"] = (status.flags & telem::kReplayStatusFlagActive) != 0U;
   replay["file_open"] = (status.flags & telem::kReplayStatusFlagFileOpen) != 0U;
   replay["at_eof"] = (status.flags & telem::kReplayStatusFlagAtEof) != 0U;
+  replay["paused"] = (status.flags & telem::kReplayStatusFlagPaused) != 0U;
   replay["teensy_seen"] = (status.flags & telem::kReplayStatusFlagTeensyReplaySeen) != 0U;
   replay["last_command"] = status.last_command;
   replay["session_id"] = status.session_id;
@@ -82,6 +83,7 @@ void appendReplayStatus(JsonDocument& doc, const telem::ReplayStatusPayloadV1& s
   replay["records_sent"] = status.records_sent;
   replay["last_error"] = status.last_error;
   replay["last_change_ms"] = status.last_change_ms;
+  replay["current_file"] = status.current_file;
 }
 
 void broadcastConfig(AsyncWebSocketClient* client = nullptr) {
@@ -133,6 +135,72 @@ void sendAck(AsyncWebSocketClient* client,
     appendReplayStatus(doc, *replay_status);
   }
   sendCtrlJson(client, doc);
+}
+
+bool waitForCommandAck(uint16_t command,
+                       uint32_t baseline_ack_rx_seq,
+                       uint32_t timeout_ms,
+                       radio_link::Snapshot& out_snap) {
+  const uint32_t start_ms = millis();
+  for (;;) {
+    out_snap = radio_link::snapshot();
+    if (out_snap.has_ack &&
+        out_snap.ack_command == command &&
+        out_snap.ack_rx_seq != 0U &&
+        out_snap.ack_rx_seq != baseline_ack_rx_seq) {
+      return true;
+    }
+    if ((uint32_t)(millis() - start_ms) >= timeout_ms) break;
+    delay(20);
+  }
+  out_snap = radio_link::snapshot();
+  return false;
+}
+
+bool waitForFilesRevision(uint32_t baseline_revision,
+                          uint32_t timeout_ms,
+                          radio_link::RemoteFilesStatus& out_status) {
+  const uint32_t start_ms = millis();
+  for (;;) {
+    out_status = radio_link::remoteFilesStatus();
+    if (out_status.revision != baseline_revision &&
+        out_status.complete &&
+        !out_status.refresh_inflight) {
+      return true;
+    }
+    if ((uint32_t)(millis() - start_ms) >= timeout_ms) break;
+    delay(20);
+  }
+  out_status = radio_link::remoteFilesStatus();
+  return false;
+}
+
+void sendFileOpResult(AsyncWebServerRequest* request,
+                      const char* op,
+                      bool tx_ok,
+                      bool ack_received,
+                      const radio_link::Snapshot& ack_snap,
+                      bool files_synced,
+                      const radio_link::RemoteFilesStatus& files_status) {
+  JsonDocument doc;
+  doc["ok"] = tx_ok && ack_received && ack_snap.ack_ok;
+  doc["op"] = op ? op : "";
+  doc["tx_ok"] = tx_ok;
+  doc["ack_received"] = ack_received;
+  doc["ack_ok"] = ack_received ? ack_snap.ack_ok : false;
+  doc["ack_code"] = ack_received ? ack_snap.ack_code : 0U;
+  doc["ack_seq"] = ack_received ? ack_snap.ack_rx_seq : 0U;
+  doc["files_synced"] = files_synced;
+  doc["files_revision"] = files_status.revision;
+  doc["files_complete"] = files_status.complete;
+  doc["files_refresh_inflight"] = files_status.refresh_inflight;
+  doc["files_total"] = files_status.total_files;
+  doc["files_stored"] = files_status.stored_files;
+  doc["files_last_update_ms"] = files_status.last_update_ms;
+  doc["files_truncated"] = files_status.truncated;
+  String text;
+  serializeJson(doc, text);
+  request->send(200, "application/json", text);
 }
 
 void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t len) {
@@ -249,14 +317,32 @@ void handleCtrlMessage(AsyncWebSocketClient* client, const char* text, size_t le
   }
 
   if (strcmp(type, "start_replay") == 0) {
-    const bool ok = radio_link::sendReplayStart();
+    const char* file_name = doc["name"] | "";
+    const bool ok = (file_name && file_name[0] != '\0') ? radio_link::sendReplayStartFile(String(file_name))
+                                                        : radio_link::sendReplayStart();
     sendAck(client, "start_replay", ok, ok ? 0U : 1U, nullptr, nullptr, nullptr);
+    return;
+  }
+
+  if (strcmp(type, "pause_replay") == 0) {
+    const bool ok = radio_link::sendReplayPause();
+    sendAck(client, "pause_replay", ok, ok ? 0U : 1U, nullptr, nullptr, nullptr);
     return;
   }
 
   if (strcmp(type, "stop_replay") == 0) {
     const bool ok = radio_link::sendReplayStop();
     sendAck(client, "stop_replay", ok, ok ? 0U : 1U, nullptr, nullptr, nullptr);
+    return;
+  }
+
+  if (strcmp(type, "seek_replay") == 0) {
+    if (doc["delta_records"].isNull()) {
+      sendAck(client, "seek_replay", false, 2U, nullptr, nullptr, nullptr);
+      return;
+    }
+    const bool ok = radio_link::sendReplaySeekRelative(doc["delta_records"].as<int32_t>());
+    sendAck(client, "seek_replay", ok, ok ? 0U : 1U, nullptr, nullptr, nullptr);
     return;
   }
 }
@@ -509,12 +595,14 @@ void begin() {
     doc["air_replay_active"] = (snap.replay_status.flags & telem::kReplayStatusFlagActive) != 0U;
     doc["air_replay_file_open"] = (snap.replay_status.flags & telem::kReplayStatusFlagFileOpen) != 0U;
     doc["air_replay_at_eof"] = (snap.replay_status.flags & telem::kReplayStatusFlagAtEof) != 0U;
+    doc["air_replay_paused"] = (snap.replay_status.flags & telem::kReplayStatusFlagPaused) != 0U;
     doc["air_replay_last_command"] = snap.replay_status.last_command;
     doc["air_replay_session_id"] = snap.replay_status.session_id;
     doc["air_replay_records_total"] = snap.replay_status.records_total;
     doc["air_replay_records_sent"] = snap.replay_status.records_sent;
     doc["air_replay_last_error"] = snap.replay_status.last_error;
     doc["air_replay_last_change_ms"] = snap.replay_status.last_change_ms;
+    doc["air_replay_current_file"] = snap.replay_status.current_file;
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -576,14 +664,77 @@ void begin() {
       });
 
   g_server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(200, "application/json", "[]");
+    const bool refresh_requested = !request->hasParam("refresh") || request->getParam("refresh")->value() != "0";
+    if (refresh_requested) {
+      (void)radio_link::sendGetLogFileList();
+    }
+    request->send(200, "application/json", radio_link::remoteFilesJson(refresh_requested));
   });
   g_server.on("/api/download", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(404, "text/plain", "not available");
   });
-  g_server.on("/api/delete", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->send(200, "application/json", "{\"ok\":1}");
-  });
+  g_server.on(
+      "/api/delete",
+      HTTP_POST,
+      [](AsyncWebServerRequest* request) { (void)request; },
+      nullptr,
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+        static String body;
+        if (index == 0) body = "";
+        body.concat(reinterpret_cast<const char*>(data), len);
+        if ((index + len) != total) return;
+        JsonDocument doc;
+        if (deserializeJson(doc, body) || doc["name"].isNull()) {
+          request->send(400, "application/json", "{\"ok\":0}");
+          return;
+        }
+        const radio_link::Snapshot before_ack = radio_link::snapshot();
+        const radio_link::RemoteFilesStatus before_files = radio_link::remoteFilesStatus();
+        radio_link::Snapshot ack_snap = before_ack;
+        radio_link::RemoteFilesStatus files_status = before_files;
+        const bool tx_ok = radio_link::sendDeleteLogFile(doc["name"].as<String>());
+        const bool ack_received =
+            tx_ok ? waitForCommandAck(telem::CMD_DELETE_LOG_FILE, before_ack.ack_rx_seq, 1500U, ack_snap) : false;
+        bool files_synced = false;
+        if (tx_ok && ack_received && ack_snap.ack_ok) {
+          (void)radio_link::sendGetLogFileList();
+          files_synced = waitForFilesRevision(before_files.revision, 2000U, files_status);
+        } else {
+          files_status = radio_link::remoteFilesStatus();
+        }
+        sendFileOpResult(request, "delete", tx_ok, ack_received, ack_snap, files_synced, files_status);
+      });
+  g_server.on(
+      "/api/rename",
+      HTTP_POST,
+      [](AsyncWebServerRequest* request) { (void)request; },
+      nullptr,
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+        static String body;
+        if (index == 0) body = "";
+        body.concat(reinterpret_cast<const char*>(data), len);
+        if ((index + len) != total) return;
+        JsonDocument doc;
+        if (deserializeJson(doc, body) || doc["from"].isNull() || doc["to"].isNull()) {
+          request->send(400, "application/json", "{\"ok\":0}");
+          return;
+        }
+        const radio_link::Snapshot before_ack = radio_link::snapshot();
+        const radio_link::RemoteFilesStatus before_files = radio_link::remoteFilesStatus();
+        radio_link::Snapshot ack_snap = before_ack;
+        radio_link::RemoteFilesStatus files_status = before_files;
+        const bool tx_ok = radio_link::sendRenameLogFile(doc["from"].as<String>(), doc["to"].as<String>());
+        const bool ack_received =
+            tx_ok ? waitForCommandAck(telem::CMD_RENAME_LOG_FILE, before_ack.ack_rx_seq, 1500U, ack_snap) : false;
+        bool files_synced = false;
+        if (tx_ok && ack_received && ack_snap.ack_ok) {
+          (void)radio_link::sendGetLogFileList();
+          files_synced = waitForFilesRevision(before_files.revision, 2000U, files_status);
+        } else {
+          files_status = radio_link::remoteFilesStatus();
+        }
+        sendFileOpResult(request, "rename", tx_ok, ack_received, ack_snap, files_synced, files_status);
+      });
   g_server.on("/api/reset_air_network", HTTP_POST, [](AsyncWebServerRequest* request) {
     const bool ok = radio_link::sendResetNetwork();
     request->send(ok ? 200 : 503, "application/json", ok ? "{\"ok\":1}" : "{\"ok\":0}");

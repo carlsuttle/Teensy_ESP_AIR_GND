@@ -10,7 +10,7 @@
   <div id="appShellFrame" class="app-shell-frame">
     <div id="appShell" class="app-shell">
       <header class="top">
-        <div class="title-row"><span class="title">Telemetry GND Unit</span><span id="status">Loading</span><span id="rec" class="rec unknown">REC --</span></div>
+        <div class="title-row"><span class="title">Telemetry GND Unit</span><span id="status">Loading</span><span id="rec" class="rec unknown">MODE --</span></div>
         <div id="stats">web_fps: -- | dqi: -- | avg ping: -- ms</div>
       </header>
 
@@ -79,18 +79,47 @@
           <button id="applyRate">Apply Capture Hz</button>
         </section>
         <section id="tab-logs" class="tab">
+          <div class="logs-card">
+            <div class="logs-card-head">
+              <h3>Replay</h3>
+              <div class="transport-head-actions">
+                <span id="replayTransportState" class="transport-state idle">IDLE</span>
+                <button id="refreshReplayStatus">Refresh</button>
+              </div>
+            </div>
+            <div class="selection-line">
+              <span class="selection-label inline">Selected Replay File</span>
+              <span id="replaySelectionSummary" class="replay-selection empty">No file selected</span>
+            </div>
+            <div class="transport-strip">
+              <button id="rewindReplay" class="transport-ghost" title="Jump backward in the selected replay">&#9194;</button>
+              <button id="pauseReplay" class="transport-pause" title="Pause replay">&#9208;</button>
+              <button id="startReplay" class="transport-start" title="Play or resume replay">&#9654;</button>
+              <button id="stopReplay" class="transport-stop" title="Stop replay">&#9209;</button>
+              <button id="fastForwardReplay" class="transport-ghost" title="Jump forward in the selected replay">&#9193;</button>
+              <button id="recordLog" class="transport-record" title="Start or stop live recording">&#9210;</button>
+            </div>
+            <div id="replayTransportHint" class="transport-hint">
+              hidden
+            </div>
+          </div>
+          <div class="logs-card">
+            <div class="logs-card-head">
+              <h3>Replay Library</h3>
+              <div class="logs-actions compact">
+                <button id="refreshReplayFiles">Refresh Files</button>
+                <button id="deleteReplayFiles">Delete File</button>
+              </div>
+            </div>
+            <div id="replayFileMeta" class="transport-hint">Requesting AIR log files...</div>
+            <div id="replayFiles" class="file-list"></div>
+          </div>
           <pre id="logs"></pre>
           <h3>Recorder</h3>
           <div class="logs-actions">
             <button id="refreshLogStatus">Refresh Log Status</button>
             <button id="startLog">Start Session</button>
             <button id="stopLog">Stop Session</button>
-          </div>
-          <h3>Replay</h3>
-          <div class="logs-actions">
-            <button id="refreshReplayStatus">Refresh Replay Status</button>
-            <button id="startReplay">Start Replay</button>
-            <button id="stopReplay">Stop Replay</button>
           </div>
           <h3>Diagnostics</h3>
           <div class="logs-actions">
@@ -105,6 +134,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20260321a"></script>
+  <script src="/app.js?v=20260322l"></script>
 </body>
 </html>

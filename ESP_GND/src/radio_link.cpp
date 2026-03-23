@@ -12,11 +12,16 @@ namespace {
 constexpr uint8_t kUnitAir = 1U;
 constexpr uint8_t kUnitGnd = 2U;
 constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
-constexpr size_t kRxQueueCapacity = 8U;
+constexpr size_t kRxQueueCapacity = 32U;
 constexpr uint8_t kSendFailThreshold = 6U;
+constexpr uint32_t kHelloIntervalMs = 1000U;
+constexpr uint32_t kPeerStaleMs = 3000U;
 constexpr uint32_t kRadioPingIntervalMs = 1000U;
 constexpr uint32_t kRadioPingTimeoutMs = 1000U;
 constexpr uint8_t kRadioRttSampleCount = 8U;
+constexpr uint16_t kRemoteFileCapacity = 64U;
+constexpr uint32_t kRemoteFilesRefreshTimeoutMs = 2500U;
+constexpr uint32_t kRemoteFilesRefreshDebounceMs = 750U;
 
 struct RxFrame {
   uint8_t mac[6] = {};
@@ -50,12 +55,44 @@ bool g_has_last_state_seq = false;
 uint32_t g_last_radio_ping_tx_ms = 0U;
 uint32_t g_last_radio_ping_attempt_ms = 0U;
 uint32_t g_last_radio_ping_seq = 0U;
+uint32_t g_last_hello_tx_ms = 0U;
 uint16_t g_radio_rtt_samples[kRadioRttSampleCount] = {};
 uint8_t g_radio_rtt_head = 0U;
 uint8_t g_radio_rtt_count = 0U;
+telem::LogFileInfoV1 g_remote_files[kRemoteFileCapacity] = {};
+uint16_t g_remote_file_total = 0U;
+uint16_t g_remote_file_count = 0U;
+uint16_t g_remote_file_chunk_count = 0U;
+uint32_t g_remote_file_chunk_mask = 0U;
+bool g_remote_files_complete = false;
+bool g_remote_files_refresh_inflight = false;
+uint32_t g_remote_files_revision = 0U;
+uint32_t g_remote_files_last_update_ms = 0U;
 
 bool stateOnlyModeEnabled() {
   return config_store::get().radio_state_only != 0U;
+}
+
+void resetRemoteFiles(uint16_t total_files = 0U, uint16_t chunk_count = 0U) {
+  memset(g_remote_files, 0, sizeof(g_remote_files));
+  g_remote_file_total = total_files;
+  g_remote_file_count = 0U;
+  g_remote_file_chunk_count = chunk_count;
+  g_remote_file_chunk_mask = 0U;
+  g_remote_files_complete = false;
+}
+
+void beginRemoteFilesRefresh() {
+  resetRemoteFiles();
+  g_remote_files_refresh_inflight = true;
+  g_remote_files_last_update_ms = millis();
+}
+
+void normalizeRemoteFilesRefreshState() {
+  if (g_remote_files_refresh_inflight && g_remote_files_last_update_ms != 0U &&
+      (uint32_t)(millis() - g_remote_files_last_update_ms) > kRemoteFilesRefreshTimeoutMs) {
+    g_remote_files_refresh_inflight = false;
+  }
 }
 
 uint8_t desiredProtocol() {
@@ -94,6 +131,16 @@ String macToString(const uint8_t* mac) {
   return String(text);
 }
 
+String jsonEscape(const char* text) {
+  String out;
+  if (!text) return out;
+  for (const char* p = text; *p; ++p) {
+    if (*p == '\\' || *p == '"') out += '\\';
+    out += *p;
+  }
+  return out;
+}
+
 void clearPeerState() {
   memset(g_air_mac, 0, sizeof(g_air_mac));
   memset(g_last_sender_mac, 0, sizeof(g_last_sender_mac));
@@ -114,6 +161,9 @@ void clearPeerState() {
   g_snapshot.radio_rtt_ms = 0U;
   g_snapshot.radio_rtt_avg_ms = 0U;
   g_snapshot.last_radio_pong_ms = 0U;
+  resetRemoteFiles();
+  g_remote_files_refresh_inflight = false;
+  g_remote_files_last_update_ms = 0U;
 }
 
 void resetStateSequenceTracking(bool preserveCurrentState) {
@@ -160,6 +210,12 @@ void resetRadioRttTracking() {
   g_snapshot.radio_rtt_avg_ms = 0U;
   g_snapshot.last_radio_pong_ms = 0U;
   g_snapshot.uplink_ping_miss_streak = 0U;
+}
+
+void shutdownEspNow() {
+  if (!g_espnow_ready) return;
+  esp_now_deinit();
+  g_espnow_ready = false;
 }
 
 bool ensurePeer(const uint8_t* mac) {
@@ -324,6 +380,20 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
   return sendFrameTo(g_air_mac, type, payload, payload_len);
 }
 
+void maybeSendHello() {
+  const uint32_t now = millis();
+  if ((uint32_t)(now - g_last_hello_tx_ms) < kHelloIntervalMs) return;
+
+  bool sent = false;
+  if (!g_has_air_mac) {
+    sent = sendHelloTo(kBroadcastMac);
+  } else if (g_snapshot.stats.last_rx_ms == 0U ||
+             (uint32_t)(now - g_snapshot.stats.last_rx_ms) >= kPeerStaleMs) {
+    sent = sendHelloTo(g_air_mac);
+  }
+  if (sent) g_last_hello_tx_ms = now;
+}
+
 void recordRadioRttSample(uint32_t rtt_ms) {
   g_snapshot.radio_rtt_ms = rtt_ms;
   g_snapshot.last_radio_pong_ms = millis();
@@ -451,15 +521,16 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
     return;
   }
 
+  const uint32_t state_seq = base.source_seq;
   if (g_has_last_state_seq) {
-    if (hdr.seq > g_last_state_seq) {
-      g_snapshot.stats.state_seq_gap += (hdr.seq - g_last_state_seq - 1U);
-      g_last_state_seq = hdr.seq;
+    if (state_seq > g_last_state_seq) {
+      g_snapshot.stats.state_seq_gap += (state_seq - g_last_state_seq - 1U);
+      g_last_state_seq = state_seq;
     } else {
       g_snapshot.stats.state_seq_rewind++;
     }
   } else {
-    g_last_state_seq = hdr.seq;
+    g_last_state_seq = state_seq;
     g_has_last_state_seq = true;
   }
 
@@ -495,7 +566,7 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
   }
 
   g_snapshot.has_state = true;
-  g_snapshot.seq = base.source_seq;
+  g_snapshot.seq = state_seq;
   g_snapshot.t_us = hdr.t_us;
   g_snapshot.stats.frames_ok++;
   g_snapshot.stats.state_packets++;
@@ -571,6 +642,44 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.last_rx_ms = millis();
       break;
+    case telem::TELEM_LOG_FILE_LIST: {
+      if (hdr.payload_len != sizeof(telem::LogFileListChunkPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      telem::LogFileListChunkPayloadV1 chunk = {};
+      memcpy(&chunk, payload, sizeof(chunk));
+      const uint16_t chunk_count = chunk.chunk_count == 0U ? 1U : chunk.chunk_count;
+      if (chunk.chunk_index == 0U ||
+          chunk_count != g_remote_file_chunk_count ||
+          chunk.total_files != g_remote_file_total) {
+        resetRemoteFiles(chunk.total_files, chunk_count);
+      }
+      const uint16_t base_index = (uint16_t)(chunk.chunk_index * telem::kLogFileChunkEntries);
+      const uint16_t copy_count =
+          (chunk.entries_in_chunk < telem::kLogFileChunkEntries) ? chunk.entries_in_chunk : telem::kLogFileChunkEntries;
+      for (uint16_t i = 0U; i < copy_count; ++i) {
+        const uint16_t dst_index = (uint16_t)(base_index + i);
+        if (dst_index >= kRemoteFileCapacity) break;
+        g_remote_files[dst_index] = chunk.entries[i];
+        if ((uint16_t)(dst_index + 1U) > g_remote_file_count) {
+          g_remote_file_count = (uint16_t)(dst_index + 1U);
+        }
+      }
+      if (chunk.chunk_index < 32U) {
+        g_remote_file_chunk_mask |= (1UL << chunk.chunk_index);
+      }
+      g_remote_files_last_update_ms = millis();
+      g_remote_files_refresh_inflight = false;
+      const uint32_t expected_mask = chunk_count >= 32U ? 0xFFFFFFFFUL : ((1UL << chunk_count) - 1UL);
+      if (g_remote_file_chunk_mask == expected_mask) {
+        g_remote_files_complete = true;
+        g_remote_files_revision++;
+      }
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
+    }
     case telem::TELEM_CONTROL_STATUS: {
       if (hdr.payload_len != sizeof(telem::ControlStatusPayloadV1)) {
         g_snapshot.stats.len_err++;
@@ -676,6 +785,7 @@ void begin(const AppConfig& cfg) {
   g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_tx_seq = 0U;
   g_session_id = esp_random();
+  g_last_hello_tx_ms = 0U;
   (void)initEspNow();
 }
 
@@ -693,7 +803,9 @@ void reconfigure(const AppConfig& cfg) {
 }
 
 void restart(const AppConfig& cfg) {
+  shutdownEspNow();
   clearPeerState();
+  g_last_hello_tx_ms = 0U;
   reconfigure(cfg);
 }
 
@@ -704,6 +816,7 @@ void poll() {
   while (popRxFrame(frame)) {
     handleIncomingFrame(frame);
   }
+  maybeSendHello();
   maybeSendRadioPing();
 }
 
@@ -735,9 +848,97 @@ bool sendGetLogStatus() { return sendFrame(telem::CMD_GET_LOG_STATUS, nullptr, 0
 
 bool sendReplayStart() { return sendFrame(telem::CMD_REPLAY_START, nullptr, 0U); }
 
+bool sendReplayStartFile(const String& name) {
+  telem::CmdNamedFileV1 cmd = {};
+  strncpy(cmd.name, name.c_str(), sizeof(cmd.name) - 1U);
+  return sendFrame(telem::CMD_REPLAY_START_FILE, &cmd, sizeof(cmd));
+}
+
 bool sendReplayStop() { return sendFrame(telem::CMD_REPLAY_STOP, nullptr, 0U); }
 
+bool sendReplayPause() { return sendFrame(telem::CMD_REPLAY_PAUSE, nullptr, 0U); }
+
+bool sendReplaySeekRelative(int32_t delta_records) {
+  telem::CmdReplaySeekRelV1 cmd = {};
+  cmd.delta_records = delta_records;
+  return sendFrame(telem::CMD_REPLAY_SEEK_REL, &cmd, sizeof(cmd));
+}
+
 bool sendGetReplayStatus() { return sendFrame(telem::CMD_GET_REPLAY_STATUS, nullptr, 0U); }
+
+bool sendGetLogFileList() {
+  const uint32_t now = millis();
+  if (g_remote_files_refresh_inflight && g_remote_files_last_update_ms != 0U &&
+      (uint32_t)(now - g_remote_files_last_update_ms) < kRemoteFilesRefreshDebounceMs) {
+    return true;
+  }
+  beginRemoteFilesRefresh();
+  const bool ok = sendFrame(telem::CMD_GET_LOG_FILE_LIST, nullptr, 0U);
+  if (!ok) g_remote_files_refresh_inflight = false;
+  return ok;
+}
+
+bool sendDeleteLogFile(const String& name) {
+  telem::CmdNamedFileV1 cmd = {};
+  strncpy(cmd.name, name.c_str(), sizeof(cmd.name) - 1U);
+  return sendFrame(telem::CMD_DELETE_LOG_FILE, &cmd, sizeof(cmd));
+}
+
+bool sendRenameLogFile(const String& src_name, const String& dst_name) {
+  telem::CmdRenameLogFileV1 cmd = {};
+  strncpy(cmd.src_name, src_name.c_str(), sizeof(cmd.src_name) - 1U);
+  strncpy(cmd.dst_name, dst_name.c_str(), sizeof(cmd.dst_name) - 1U);
+  return sendFrame(telem::CMD_RENAME_LOG_FILE, &cmd, sizeof(cmd));
+}
+
+RemoteFilesStatus remoteFilesStatus() {
+  normalizeRemoteFilesRefreshState();
+  RemoteFilesStatus out = {};
+  out.revision = g_remote_files_revision;
+  out.total_files = g_remote_file_total;
+  out.stored_files = g_remote_file_count;
+  out.last_update_ms = g_remote_files_last_update_ms;
+  out.complete = g_remote_files_complete;
+  out.refresh_inflight = g_remote_files_refresh_inflight;
+  out.truncated = g_remote_file_total > kRemoteFileCapacity;
+  return out;
+}
+
+String remoteFilesJson(bool refresh_requested) {
+  normalizeRemoteFilesRefreshState();
+  String json;
+  json.reserve(4096);
+  json += "{\"ok\":1,\"refresh_requested\":";
+  json += refresh_requested ? "true" : "false";
+  json += ",\"complete\":";
+  json += g_remote_files_complete ? "true" : "false";
+  json += ",\"refresh_inflight\":";
+  json += g_remote_files_refresh_inflight ? "true" : "false";
+  json += ",\"revision\":";
+  json += String(g_remote_files_revision);
+  json += ",\"total_files\":";
+  json += String(g_remote_file_total);
+  json += ",\"stored_files\":";
+  json += String(g_remote_file_count);
+  json += ",\"truncated\":";
+  json += (g_remote_file_total > kRemoteFileCapacity) ? "true" : "false";
+  json += ",\"last_update_ms\":";
+  json += String(g_remote_files_last_update_ms);
+  json += ",\"files\":[";
+  bool first = true;
+  for (uint16_t i = 0U; i < g_remote_file_count; ++i) {
+    if (g_remote_files[i].name[0] == '\0') continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{\"name\":\"";
+    json += jsonEscape(g_remote_files[i].name);
+    json += "\",\"size\":";
+    json += String(g_remote_files[i].size_bytes);
+    json += "}";
+  }
+  json += "]}";
+  return json;
+}
 
 bool hasLearnedSender() { return g_has_air_mac; }
 

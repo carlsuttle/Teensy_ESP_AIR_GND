@@ -51,6 +51,16 @@ struct Snapshot {
   Stats stats = {};
 };
 
+struct RemoteFilesStatus {
+  uint32_t revision = 0;
+  uint16_t total_files = 0;
+  uint16_t stored_files = 0;
+  uint32_t last_update_ms = 0;
+  bool complete = false;
+  bool refresh_inflight = false;
+  bool truncated = false;
+};
+
 void begin(const AppConfig& cfg);
 void reconfigure(const AppConfig& cfg);
 void restart(const AppConfig& cfg);
@@ -66,8 +76,16 @@ bool sendLogStart();
 bool sendLogStop();
 bool sendGetLogStatus();
 bool sendReplayStart();
+bool sendReplayStartFile(const String& name);
 bool sendReplayStop();
+bool sendReplayPause();
+bool sendReplaySeekRelative(int32_t delta_records);
 bool sendGetReplayStatus();
+bool sendGetLogFileList();
+bool sendDeleteLogFile(const String& name);
+bool sendRenameLogFile(const String& src_name, const String& dst_name);
+RemoteFilesStatus remoteFilesStatus();
+String remoteFilesJson(bool refresh_requested);
 bool hasLearnedSender();
 String targetSenderMac();
 String lastSenderMac();

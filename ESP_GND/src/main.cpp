@@ -57,6 +57,9 @@ void printConsoleHelp() {
   Serial.println("  help / h  - show command list");
   Serial.println("  kickair   - resend current stream-rate command to AIR");
   Serial.println("  resetair  - send AIR network reset command");
+  Serial.println("  replaystart - send replay-start command to AIR");
+  Serial.println("  replaystop  - send replay-stop command to AIR");
+  Serial.println("  replaystat  - request and print AIR replay status");
   Serial.println("  relink    - restart GND radio link state");
   Serial.println("  seelink   - start 1Hz AIR link metadata stream");
   Serial.println("  stats     - start 1Hz status stream");
@@ -124,6 +127,33 @@ void handleConsoleCommands() {
         Serial.printf("RESETAIR tx_ok=%u target=%s\n",
                       ok ? 1U : 0U,
                       radio_link::targetSenderMac().c_str());
+      } else if (line.equalsIgnoreCase("replaystart")) {
+        const bool ok = radio_link::sendReplayStart();
+        Serial.printf("REPLAYSTART tx_ok=%u target=%s\n",
+                      ok ? 1U : 0U,
+                      radio_link::targetSenderMac().c_str());
+      } else if (line.equalsIgnoreCase("replaystop")) {
+        const bool ok = radio_link::sendReplayStop();
+        Serial.printf("REPLAYSTOP tx_ok=%u target=%s\n",
+                      ok ? 1U : 0U,
+                      radio_link::targetSenderMac().c_str());
+      } else if (line.equalsIgnoreCase("replaystat")) {
+        const bool ok = radio_link::sendGetReplayStatus();
+        Serial.printf("REPLAYSTAT tx_ok=%u target=%s\n",
+                      ok ? 1U : 0U,
+                      radio_link::targetSenderMac().c_str());
+        const auto snap = radio_link::snapshot();
+        const bool active = (snap.replay_status.flags & telem::kReplayStatusFlagActive) != 0U;
+        Serial.printf("REPLAY has=%u active=%u flags=0x%02X session=%lu sent=%lu total=%lu last_cmd=%u last_err=%lu last_change_ms=%lu\n",
+                      snap.has_replay_status ? 1U : 0U,
+                      active ? 1U : 0U,
+                      (unsigned)snap.replay_status.flags,
+                      (unsigned long)snap.replay_status.session_id,
+                      (unsigned long)snap.replay_status.records_sent,
+                      (unsigned long)snap.replay_status.records_total,
+                      (unsigned)snap.replay_status.last_command,
+                      (unsigned long)snap.replay_status.last_error,
+                      (unsigned long)snap.replay_status.last_change_ms);
       } else if (line.equalsIgnoreCase("relink")) {
         const AppConfig& cfg = config_store::get();
         radio_link::restart(cfg);

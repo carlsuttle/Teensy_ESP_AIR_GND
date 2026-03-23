@@ -400,6 +400,20 @@ bool computeLogDigest(File& file, uint32_t& size_bytes, uint32_t& records, uint3
   }
 }
 
+bool copyFileRaw(File& src, File& dst) {
+  uint8_t buffer[512];
+  for (;;) {
+    const size_t got = src.read(buffer, sizeof(buffer));
+    if (got == 0U) return true;
+    size_t written_total = 0U;
+    while (written_total < got) {
+      const size_t written = dst.write(buffer + written_total, got - written_total);
+      if (written == 0U) return false;
+      written_total += written;
+    }
+  }
+}
+
 bool copyFileAndDigest(File& src, File& dst,
                        uint32_t& src_size, uint32_t& src_records, uint32_t& src_crc32,
                        uint32_t& dst_size, uint32_t& dst_records, uint32_t& dst_crc32) {
@@ -915,6 +929,43 @@ String filesJson() {
   return out;
 }
 
+bool listFiles(telem::LogFileInfoV1* out_files,
+               uint16_t max_files,
+               uint16_t offset,
+               uint16_t& total_files,
+               uint16_t& returned_files) {
+  total_files = 0U;
+  returned_files = 0U;
+
+  LockGuard lock(g_state_mutex);
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    return false;
+  }
+
+  File dir = SD.open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  String candidate_name;
+  while (nextLogName(dir, candidate_name)) {
+    const String short_name = candidate_name.startsWith("/logs/") ? candidate_name.substring(6) : candidate_name;
+    File file = SD.open(candidate_name, FILE_READ);
+    const uint32_t size_bytes = file ? (uint32_t)file.size() : 0U;
+    if (file) file.close();
+
+    if (total_files >= offset && returned_files < max_files && out_files) {
+      telem::LogFileInfoV1& entry = out_files[returned_files];
+      memset(&entry, 0, sizeof(entry));
+      entry.size_bytes = size_bytes;
+      strncpy(entry.name, short_name.c_str(), sizeof(entry.name) - 1U);
+      returned_files++;
+    }
+    total_files++;
+  }
+  dir.close();
+  return true;
+}
+
 bool latestLogNameLocked(String& out_name) {
   out_name = "";
   if (!sd_backend::mounted()) return false;
@@ -925,6 +976,34 @@ bool latestLogNameLocked(String& out_name) {
   String candidate_name;
   while (nextLogName(dir, candidate_name)) {
     if (candidate_name > best_name) best_name = candidate_name;
+  }
+  dir.close();
+  out_name = best_name;
+  return !out_name.isEmpty();
+}
+
+bool largestLogNameLocked(String& out_name) {
+  out_name = "";
+  if (!sd_backend::mounted()) return false;
+  File dir = SD.open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  uint32_t best_size = 0U;
+  String best_name;
+  File f = dir.openNextFile();
+  while (f) {
+    const bool is_dir = f.isDirectory();
+    const String name = String(f.name());
+    const uint32_t file_size = (uint32_t)f.size();
+    f.close();
+    if (!is_dir && name.endsWith(kBinaryExt) && file_size >= sizeof(BinaryLogRecordV2)) {
+      const String normalized = normalizeLogPath(name);
+      if (file_size > best_size || (file_size == best_size && normalized > best_name)) {
+        best_size = file_size;
+        best_name = normalized;
+      }
+    }
+    f = dir.openNextFile();
   }
   dir.close();
   out_name = best_name;
@@ -958,9 +1037,14 @@ bool isSafeName(const String& name) {
 }
 
 bool deleteFileByName(const String& name) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending) return false;
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
   if (!sd_backend::mounted()) return false;
   if (!isSafeName(name)) return false;
   const String full = String(LOG_DIR) + "/" + name;
+  if (!SD.exists(full)) return false;
   if (g_current_name == full) {
     closeCurrentLog();
   }
@@ -969,6 +1053,46 @@ bool deleteFileByName(const String& name) {
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_delete_last_ms, g_stats.fs_delete_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
+  refreshBackendStatus(true);
+  return ok;
+}
+
+bool renameFileByName(const String& src_name, const String& dst_name) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending) return false;
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
+  if (!sd_backend::mounted()) return false;
+  if (!isSafeName(src_name) || !isSafeName(dst_name)) return false;
+  if (src_name == dst_name) return true;
+
+  const String src_full = String(LOG_DIR) + "/" + src_name;
+  const String dst_full = String(LOG_DIR) + "/" + dst_name;
+  if (src_full == dst_full) return true;
+  if (!SD.exists(src_full) || SD.exists(dst_full)) return false;
+
+  if (g_current_name == src_full) {
+    closeCurrentLog();
+  }
+  bool ok = SD.rename(src_full, dst_full);
+  if (!ok) {
+    File src = SD.open(src_full, FILE_READ);
+    if (src) {
+      if (SD.exists(dst_full)) (void)SD.remove(dst_full);
+      File dst = SD.open(dst_full, FILE_WRITE);
+      if (dst) {
+        ok = copyFileRaw(src, dst);
+        dst.flush();
+        dst.close();
+        if (ok) {
+          ok = SD.remove(src_full);
+        } else if (SD.exists(dst_full)) {
+          (void)SD.remove(dst_full);
+        }
+      }
+      src.close();
+    }
+  }
   refreshBackendStatus(true);
   return ok;
 }
@@ -1080,6 +1204,16 @@ bool latestLogName(String& out_name) {
     return false;
   }
   return latestLogNameLocked(out_name);
+}
+
+bool largestLogName(String& out_name) {
+  LockGuard lock(g_state_mutex);
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    out_name = "";
+    return false;
+  }
+  return largestLogNameLocked(out_name);
 }
 
 bool latestLogNameForSession(uint32_t session_id, String& out_name) {

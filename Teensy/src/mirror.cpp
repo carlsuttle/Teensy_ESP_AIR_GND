@@ -11,8 +11,6 @@ namespace {
 
 constexpr uint16_t kDefaultStreamRateHz = 50U;
 constexpr uint16_t kDefaultLogRateHz = 50U;
-constexpr uint16_t kMinStreamRateHz = 1U;
-constexpr uint16_t kMaxStreamRateHz = 400U;
 constexpr size_t kRecordBytes = sizeof(telem::TelemetryFullStateV1);
 constexpr uint32_t kReplayIdleTimeoutMs = 250U;
 constexpr uint8_t kReplayOutputQueueDepth = 64U;
@@ -69,22 +67,10 @@ void packFusionReplayDiagnostics(telem::TelemetryFullStateV1& payload,
   memcpy(payload.reserved1, packed, sizeof(packed));
 }
 
-uint16_t clampRateHz(uint16_t rateHz) {
-  if (rateHz < kMinStreamRateHz) return kMinStreamRateHz;
-  if (rateHz > kMaxStreamRateHz) return kMaxStreamRateHz;
-  return rateHz;
-}
-
 void applyFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
   g_dbg.cmdSetFusion++;
   (void)imu_fusion::setFusionSettings(
       cmd.gain, cmd.accelerationRejection, cmd.magneticRejection, cmd.recoveryTriggerPeriod);
-}
-
-void applyStreamRate(const telem::CmdSetStreamRateV1& cmd) {
-  g_dbg.cmdSetStreamRate++;
-  g_streamRateHz = clampRateHz(cmd.ws_rate_hz);
-  g_logRateHz = clampRateHz(cmd.log_rate_hz);
 }
 
 void handleReplayControl(const telem::ReplayControlRecord160& replay) {
@@ -108,9 +94,10 @@ void handleReplayControl(const telem::ReplayControlRecord160& replay) {
         g_dbg.lenErr++;
         return;
       }
-      telem::CmdSetStreamRateV1 cmd = {};
-      memcpy(&cmd, payload, sizeof(cmd));
-      applyStreamRate(cmd);
+      // Replay logs may contain historical stream-rate commands from the source
+      // session. Applying them here would leak replay-time metadata back into
+      // the live mirror cadence after replay ends.
+      g_dbg.cmdSetStreamRate++;
       return;
     }
     default:

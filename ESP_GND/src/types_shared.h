@@ -32,6 +32,8 @@ static constexpr uint16_t kTelemetryStateRecordBytes = 160U;
 static constexpr uint16_t kReplayRecordBytes = 160U;
 static constexpr uint32_t kReplayMagic = 0x52504C59UL;  // "RPLY"
 static constexpr uint16_t kReplayVersion = 1U;
+static constexpr uint16_t kLogFileNameBytes = 96U;
+static constexpr uint16_t kLogFileChunkEntries = 2U;
 
 static constexpr uint32_t kSensorPresentImu = 1UL << 0;
 static constexpr uint32_t kSensorPresentMag = 1UL << 1;
@@ -62,6 +64,7 @@ enum MsgType : uint16_t {
   TELEM_CONTROL_STATUS = 6,
   TELEM_UNIFIED_DOWNLINK = 7,
   TELEM_REPLAY_STATUS = 8,
+  TELEM_LOG_FILE_LIST = 9,
   CMD_SET_FUSION_SETTINGS = 100,
   CMD_GET_FUSION_SETTINGS = 101,
   CMD_SET_STREAM_RATE = 102,
@@ -76,6 +79,12 @@ enum MsgType : uint16_t {
   CMD_GET_REPLAY_STATUS = 111,
   CMD_REPLAY_INPUT_RECORD = 112,
   CMD_REPLAY_CONTROL_RECORD = 113,
+  CMD_GET_LOG_FILE_LIST = 114,
+  CMD_DELETE_LOG_FILE = 115,
+  CMD_RENAME_LOG_FILE = 116,
+  CMD_REPLAY_START_FILE = 117,
+  CMD_REPLAY_PAUSE = 118,
+  CMD_REPLAY_SEEK_REL = 119,
   LINK_HELLO = 150,
   ACK = 200,
   NACK = 201
@@ -251,6 +260,7 @@ static constexpr uint8_t kReplayStatusFlagActive = 1U << 0;
 static constexpr uint8_t kReplayStatusFlagFileOpen = 1U << 1;
 static constexpr uint8_t kReplayStatusFlagAtEof = 1U << 2;
 static constexpr uint8_t kReplayStatusFlagTeensyReplaySeen = 1U << 3;
+static constexpr uint8_t kReplayStatusFlagPaused = 1U << 4;
 
 struct ControlStatusPayloadV1 {
   uint8_t flags;
@@ -273,6 +283,33 @@ struct ReplayStatusPayloadV1 {
   uint32_t records_sent;
   uint32_t last_error;
   uint32_t last_change_ms;
+  char current_file[kLogFileNameBytes];
+};
+
+struct LogFileInfoV1 {
+  uint32_t size_bytes;
+  char name[kLogFileNameBytes];
+};
+
+struct LogFileListChunkPayloadV1 {
+  uint16_t total_files;
+  uint16_t chunk_index;
+  uint16_t chunk_count;
+  uint16_t entries_in_chunk;
+  LogFileInfoV1 entries[kLogFileChunkEntries];
+};
+
+struct CmdNamedFileV1 {
+  char name[kLogFileNameBytes];
+};
+
+struct CmdRenameLogFileV1 {
+  char src_name[kLogFileNameBytes];
+  char dst_name[kLogFileNameBytes];
+};
+
+struct CmdReplaySeekRelV1 {
+  int32_t delta_records;
 };
 
 struct ReplayRecordHeaderV1 {

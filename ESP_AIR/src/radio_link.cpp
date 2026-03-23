@@ -130,6 +130,7 @@ bool initEspNow();
 void clearPeerState();
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us);
 void sendReplayStatusFrame();
+void sendLogFileListFrames();
 
 uint8_t desiredProtocol() {
   const uint8_t kNormalMask = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -647,19 +648,57 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uin
 
 void sendReplayStatusFrame() {
   const telem::ReplayStatusPayloadV1 payload = replay_bridge::currentPayload();
-  (void)sendFrame(telem::TELEM_REPLAY_STATUS, &payload, sizeof(payload), g_tx_seq + 1U, micros());
+  (void)sendFrame(telem::TELEM_REPLAY_STATUS, &payload, sizeof(payload), 0U, micros());
+}
+
+void sendLogFileListFrames() {
+  uint16_t total_files = 0U;
+  uint16_t returned_files = 0U;
+  telem::LogFileListChunkPayloadV1 chunk = {};
+  if (!log_store::listFiles(chunk.entries,
+                            telem::kLogFileChunkEntries,
+                            0U,
+                            total_files,
+                            returned_files)) {
+    return;
+  }
+
+  const uint16_t chunk_count = (total_files == 0U)
+                                   ? 1U
+                                   : (uint16_t)((total_files + telem::kLogFileChunkEntries - 1U) /
+                                                telem::kLogFileChunkEntries);
+  for (uint16_t chunk_index = 0U; chunk_index < chunk_count; ++chunk_index) {
+    memset(&chunk, 0, sizeof(chunk));
+    if (!log_store::listFiles(chunk.entries,
+                              telem::kLogFileChunkEntries,
+                              (uint16_t)(chunk_index * telem::kLogFileChunkEntries),
+                              total_files,
+                              returned_files)) {
+      return;
+    }
+    chunk.total_files = total_files;
+    chunk.chunk_index = chunk_index;
+    chunk.chunk_count = chunk_count;
+    chunk.entries_in_chunk = returned_files;
+    (void)sendFrame(telem::TELEM_LOG_FILE_LIST, &chunk, sizeof(chunk), 0U, micros());
+  }
 }
 
 void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint32_t t_us) {
+  telem::AckPayloadV1 ack = {};
+  ack.command = command;
+  ack.ok = ok ? 1U : 0U;
+  ack.code = code;
+
   if (stateOnlyModeEnabled()) {
     if (command != telem::CMD_SET_STREAM_RATE && command != telem::CMD_SET_RADIO_MODE) return;
-    telem::AckPayloadV1 ack = {};
-    ack.command = command;
-    ack.ok = ok ? 1U : 0U;
-    ack.code = code;
     (void)sendFrame(ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), seq, t_us);
     return;
   }
+
+  // Emit an immediate ACK/NACK frame so command completion does not depend on the
+  // next scheduled control-status downlink.
+  (void)sendFrame(ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), seq, t_us);
   g_control_has_ack = true;
   g_control_ack_command = command;
   g_control_ack_code = code;
@@ -801,7 +840,8 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      if (replay_bridge::startLatest()) {
+      if ((replay_bridge::status().flags & telem::kReplayStatusFlagFileOpen) != 0U ? replay_bridge::resume()
+                                                                                   : replay_bridge::startLatest()) {
         sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
       } else {
         sendCommandAck(hdr.msg_type, false, 2U, hdr.seq, micros());
@@ -827,6 +867,90 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
       sendReplayStatusFrame();
       break;
+    case telem::CMD_GET_LOG_FILE_LIST:
+      if (hdr.payload_len != 0U) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      sendLogFileListFrames();
+      break;
+    case telem::CMD_DELETE_LOG_FILE: {
+      if (hdr.payload_len != sizeof(telem::CmdNamedFileV1)) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      telem::CmdNamedFileV1 cmd = {};
+      memcpy(&cmd, payload, sizeof(cmd));
+      const String file_name = String(cmd.name);
+      if (file_name == replay_bridge::currentFileName()) {
+        replay_bridge::stop();
+        sendReplayStatusFrame();
+      }
+      const bool ok = log_store::deleteFileByName(file_name);
+      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      sendLogFileListFrames();
+      break;
+    }
+    case telem::CMD_RENAME_LOG_FILE: {
+      if (hdr.payload_len != sizeof(telem::CmdRenameLogFileV1)) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      telem::CmdRenameLogFileV1 cmd = {};
+      memcpy(&cmd, payload, sizeof(cmd));
+      const String src_name = String(cmd.src_name);
+      const String dst_name = String(cmd.dst_name);
+      if (src_name == replay_bridge::currentFileName()) {
+        replay_bridge::stop();
+        sendReplayStatusFrame();
+      }
+      const bool ok = log_store::renameFileByName(src_name, dst_name);
+      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      sendLogFileListFrames();
+      break;
+    }
+    case telem::CMD_REPLAY_START_FILE: {
+      if (hdr.payload_len != sizeof(telem::CmdNamedFileV1)) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      telem::CmdNamedFileV1 cmd = {};
+      memcpy(&cmd, payload, sizeof(cmd));
+      const bool ok = replay_bridge::startFile(String(cmd.name));
+      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      sendReplayStatusFrame();
+      break;
+    }
+    case telem::CMD_REPLAY_PAUSE:
+      if (hdr.payload_len != 0U) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      {
+        const bool ok = replay_bridge::pause();
+        sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      }
+      sendReplayStatusFrame();
+      break;
+    case telem::CMD_REPLAY_SEEK_REL: {
+      if (hdr.payload_len != sizeof(telem::CmdReplaySeekRelV1)) {
+        g_stats.rx_bad_len++;
+        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        return;
+      }
+      telem::CmdReplaySeekRelV1 cmd = {};
+      memcpy(&cmd, payload, sizeof(cmd));
+      const bool ok = replay_bridge::seekRelative(cmd.delta_records);
+      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      sendReplayStatusFrame();
+      break;
+    }
     case telem::CMD_RESET_NETWORK:
       if (hdr.payload_len != 0U) {
         g_stats.rx_bad_len++;

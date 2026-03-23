@@ -181,12 +181,15 @@ void printConsoleHelp() {
   Serial.println("  logstop       - stop real AIR SD logging session");
   Serial.println("  logstat       - print real AIR SD logging status");
   Serial.println("  latestlog     - print latest .tlog on SD");
+  Serial.println("  largestlog    - print largest .tlog on SD");
   Serial.println("  latestlogsession <n> - print latest .tlog for a given session id");
   Serial.println("  verifylog     - copy latest .tlog to *_copy.tlog and verify byte-exact match");
   Serial.println("  expandlogs    - expand every .tlog on SD into a sibling .csv file");
   Serial.println("  comparelogs a b - compare two .tlog files, ignoring fusion outputs");
   Serial.println("  replaycapture - replay latest .tlog into Teensy while logging returned state");
   Serial.println("  replaycapfile <name> - replay a specific .tlog into Teensy while logging returned state");
+  Serial.println("  replayfile <name> - replay a specific .tlog into Teensy without rerecording");
+  Serial.println("  replaylargest - replay the largest .tlog into Teensy without rerecording");
   Serial.println("  replaycapstat - print replay-capture progress");
   Serial.println("  setpin <gpio> - drive a GPIO high for 5 seconds, then return it low");
   Serial.println("  tx1           - send current state once to GND");
@@ -422,6 +425,31 @@ bool beginReplayCapture(const String* source_override) {
   return true;
 }
 
+bool beginReplayDirect(const String& source_name) {
+  if (g_replay_capture.active) {
+    Serial.println("AIRREPLAY START ok=0 reason=replay_capture_active");
+    return false;
+  }
+  if (replay_bridge::active()) {
+    Serial.println("AIRREPLAY START ok=0 reason=already_active");
+    return false;
+  }
+  if (source_name.isEmpty()) {
+    Serial.println("AIRREPLAY START ok=0 reason=no_source_log");
+    return false;
+  }
+  if (!replay_bridge::startFile(source_name)) {
+    Serial.printf("AIRREPLAY START ok=0 reason=replay_start_failed src=%s\r\n",
+                  shortLogName(source_name).c_str());
+    return false;
+  }
+  const auto replay = replay_bridge::status();
+  Serial.printf("AIRREPLAY START ok=1 src=%s records_total=%lu\r\n",
+                shortLogName(source_name).c_str(),
+                (unsigned long)replay.records_total);
+  return true;
+}
+
 void serviceReplayCapture() {
   if (!g_replay_capture.active) return;
 
@@ -532,6 +560,12 @@ void handleConsoleCommands() {
         Serial.printf("AIRLOG latest_ok=%u file=%s\r\n",
                       ok ? 1U : 0U,
                       ok ? shortLogName(latest_name).c_str() : "(none)");
+      } else if (strcmp(g_console_line, "largestlog") == 0) {
+        String largest_name;
+        const bool ok = log_store::largestLogName(largest_name);
+        Serial.printf("AIRLOG largest_ok=%u file=%s\r\n",
+                      ok ? 1U : 0U,
+                      ok ? shortLogName(largest_name).c_str() : "(none)");
       } else if (strncmp(g_console_line, "latestlogsession ", 17) == 0) {
         unsigned session_id = 0U;
         if (sscanf(g_console_line + 17, "%u", &session_id) == 1 && session_id != 0U) {
@@ -568,6 +602,21 @@ void handleConsoleCommands() {
           Serial.println("AIRREPLAYCAP usage: replaycapfile <file.tlog>");
         } else {
           (void)beginReplayCapture(&source_name);
+        }
+      } else if (strncmp(g_console_line, "replayfile ", 11) == 0) {
+        String source_name = String(g_console_line + 11);
+        source_name.trim();
+        if (source_name.length() == 0) {
+          Serial.println("AIRREPLAY usage: replayfile <file.tlog>");
+        } else {
+          (void)beginReplayDirect(source_name);
+        }
+      } else if (strcmp(g_console_line, "replaylargest") == 0) {
+        String largest_name;
+        if (!log_store::largestLogName(largest_name)) {
+          Serial.println("AIRREPLAY START ok=0 reason=no_source_log");
+        } else {
+          (void)beginReplayDirect(largest_name);
         }
       } else if (strcmp(g_console_line, "replaycapstat") == 0) {
         const auto replay = replay_bridge::status();

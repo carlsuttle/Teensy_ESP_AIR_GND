@@ -59,12 +59,16 @@ Stats stats();
 void resetStats();
 
 String filesJson();
+bool listFiles(telem::LogFileInfoV1* out_files, uint16_t max_files, uint16_t offset,
+               uint16_t& total_files, uint16_t& returned_files);
 bool deleteFileByName(const String& name);
+bool renameFileByName(const String& src_name, const String& dst_name);
 bool isSafeName(const String& name);
 bool exportAllLogsToCsv(Stream& out);
 bool busy();
 String currentFileName();
 bool latestLogName(String& out_name);
+bool largestLogName(String& out_name);
 bool latestLogNameForSession(uint32_t session_id, String& out_name);
 bool copyLatestLogAndVerify(Stream& out);
 bool compareLogs(Stream& out, const String& src_name, const String& dst_name);

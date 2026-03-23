@@ -51,6 +51,18 @@ uint8_t g_output_source_head = 0U;
 uint8_t g_output_source_tail = 0U;
 uint8_t g_output_source_count = 0U;
 
+String displayFileName(const String& path) {
+  if (path.startsWith("/logs/")) return path.substring(6);
+  if (path.startsWith("/")) return path.substring(1);
+  return path;
+}
+
+void setCurrentFileName(const String& path) {
+  memset(g_status.current_file, 0, sizeof(g_status.current_file));
+  const String display = displayFileName(path);
+  strncpy(g_status.current_file, display.c_str(), sizeof(g_status.current_file) - 1U);
+}
+
 void markStatusChanged() {
   g_status.last_change_ms = millis();
   g_status_dirty = true;
@@ -72,6 +84,24 @@ void resetRuntime(bool preserve_session = true) {
   g_status = {};
   g_status.session_id = session_id;
   markStatusChanged();
+}
+
+bool seekToRecord(uint32_t target_index) {
+  if (!g_file || g_status.records_total == 0U) return false;
+  if (target_index >= g_status.records_total) {
+    target_index = g_status.records_total - 1U;
+  }
+  const size_t record_offset = (size_t)target_index * sizeof(BinaryLogRecordV2);
+  if (!g_file.seek(record_offset)) return false;
+  g_have_pending = false;
+  g_pending = {};
+  g_status.records_sent = target_index;
+  g_status.flags &= (uint8_t)~telem::kReplayStatusFlagAtEof;
+  g_status.last_error = 0U;
+  g_last_record_t_us = 0U;
+  g_next_send_us = micros();
+  markStatusChanged();
+  return true;
 }
 
 bool openLatestLog(String& out_name) {
@@ -138,8 +168,8 @@ bool loadNextRecord() {
   if (got == 0U) {
     g_status.flags |= telem::kReplayStatusFlagAtEof;
     g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
+    g_status.flags &= (uint8_t)~telem::kReplayStatusFlagPaused;
     markStatusChanged();
-    stop();
     return false;
   }
   if (got != sizeof(record)) {
@@ -293,6 +323,7 @@ bool startLatest() {
   g_status.last_error = 0U;
   g_status.last_command = telem::CMD_REPLAY_START;
   g_status.flags = telem::kReplayStatusFlagActive | telem::kReplayStatusFlagFileOpen;
+  setCurrentFileName(file_name);
   g_have_pending = false;
   g_next_send_us = micros();
   markStatusChanged();
@@ -314,10 +345,44 @@ bool startFile(const String& file_name) {
   g_status.last_error = 0U;
   g_status.last_command = telem::CMD_REPLAY_START;
   g_status.flags = telem::kReplayStatusFlagActive | telem::kReplayStatusFlagFileOpen;
+  setCurrentFileName(opened_name);
   g_have_pending = false;
   g_next_send_us = micros();
   markStatusChanged();
   return true;
+}
+
+bool resume() {
+  if (!g_file) return false;
+  if ((g_status.flags & telem::kReplayStatusFlagAtEof) != 0U) {
+    if (!seekToRecord(0U)) return false;
+  }
+  g_status.flags |= telem::kReplayStatusFlagFileOpen;
+  g_status.flags |= telem::kReplayStatusFlagActive;
+  g_status.flags &= (uint8_t)~telem::kReplayStatusFlagPaused;
+  g_status.last_command = telem::CMD_REPLAY_START;
+  g_status.last_error = 0U;
+  if (g_next_send_us == 0U) g_next_send_us = micros();
+  markStatusChanged();
+  return true;
+}
+
+bool pause() {
+  if ((g_status.flags & telem::kReplayStatusFlagActive) == 0U || !g_file) return false;
+  g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
+  g_status.flags |= telem::kReplayStatusFlagPaused;
+  g_status.last_command = telem::CMD_REPLAY_PAUSE;
+  markStatusChanged();
+  return true;
+}
+
+bool seekRelative(int32_t delta_records) {
+  if (!g_file || g_status.records_total == 0U) return false;
+  const int32_t current_index = (int32_t)g_status.records_sent;
+  const int32_t max_index = (int32_t)g_status.records_total - 1;
+  const int32_t target_index = constrain(current_index + delta_records, 0, max_index);
+  g_status.last_command = telem::CMD_REPLAY_SEEK_REL;
+  return seekToRecord((uint32_t)target_index);
 }
 
 void stop() {
@@ -325,11 +390,14 @@ void stop() {
     g_file.close();
   }
   g_have_pending = false;
+  g_pending = {};
   g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
   g_status.flags &= (uint8_t)~telem::kReplayStatusFlagFileOpen;
+  g_status.flags &= (uint8_t)~telem::kReplayStatusFlagPaused;
   if (g_status.last_command != telem::CMD_REPLAY_STOP) {
     g_status.last_command = telem::CMD_REPLAY_STOP;
   }
+  memset(g_status.current_file, 0, sizeof(g_status.current_file));
   markStatusChanged();
 }
 
@@ -346,6 +414,7 @@ telem::ReplayStatusPayloadV1 currentPayload() {
   payload.records_sent = g_status.records_sent;
   payload.last_error = g_status.last_error;
   payload.last_change_ms = g_status.last_change_ms ? (uint32_t)(millis() - g_status.last_change_ms) : 0U;
+  memcpy(payload.current_file, g_status.current_file, sizeof(payload.current_file));
   return payload;
 }
 
@@ -357,6 +426,10 @@ bool takeStatusDirty() {
 
 bool active() {
   return (g_status.flags & telem::kReplayStatusFlagActive) != 0U;
+}
+
+String currentFileName() {
+  return String(g_status.current_file);
 }
 
 bool takeOutputSourceStamp(uint32_t& seq, uint32_t& t_us) {
