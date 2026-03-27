@@ -50,6 +50,8 @@ class BMI2_BMM1_Class {
     float accelerationSampleRate(); // Sampling rate of the sensor.
 
     int readGyroAccel(imu_data_t & imu_sensor_data, bool raw = false); // Results are in degrees/second.
+    int readAccelerationRaw(int16_t& x, int16_t& y, int16_t& z);
+    int readGyroscopeRaw(int16_t& x, int16_t& y, int16_t& z);
     int readAuxMag(mag_data_t & mag_sensor_data);
     int gyroscopeAvailable(); // Number of samples in the FIFO.
     float gyroscopeSampleRate(); // Sampling rate of the sensor.

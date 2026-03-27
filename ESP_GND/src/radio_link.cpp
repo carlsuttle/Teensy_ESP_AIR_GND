@@ -74,6 +74,10 @@ bool g_remote_files_refresh_inflight = false;
 bool g_remote_files_truncated = false;
 uint32_t g_remote_files_revision = 0U;
 uint32_t g_remote_files_last_update_ms = 0U;
+telem::StorageStatusPayloadV1 g_remote_storage = {};
+bool g_remote_storage_known = false;
+uint32_t g_remote_storage_revision = 0U;
+uint32_t g_remote_storage_last_update_ms = 0U;
 
 bool stateOnlyModeEnabled() {
   return config_store::get().radio_state_only != 0U;
@@ -177,6 +181,10 @@ void clearPeerState() {
   resetRemoteFiles();
   g_remote_files_refresh_inflight = false;
   g_remote_files_last_update_ms = 0U;
+  memset(&g_remote_storage, 0, sizeof(g_remote_storage));
+  g_remote_storage_known = false;
+  g_remote_storage_revision = 0U;
+  g_remote_storage_last_update_ms = 0U;
 }
 
 void resetStateSequenceTracking(bool preserveCurrentState) {
@@ -191,8 +199,14 @@ void resetStateSequenceTracking(bool preserveCurrentState) {
 
 void resetStatsInternal() {
   const uint32_t last_rx_ms = g_snapshot.stats.last_rx_ms;
+  const uint32_t last_state_apply_ms = g_snapshot.stats.last_state_apply_ms;
+  const uint32_t last_state_seq = g_snapshot.stats.last_state_seq;
+  const uint32_t last_state_source_t_us = g_snapshot.stats.last_state_source_t_us;
   g_snapshot.stats = {};
   g_snapshot.stats.last_rx_ms = last_rx_ms;
+  g_snapshot.stats.last_state_apply_ms = last_state_apply_ms;
+  g_snapshot.stats.last_state_seq = last_state_seq;
+  g_snapshot.stats.last_state_source_t_us = last_state_source_t_us;
   g_radio_ping_pending = false;
   g_last_radio_ping_tx_ms = 0U;
   g_last_radio_ping_attempt_ms = 0U;
@@ -583,7 +597,11 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
   g_snapshot.t_us = hdr.t_us;
   g_snapshot.stats.frames_ok++;
   g_snapshot.stats.state_packets++;
+  g_snapshot.stats.unified_state_packets++;
   g_snapshot.stats.last_rx_ms = millis();
+  g_snapshot.stats.last_state_apply_ms = g_snapshot.stats.last_rx_ms;
+  g_snapshot.stats.last_state_seq = state_seq;
+  g_snapshot.stats.last_state_source_t_us = hdr.t_us;
 }
 
 void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
@@ -610,7 +628,11 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.t_us = hdr.t_us;
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.state_packets++;
+      g_snapshot.stats.full_state_packets++;
       g_snapshot.stats.last_rx_ms = millis();
+      g_snapshot.stats.last_state_apply_ms = g_snapshot.stats.last_rx_ms;
+      g_snapshot.stats.last_state_seq = hdr.seq;
+      g_snapshot.stats.last_state_source_t_us = hdr.t_us;
       break;
     case telem::TELEM_UNIFIED_DOWNLINK:
       applyUnifiedDownlink(hdr, payload);
@@ -702,6 +724,20 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.stats.last_rx_ms = millis();
       break;
     }
+    case telem::TELEM_STORAGE_STATUS:
+      if (hdr.payload_len != sizeof(telem::StorageStatusPayloadV1)) {
+        g_snapshot.stats.len_err++;
+        return;
+      }
+      memcpy(&g_remote_storage, payload, sizeof(g_remote_storage));
+      g_remote_storage.record_prefix[sizeof(g_remote_storage.record_prefix) - 1U] = '\0';
+      g_remote_storage.next_record_name[sizeof(g_remote_storage.next_record_name) - 1U] = '\0';
+      g_remote_storage_known = true;
+      g_remote_storage_revision++;
+      g_remote_storage_last_update_ms = millis();
+      g_snapshot.stats.frames_ok++;
+      g_snapshot.stats.last_rx_ms = millis();
+      break;
     case telem::TELEM_CONTROL_STATUS: {
       if (hdr.payload_len != sizeof(telem::ControlStatusPayloadV1)) {
         g_snapshot.stats.len_err++;
@@ -913,6 +949,26 @@ bool sendRenameLogFile(const String& src_name, const String& dst_name) {
   return sendFrame(telem::CMD_RENAME_LOG_FILE, &cmd, sizeof(cmd));
 }
 
+bool sendGetStorageStatus() {
+  return sendFrame(telem::CMD_GET_STORAGE_STATUS, nullptr, 0U);
+}
+
+bool sendMountMedia() { return sendFrame(telem::CMD_MOUNT_MEDIA, nullptr, 0U); }
+
+bool sendEjectMedia() { return sendFrame(telem::CMD_EJECT_MEDIA, nullptr, 0U); }
+
+bool sendExportLogCsv(const String& name) {
+  telem::CmdNamedFileV1 cmd = {};
+  strncpy(cmd.name, name.c_str(), sizeof(cmd.name) - 1U);
+  return sendFrame(telem::CMD_EXPORT_LOG_CSV, &cmd, sizeof(cmd));
+}
+
+bool sendSetRecordPrefix(const String& prefix) {
+  telem::CmdRecordPrefixV1 cmd = {};
+  strncpy(cmd.prefix, prefix.c_str(), sizeof(cmd.prefix) - 1U);
+  return sendFrame(telem::CMD_SET_RECORD_PREFIX, &cmd, sizeof(cmd));
+}
+
 RemoteFilesStatus remoteFilesStatus() {
   normalizeRemoteFilesRefreshState();
   RemoteFilesStatus out = {};
@@ -959,6 +1015,62 @@ String remoteFilesJson(bool refresh_requested) {
     json += "}";
   }
   json += "]}";
+  return json;
+}
+
+RemoteStorageStatus remoteStorageStatus() {
+  RemoteStorageStatus out = {};
+  out.known = g_remote_storage_known;
+  out.revision = g_remote_storage_revision;
+  out.last_update_ms = g_remote_storage_last_update_ms;
+  out.media_state = g_remote_storage.media_state;
+  out.mounted = (g_remote_storage.flags & telem::kStorageStatusFlagMounted) != 0U;
+  out.backend_ready = (g_remote_storage.flags & telem::kStorageStatusFlagBackendReady) != 0U;
+  out.media_present = (g_remote_storage.flags & telem::kStorageStatusFlagMediaPresent) != 0U;
+  out.busy = (g_remote_storage.flags & telem::kStorageStatusFlagBusy) != 0U;
+  out.init_hz = g_remote_storage.init_hz;
+  out.free_bytes = g_remote_storage.free_bytes;
+  out.total_bytes = g_remote_storage.total_bytes;
+  out.file_count = g_remote_storage.file_count;
+  strncpy(out.record_prefix, g_remote_storage.record_prefix, sizeof(out.record_prefix) - 1U);
+  strncpy(out.next_record_name, g_remote_storage.next_record_name, sizeof(out.next_record_name) - 1U);
+  return out;
+}
+
+String remoteStorageJson(bool refresh_requested) {
+  String json;
+  json.reserve(512);
+  json += "{\"ok\":1,\"refresh_requested\":";
+  json += refresh_requested ? "true" : "false";
+  json += ",\"known\":";
+  json += g_remote_storage_known ? "true" : "false";
+  json += ",\"revision\":";
+  json += String(g_remote_storage_revision);
+  json += ",\"last_update_ms\":";
+  json += String(g_remote_storage_last_update_ms);
+  json += ",\"media_state\":";
+  json += String((uint32_t)g_remote_storage.media_state);
+  json += ",\"mounted\":";
+  json += (g_remote_storage.flags & telem::kStorageStatusFlagMounted) ? "true" : "false";
+  json += ",\"backend_ready\":";
+  json += (g_remote_storage.flags & telem::kStorageStatusFlagBackendReady) ? "true" : "false";
+  json += ",\"media_present\":";
+  json += (g_remote_storage.flags & telem::kStorageStatusFlagMediaPresent) ? "true" : "false";
+  json += ",\"busy\":";
+  json += (g_remote_storage.flags & telem::kStorageStatusFlagBusy) ? "true" : "false";
+  json += ",\"init_hz\":";
+  json += String(g_remote_storage.init_hz);
+  json += ",\"free_bytes\":";
+  json += String(g_remote_storage.free_bytes);
+  json += ",\"total_bytes\":";
+  json += String(g_remote_storage.total_bytes);
+  json += ",\"file_count\":";
+  json += String(g_remote_storage.file_count);
+  json += ",\"record_prefix\":\"";
+  json += jsonEscape(g_remote_storage.record_prefix);
+  json += "\",\"next_record_name\":\"";
+  json += jsonEscape(g_remote_storage.next_record_name);
+  json += "\"}";
   return json;
 }
 

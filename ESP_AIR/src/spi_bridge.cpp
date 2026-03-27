@@ -15,9 +15,10 @@ constexpr uint16_t kProtocolVersion = 1U;
 constexpr uint16_t kRecordBytes = 160U;
 constexpr uint16_t kTransactionBytes = 8192U;
 constexpr uint16_t kRingDepth = 128U;
-constexpr uint32_t kDefaultSpiClockHz = 40000000UL;
+constexpr uint32_t kDefaultSpiClockHz = 20000000UL;
 constexpr uint32_t kDefaultTransactionRateHz = 100U;
 constexpr uint32_t kReadyWaitTimeoutUs = 5000U;
+constexpr uint32_t kReadySettleDelayUs = 2U;
 constexpr gpio_num_t kSpiSck = GPIO_NUM_5;
 constexpr gpio_num_t kSpiMiso = GPIO_NUM_6;
 constexpr gpio_num_t kSpiMosi = GPIO_NUM_1;
@@ -50,6 +51,7 @@ enum MsgType : uint16_t {
   kMsgReplayData = 2U,
   kMsgControl = 3U,
   kMsgStatus = 4U,
+  kMsgReplayInputData = 5U,
 };
 
 class RecordRing {
@@ -149,6 +151,7 @@ class Bridge {
   void begin();
   void poll();
   bool popState(uint8_t* out) { return state_rx_ring_.pop(out); }
+  bool popRaw(uint8_t* out) { return raw_rx_ring_.pop(out); }
   bool queueReplay(const uint8_t* record_bytes) { return replay_tx_ring_.push(record_bytes); }
   Stats stats() const { return stats_; }
 
@@ -166,6 +169,7 @@ class Bridge {
   spi_device_handle_t device_ = nullptr;
   TaskHandle_t task_ = nullptr;
   RecordRing state_rx_ring_;
+  RecordRing raw_rx_ring_;
   RecordRing replay_tx_ring_;
   Stats stats_ = {};
   uint32_t spi_clock_hz_ = kDefaultSpiClockHz;
@@ -186,6 +190,7 @@ Bridge g_bridge;
 
 void Bridge::begin() {
   state_rx_ring_.reset();
+  raw_rx_ring_.reset();
   replay_tx_ring_.reset();
   stats_ = {};
   spi_clock_hz_ = kDefaultSpiClockHz;
@@ -336,6 +341,22 @@ void Bridge::parseRxFrame() {
         continue;
       }
       stats_.state_records_received++;
+      stats_.last_state_rx_ms = millis();
+    }
+    return;
+  }
+
+  if (header->type == kMsgReplayInputData) {
+    if (header->payload_len == 0U || (header->payload_len % kRecordBytes) != 0U) {
+      stats_.rx_type_errors++;
+      return;
+    }
+    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kRecordBytes)) {
+      if (!raw_rx_ring_.push(payload + offset)) {
+        stats_.rx_overflows++;
+        continue;
+      }
+      stats_.raw_records_received++;
     }
     return;
   }
@@ -351,6 +372,7 @@ bool Bridge::performTransaction() {
   if (!waitForReadyHigh(kReadyWaitTimeoutUs)) {
     return false;
   }
+  delayMicroseconds(kReadySettleDelayUs);
 
   memset(rx_buffer_, 0, kTransactionBytes);
   spi_transaction_t t = {};
@@ -417,6 +439,11 @@ void poll() {
 bool popStateRecord(uint8_t* record_out, size_t len) {
   if (!record_out || len != kRecordBytes) return false;
   return g_bridge.popState(record_out);
+}
+
+bool popRawRecord(uint8_t* record_out, size_t len) {
+  if (!record_out || len != kRecordBytes) return false;
+  return g_bridge.popRaw(record_out);
 }
 
 bool queueReplayRecord(const uint8_t* record_bytes, size_t len) {

@@ -17,6 +17,7 @@ struct Stats {
 void begin();
 void poll();
 bool pushStateRecord(const uint8_t* record_bytes, size_t len);
+bool pushRawRecord(const uint8_t* record_bytes, size_t len);
 bool popReplayRecord(uint8_t* record_out, size_t len);
 uint16_t replayFreeSlots();
 Stats stats();

@@ -35,6 +35,7 @@ static constexpr uint32_t kReplayMagic = 0x52504C59UL;  // "RPLY"
 static constexpr uint16_t kReplayVersion = 1U;
 static constexpr uint16_t kLogFileNameBytes = 96U;
 static constexpr uint16_t kLogFileChunkEntries = 2U;
+static constexpr uint16_t kRecordPrefixBytes = 24U;
 
 static constexpr uint32_t kSensorPresentImu = 1UL << 0;
 static constexpr uint32_t kSensorPresentMag = 1UL << 1;
@@ -54,6 +55,7 @@ enum class ReplayRecordKind : uint8_t {
 enum class LogRecordKind : uint16_t {
   State160 = 1,
   ReplayControl160 = 2,
+  ReplayInput160 = 3,
 };
 
 enum MsgType : uint16_t {
@@ -66,6 +68,7 @@ enum MsgType : uint16_t {
   TELEM_UNIFIED_DOWNLINK = 7,
   TELEM_REPLAY_STATUS = 8,
   TELEM_LOG_FILE_LIST = 9,
+  TELEM_STORAGE_STATUS = 10,
   CMD_SET_FUSION_SETTINGS = 100,
   CMD_GET_FUSION_SETTINGS = 101,
   CMD_SET_STREAM_RATE = 102,
@@ -86,6 +89,14 @@ enum MsgType : uint16_t {
   CMD_REPLAY_START_FILE = 117,
   CMD_REPLAY_PAUSE = 118,
   CMD_REPLAY_SEEK_REL = 119,
+  CMD_SET_CAPTURE_SETTINGS = 120,
+  CMD_GET_CAPTURE_SETTINGS = 121,
+  CMD_SAVE_CAPTURE_SETTINGS = 122,
+  CMD_GET_STORAGE_STATUS = 123,
+  CMD_MOUNT_MEDIA = 124,
+  CMD_EJECT_MEDIA = 125,
+  CMD_EXPORT_LOG_CSV = 126,
+  CMD_SET_RECORD_PREFIX = 127,
   LINK_HELLO = 150,
   ACK = 200,
   NACK = 201
@@ -207,6 +218,13 @@ struct FusionSettingsV1 {
   uint16_t reserved;
 };
 
+struct CaptureSettingsV1 {
+  uint16_t source_rate_hz;
+  uint16_t reserved;
+};
+
+using CmdSetCaptureSettingsV1 = CaptureSettingsV1;
+
 struct CmdSetStreamRateV1 {
   uint16_t ws_rate_hz;
   uint16_t log_rate_hz;
@@ -263,6 +281,10 @@ static constexpr uint8_t kReplayStatusFlagFileOpen = 1U << 1;
 static constexpr uint8_t kReplayStatusFlagAtEof = 1U << 2;
 static constexpr uint8_t kReplayStatusFlagTeensyReplaySeen = 1U << 3;
 static constexpr uint8_t kReplayStatusFlagPaused = 1U << 4;
+static constexpr uint8_t kStorageStatusFlagMounted = 1U << 0;
+static constexpr uint8_t kStorageStatusFlagBackendReady = 1U << 1;
+static constexpr uint8_t kStorageStatusFlagMediaPresent = 1U << 2;
+static constexpr uint8_t kStorageStatusFlagBusy = 1U << 3;
 
 struct ControlStatusPayloadV1 {
   uint8_t flags;
@@ -308,6 +330,23 @@ struct CmdNamedFileV1 {
 struct CmdRenameLogFileV1 {
   char src_name[kLogFileNameBytes];
   char dst_name[kLogFileNameBytes];
+};
+
+struct CmdRecordPrefixV1 {
+  char prefix[kRecordPrefixBytes];
+};
+
+struct StorageStatusPayloadV1 {
+  uint8_t media_state;
+  uint8_t flags;
+  uint16_t reserved0;
+  uint32_t init_hz;
+  uint32_t free_bytes;
+  uint32_t total_bytes;
+  uint16_t file_count;
+  uint16_t reserved1;
+  char record_prefix[kRecordPrefixBytes];
+  char next_record_name[kLogFileNameBytes];
 };
 
 struct CmdReplaySeekRelV1 {

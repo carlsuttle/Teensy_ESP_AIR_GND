@@ -239,11 +239,8 @@ void updateAirReadiness() {
     }
   } else {
     if (!g_air_wait_announced) {
-      Serial.printf("GND WAIT air_packets target=%s\n", radio_link::targetSenderMac().c_str());
+      Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
       g_air_wait_announced = true;
-    }
-    if (g_air_ready) {
-      scheduleAirConfigApply();
     }
     g_air_ready = false;
   }
@@ -266,9 +263,9 @@ void printStats() {
   const auto ws = ws_server::stats();
   Serial.printf(
       "STAT unit=GND seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
-      "rx_bytes=%lu ok=%lu state_rx=%lu state_gap=%lu state_rewind=%lu "
+      "rx_bytes=%lu ok=%lu state_rx=%lu state_full=%lu state_uni=%lu state_gap=%lu state_rewind=%lu sink_seq=%lu sink_t_us=%lu sink_rx_ms=%lu "
       "crc=%u cobs=%u len=%lu unk=%lu drop=%lu link_tx=%u link_rx=%lu link_drop=%u "
-      "rtt=%lu ws_clients=%lu ws_seq=%lu ws_state_seq=%lu ui_tx_ms=%lu ui_lat=%lu\n",
+      "rtt=%lu ws_clients=%lu ws_seq=%lu ws_state_seq=%lu ws_src_t_us=%lu ws_rx_ms=%lu ui_tx_ms=%lu ui_lat=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -279,8 +276,13 @@ void printStats() {
       (unsigned long)snap.stats.rx_bytes,
       (unsigned long)snap.stats.frames_ok,
       (unsigned long)snap.stats.state_packets,
+      (unsigned long)snap.stats.full_state_packets,
+      (unsigned long)snap.stats.unified_state_packets,
       (unsigned long)snap.stats.state_seq_gap,
       (unsigned long)snap.stats.state_seq_rewind,
+      (unsigned long)snap.stats.last_state_seq,
+      (unsigned long)snap.stats.last_state_source_t_us,
+      (unsigned long)snap.stats.last_state_apply_ms,
       0U,
       0U,
       (unsigned long)snap.stats.len_err,
@@ -293,6 +295,8 @@ void printStats() {
       (unsigned long)ws.clients,
       (unsigned long)ws.ws_state_seq,
       (unsigned long)ws.last_state_seq_sent,
+      (unsigned long)ws.last_source_t_us_sent,
+      (unsigned long)ws.last_radio_rx_ms_seen,
       (unsigned long)ws.last_ui_tx_ms,
       (unsigned long)ws.last_ui_tx_latency_ms);
 }
@@ -368,7 +372,7 @@ void setup() {
   Serial.printf("GND READY ap ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
                 WiFi.softAPIP().toString().c_str(),
                 (unsigned)kApChannel);
-  Serial.printf("GND WAIT air_packets target=%s\n", radio_link::targetSenderMac().c_str());
+  Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
   g_air_wait_announced = true;
 
   ws_server::begin();

@@ -6,6 +6,13 @@
 
 namespace sd_backend {
 
+enum class MediaState : uint8_t {
+  no_card = 0,
+  unmounted,
+  ready,
+  error,
+};
+
 struct Status {
   uint8_t cs_pin = 0;
   uint8_t sck_pin = 0;
@@ -29,10 +36,13 @@ uint8_t misoPin();
 uint8_t mosiPin();
 
 void fillPinStatus(Status& status);
+bool mount(Status* status = nullptr);
+bool eject();
 bool begin(Status* status = nullptr);
 bool refreshStatus(Status& status);
 bool mounted();
 bool mediaPresent();
+MediaState mediaState();
 uint32_t mountedFrequencyHz();
 void end();
 

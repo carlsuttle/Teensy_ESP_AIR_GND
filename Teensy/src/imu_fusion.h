@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include "state.h"
+#include "types_shared.h"
 
 namespace imu_fusion {
 
@@ -52,22 +53,59 @@ struct ImuConfig {
   uint8_t gyrFilterPerf;
 };
 
+struct CaptureSettings {
+  uint16_t sourceRateHz = 0U;
+};
+
+struct SourcePerfSnapshot {
+  uint32_t read_accel_gyro_avg_us = 0U;
+  uint32_t read_accel_gyro_max_us = 0U;
+  uint32_t read_mag_avg_us = 0U;
+  uint32_t read_mag_max_us = 0U;
+  uint32_t read_frame_avg_us = 0U;
+  uint32_t read_frame_max_us = 0U;
+  uint32_t apply_frame_avg_us = 0U;
+  uint32_t apply_frame_max_us = 0U;
+  uint32_t fusion_ahrs_avg_us = 0U;
+  uint32_t fusion_ahrs_max_us = 0U;
+};
+
+struct SourceFlowSnapshot {
+  uint32_t scheduled_ticks = 0U;
+  uint32_t successful_reads = 0U;
+  uint32_t applied_updates = 0U;
+  uint32_t frame_drops = 0U;
+  uint32_t raw_record_drops = 0U;
+};
+
 bool begin(Stream* dbg = &Serial);
+void updateSourceRate(State& s);
 void update400Hz(State& s);
+bool setSourceRateHz(uint16_t requested_hz, uint16_t* applied_hz = nullptr);
+bool isSupportedSourceRateHz(uint16_t hz);
+size_t supportedSourceRateCount();
+uint16_t supportedSourceRateHzAt(size_t index);
+uint16_t sourceRateHz();
+uint32_t sourcePeriodUs();
+uint32_t sourceReadCount();
+uint32_t sourceUpdateCount();
+void getSourcePerfSnapshot(SourcePerfSnapshot& out);
+void getSourceFlowSnapshot(SourceFlowSnapshot& out);
 void setReplayMode(bool active);
 bool replayMode();
 bool takeReplayDebug(FusionReplayDebug& out);
+bool takeRawReplayInput(telem::ReplayInputRecord160& out);
 bool submitReplaySample(float ax_mps2, float ay_mps2, float az_mps2,
                         float gx_dps, float gy_dps, float gz_dps,
                         float mx_uT, float my_uT, float mz_uT,
                         uint32_t sample_t_us);
 
 bool readRawAccelGyro(float out6[6]);   // ax,ay,az[m/s^2], gx,gy,gz[dps]
+bool readRawGyro(float out3[3]); // gx,gy,gz[dps]
 bool readCorrectedAccelGyro(float out6[6]); // calibration-corrected ax,ay,az[g], gx,gy,gz[dps]
 bool readRawCounts(int16_t out6[6]); // ax,ay,az[counts], gx,gy,gz[counts]
 bool readRawMag(float& mx, float& my, float& mz); // uT
 bool readTemperatureC(float& tempC);
-bool sampleAvailable();
 void getGyroBiasDps(float& gx, float& gy, float& gz);
 void getAccelBiasMps2(float& ax, float& ay, float& az);
 void getGyroScale(float& lsbPerDps, float& dpsPerLsb);
@@ -77,6 +115,10 @@ void getFusionHealthFlags(bool& accelerationError, bool& accelerometerIgnored, b
 bool setFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod);
 bool loadPersistedFusionSettings();
 bool savePersistedFusionSettings();
+bool getCaptureSettings(CaptureSettings& cfg);
+bool setCaptureSettings(const CaptureSettings& cfg, uint16_t* applied_hz = nullptr);
+bool loadPersistedCaptureSettings();
+bool savePersistedCaptureSettings();
 bool getImuConfig(ImuConfig& cfg);
 bool setImuConfig(const ImuConfig& cfg);
 bool getImuSampleRates(float& accHz, float& gyrHz);

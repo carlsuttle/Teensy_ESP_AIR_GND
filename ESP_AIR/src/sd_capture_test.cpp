@@ -1,19 +1,20 @@
 #include "sd_capture_test.h"
 
-#include <SD.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
 
+#include "sd_api.h"
 #include "sd_backend.h"
 
 namespace sd_capture_test {
 namespace {
+using File = sd_api::File;
 
 constexpr char kBinaryExt[] = ".tlog";
 constexpr size_t kQueueDepth = 512U;
-constexpr size_t kWriteBufferBytes = 16384U;
+constexpr size_t kWriteBufferBytes = 10000U;
 constexpr uint32_t kFlushIntervalMs = 250U;
 constexpr uint8_t kWriteRetryCount = 8U;
 constexpr uint32_t kWriteRetryDelayMs = 2U;
@@ -133,7 +134,7 @@ bool ensureFileOpen() {
   snprintf(file_name, sizeof(file_name), "/cap_%lu%s",
            (unsigned long)g_stats.started_ms, kBinaryExt);
   strlcpy(g_stats.file_name, file_name, sizeof(g_stats.file_name));
-  g_file = SD.open(file_name, FILE_WRITE);
+  g_file = sd_api::open(file_name, sd_api::OpenMode::write);
   recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
   if (!g_file) {
     setError("file open failed");

@@ -15,15 +15,19 @@ namespace {
 AsyncWebServer g_server(80);
 AsyncWebSocket g_ws_ctrl("/ws_ctrl");
 AsyncWebSocket g_ws_state("/ws_state");
+AsyncWebSocket g_ws_raw("/ws_raw");
 constexpr uint16_t kFixedDownlinkRateHz = 30U;
 constexpr uint16_t kFixedUiRateHz = 30U;
-
 uint32_t g_ws_state_seq = 0;
 uint32_t g_last_state_broadcast_ms = 0;
 uint32_t g_last_state_seq_sent = 0;
+uint32_t g_last_source_t_us_sent = 0;
+uint32_t g_last_radio_rx_ms_seen = 0;
 uint32_t g_last_ui_tx_ms = 0;
 uint32_t g_last_ui_tx_latency_ms = 0;
 uint32_t g_max_ui_tx_latency_ms = 0;
+uint32_t g_last_raw_seq_sent = 0;
+uint32_t g_last_raw_log_ms = 0;
 
 struct EventRow {
   uint32_t ms = 0;
@@ -176,6 +180,22 @@ bool waitForFilesRevision(uint32_t baseline_revision,
   return false;
 }
 
+bool waitForStorageRevision(uint32_t baseline_revision,
+                            uint32_t timeout_ms,
+                            radio_link::RemoteStorageStatus& out_status) {
+  const uint32_t start_ms = millis();
+  for (;;) {
+    out_status = radio_link::remoteStorageStatus();
+    if (out_status.known && out_status.revision != baseline_revision) {
+      return true;
+    }
+    if ((uint32_t)(millis() - start_ms) >= timeout_ms) break;
+    delay(20);
+  }
+  out_status = radio_link::remoteStorageStatus();
+  return false;
+}
+
 void sendFileOpResult(AsyncWebServerRequest* request,
                       const char* op,
                       bool tx_ok,
@@ -199,6 +219,45 @@ void sendFileOpResult(AsyncWebServerRequest* request,
   doc["files_stored"] = files_status.stored_files;
   doc["files_last_update_ms"] = files_status.last_update_ms;
   doc["files_truncated"] = files_status.truncated;
+  String text;
+  serializeJson(doc, text);
+  request->send(200, "application/json", text);
+}
+
+void appendStorageStatus(JsonDocument& doc, const radio_link::RemoteStorageStatus& storage) {
+  doc["storage_known"] = storage.known;
+  doc["storage_revision"] = storage.revision;
+  doc["storage_last_update_ms"] = storage.last_update_ms;
+  doc["storage_media_state"] = storage.media_state;
+  doc["storage_mounted"] = storage.mounted;
+  doc["storage_backend_ready"] = storage.backend_ready;
+  doc["storage_media_present"] = storage.media_present;
+  doc["storage_busy"] = storage.busy;
+  doc["storage_init_hz"] = storage.init_hz;
+  doc["storage_free_bytes"] = storage.free_bytes;
+  doc["storage_total_bytes"] = storage.total_bytes;
+  doc["storage_file_count"] = storage.file_count;
+  doc["storage_record_prefix"] = storage.record_prefix;
+  doc["storage_next_record_name"] = storage.next_record_name;
+}
+
+void sendStorageOpResult(AsyncWebServerRequest* request,
+                         const char* op,
+                         bool tx_ok,
+                         bool ack_received,
+                         const radio_link::Snapshot& ack_snap,
+                         bool storage_synced,
+                         const radio_link::RemoteStorageStatus& storage_status) {
+  JsonDocument doc;
+  doc["ok"] = tx_ok && ack_received && ack_snap.ack_ok;
+  doc["op"] = op ? op : "";
+  doc["tx_ok"] = tx_ok;
+  doc["ack_received"] = ack_received;
+  doc["ack_ok"] = ack_received ? ack_snap.ack_ok : false;
+  doc["ack_code"] = ack_received ? ack_snap.ack_code : 0U;
+  doc["ack_seq"] = ack_received ? ack_snap.ack_rx_seq : 0U;
+  doc["storage_synced"] = storage_synced;
+  appendStorageStatus(doc, storage_status);
   String text;
   serializeJson(doc, text);
   request->send(200, "application/json", text);
@@ -388,6 +447,23 @@ void onStateEvent(AsyncWebSocket* server,
   }
 }
 
+void onRawEvent(AsyncWebSocket* server,
+                AsyncWebSocketClient* client,
+                AwsEventType type,
+                void* arg,
+                uint8_t* data,
+                size_t len) {
+  (void)server;
+  (void)arg;
+  (void)data;
+  (void)len;
+  if (type == WS_EVT_CONNECT) {
+    pushEvent("raw", "open", client ? client->id() : 0U);
+  } else if (type == WS_EVT_DISCONNECT) {
+    pushEvent("raw", "close", client ? client->id() : 0U);
+  }
+}
+
 void serveDiagCsv(AsyncWebServerRequest* request) {
   const auto snap = radio_link::snapshot();
   const bool air_link_fresh =
@@ -476,6 +552,8 @@ void broadcastState() {
 
   g_last_state_broadcast_ms = now;
   g_last_state_seq_sent = snap.seq;
+  g_last_source_t_us_sent = snap.t_us;
+  g_last_radio_rx_ms_seen = snap.stats.last_rx_ms;
   g_last_ui_tx_ms = now;
   g_last_ui_tx_latency_ms = snap.stats.last_rx_ms ? (uint32_t)(now - snap.stats.last_rx_ms) : 0U;
   if (g_last_ui_tx_latency_ms > g_max_ui_tx_latency_ms) {
@@ -497,6 +575,69 @@ void broadcastState() {
   memcpy(frame, &hdr, sizeof(hdr));
   memcpy(frame + sizeof(hdr), &snap.state, sizeof(snap.state));
   g_ws_state.binaryAll(frame, sizeof(frame));
+
+  JsonDocument doc;
+  doc["seq"] = snap.seq;
+  doc["t_us"] = snap.t_us;
+  doc["esp_rx_ms"] = snap.stats.last_rx_ms;
+  doc["air_link_fresh"] = snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U;
+  doc["roll_deg"] = snap.state.roll_deg;
+  doc["pitch_deg"] = snap.state.pitch_deg;
+  doc["yaw_deg"] = snap.state.yaw_deg;
+  doc["mag_heading_deg"] = snap.state.mag_heading_deg;
+  doc["iTOW_ms"] = snap.state.iTOW_ms;
+  doc["fixType"] = snap.state.fixType;
+  doc["numSV"] = snap.state.numSV;
+  doc["lat_1e7"] = snap.state.lat_1e7;
+  doc["lon_1e7"] = snap.state.lon_1e7;
+  doc["hMSL_mm"] = snap.state.hMSL_mm;
+  doc["gSpeed_mms"] = snap.state.gSpeed_mms;
+  doc["headMot_1e5deg"] = snap.state.headMot_1e5deg;
+  doc["hAcc_mm"] = snap.state.hAcc_mm;
+  doc["sAcc_mms"] = snap.state.sAcc_mms;
+  doc["last_gps_ms"] = snap.state.last_gps_ms;
+  doc["last_imu_ms"] = snap.state.last_imu_ms;
+  doc["last_baro_ms"] = snap.state.last_baro_ms;
+  doc["baro_temp_c"] = snap.state.baro_temp_c;
+  doc["baro_press_hpa"] = snap.state.baro_press_hpa;
+  doc["baro_alt_m"] = snap.state.baro_alt_m;
+  doc["baro_vsi_mps"] = snap.state.baro_vsi_mps;
+  doc["flags"] = snap.state.flags;
+  String text;
+  serializeJson(doc, text);
+  g_ws_raw.textAll(text);
+}
+
+void broadcastRawState() {
+  const auto snap = radio_link::snapshot();
+  if (!snap.has_state) return;
+  if (snap.seq == 0U || snap.seq == g_last_raw_seq_sent) return;
+
+  const uint32_t now = millis();
+  const uint32_t prev_seq = g_last_raw_seq_sent;
+  const uint32_t prev_ms = g_last_raw_log_ms;
+  const uint32_t delta_seq = prev_seq ? (snap.seq - prev_seq) : 0U;
+  const uint32_t delta_ms = prev_ms ? (now - prev_ms) : 0U;
+  g_last_raw_seq_sent = snap.seq;
+  g_last_raw_log_ms = now;
+
+  Serial.printf("WSRAW seq=%lu dseq=%lu dms=%lu tus=%lu fresh=%u\n",
+                (unsigned long)snap.seq,
+                (unsigned long)delta_seq,
+                (unsigned long)delta_ms,
+                (unsigned long)snap.t_us,
+                (snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U) ? 1U : 0U);
+
+  JsonDocument doc;
+  doc["seq"] = snap.seq;
+  doc["t_us"] = snap.t_us;
+  doc["esp_rx_ms"] = snap.stats.last_rx_ms;
+  doc["air_link_fresh"] = snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U;
+  doc["ms"] = now;
+  doc["clients"] = clientCount();
+  String text;
+  serializeJson(doc, text);
+  g_ws_raw.textAll(text);
 }
 
 }  // namespace
@@ -504,11 +645,14 @@ void broadcastState() {
 void begin() {
   g_ws_ctrl.onEvent(onCtrlEvent);
   g_ws_state.onEvent(onStateEvent);
+  g_ws_raw.onEvent(onRawEvent);
   g_server.addHandler(&g_ws_ctrl);
   g_server.addHandler(&g_ws_state);
+  g_server.addHandler(&g_ws_raw);
 
   g_server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
     const auto snap = radio_link::snapshot();
+    const auto storage = radio_link::remoteStorageStatus();
     const bool air_link_fresh =
         snap.stats.last_rx_ms != 0U && (uint32_t)(millis() - snap.stats.last_rx_ms) <= 3000U;
     JsonDocument doc;
@@ -605,6 +749,7 @@ void begin() {
     doc["air_replay_last_error"] = snap.replay_status.last_error;
     doc["air_replay_last_change_ms"] = snap.replay_status.last_change_ms;
     doc["air_replay_current_file"] = snap.replay_status.current_file;
+    appendStorageStatus(doc, storage);
     String text;
     serializeJson(doc, text);
     request->send(200, "application/json", text);
@@ -674,9 +819,129 @@ void begin() {
     }
     request->send(200, "application/json", radio_link::remoteFilesJson(refresh_requested));
   });
+  g_server.on("/api/sd/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    const bool refresh_requested = !request->hasParam("refresh") || request->getParam("refresh")->value() != "0";
+    if (refresh_requested) {
+      (void)radio_link::sendGetStorageStatus();
+    }
+    request->send(200, "application/json", radio_link::remoteStorageJson(refresh_requested));
+  });
+  g_server.on("/api/sd/mount", HTTP_POST, [](AsyncWebServerRequest* request) {
+    const radio_link::Snapshot before_ack = radio_link::snapshot();
+    const radio_link::RemoteStorageStatus before_storage = radio_link::remoteStorageStatus();
+    radio_link::Snapshot ack_snap = before_ack;
+    radio_link::RemoteStorageStatus storage_status = before_storage;
+    const bool tx_ok = radio_link::sendMountMedia();
+    const bool ack_received =
+        tx_ok ? waitForCommandAck(telem::CMD_MOUNT_MEDIA, before_ack.ack_rx_seq, 2000U, ack_snap) : false;
+    bool storage_synced = false;
+    if (tx_ok && ack_received && ack_snap.ack_ok) {
+      (void)radio_link::sendGetStorageStatus();
+      storage_synced = waitForStorageRevision(before_storage.revision, 2000U, storage_status);
+      if (storage_synced && storage_status.media_present) {
+        (void)radio_link::sendGetLogFileList();
+      }
+    } else {
+      storage_status = radio_link::remoteStorageStatus();
+    }
+    sendStorageOpResult(request, "mount", tx_ok, ack_received, ack_snap, storage_synced, storage_status);
+  });
+  g_server.on("/api/sd/eject", HTTP_POST, [](AsyncWebServerRequest* request) {
+    const radio_link::Snapshot before_ack = radio_link::snapshot();
+    const radio_link::RemoteStorageStatus before_storage = radio_link::remoteStorageStatus();
+    radio_link::Snapshot ack_snap = before_ack;
+    radio_link::RemoteStorageStatus storage_status = before_storage;
+    const bool tx_ok = radio_link::sendEjectMedia();
+    const bool ack_received =
+        tx_ok ? waitForCommandAck(telem::CMD_EJECT_MEDIA, before_ack.ack_rx_seq, 2000U, ack_snap) : false;
+    bool storage_synced = false;
+    if (tx_ok && ack_received) {
+      (void)radio_link::sendGetStorageStatus();
+      storage_synced = waitForStorageRevision(before_storage.revision, 2000U, storage_status);
+    } else {
+      storage_status = radio_link::remoteStorageStatus();
+    }
+    sendStorageOpResult(request, "eject", tx_ok, ack_received, ack_snap, storage_synced, storage_status);
+  });
+  g_server.on("/api/logprefix", HTTP_GET, [](AsyncWebServerRequest* request) {
+    const bool refresh_requested = !request->hasParam("refresh") || request->getParam("refresh")->value() != "0";
+    if (refresh_requested) {
+      (void)radio_link::sendGetStorageStatus();
+    }
+    const auto storage = radio_link::remoteStorageStatus();
+    JsonDocument doc;
+    doc["ok"] = 1;
+    doc["refresh_requested"] = refresh_requested;
+    appendStorageStatus(doc, storage);
+    String text;
+    serializeJson(doc, text);
+    request->send(200, "application/json", text);
+  });
+  g_server.on(
+      "/api/logprefix",
+      HTTP_POST,
+      [](AsyncWebServerRequest* request) { (void)request; },
+      nullptr,
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+        static String body;
+        if (index == 0) body = "";
+        body.concat(reinterpret_cast<const char*>(data), len);
+        if ((index + len) != total) return;
+        JsonDocument doc;
+        if (deserializeJson(doc, body) || doc["prefix"].isNull()) {
+          request->send(400, "application/json", "{\"ok\":0}");
+          return;
+        }
+        const radio_link::Snapshot before_ack = radio_link::snapshot();
+        const radio_link::RemoteStorageStatus before_storage = radio_link::remoteStorageStatus();
+        radio_link::Snapshot ack_snap = before_ack;
+        radio_link::RemoteStorageStatus storage_status = before_storage;
+        const bool tx_ok = radio_link::sendSetRecordPrefix(doc["prefix"].as<String>());
+        const bool ack_received =
+            tx_ok ? waitForCommandAck(telem::CMD_SET_RECORD_PREFIX, before_ack.ack_rx_seq, 1500U, ack_snap) : false;
+        bool storage_synced = false;
+        if (tx_ok && ack_received && ack_snap.ack_ok) {
+          (void)radio_link::sendGetStorageStatus();
+          storage_synced = waitForStorageRevision(before_storage.revision, 2000U, storage_status);
+        } else {
+          storage_status = radio_link::remoteStorageStatus();
+        }
+        sendStorageOpResult(request, "set_prefix", tx_ok, ack_received, ack_snap, storage_synced, storage_status);
+      });
   g_server.on("/api/download", HTTP_GET, [](AsyncWebServerRequest* request) {
     request->send(404, "text/plain", "not available");
   });
+  g_server.on(
+      "/api/csv",
+      HTTP_POST,
+      [](AsyncWebServerRequest* request) { (void)request; },
+      nullptr,
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+        static String body;
+        if (index == 0) body = "";
+        body.concat(reinterpret_cast<const char*>(data), len);
+        if ((index + len) != total) return;
+        JsonDocument doc;
+        if (deserializeJson(doc, body) || doc["name"].isNull()) {
+          request->send(400, "application/json", "{\"ok\":0}");
+          return;
+        }
+        const radio_link::Snapshot before_ack = radio_link::snapshot();
+        const radio_link::RemoteStorageStatus before_storage = radio_link::remoteStorageStatus();
+        radio_link::Snapshot ack_snap = before_ack;
+        radio_link::RemoteStorageStatus storage_status = before_storage;
+        const bool tx_ok = radio_link::sendExportLogCsv(doc["name"].as<String>());
+        const bool ack_received =
+            tx_ok ? waitForCommandAck(telem::CMD_EXPORT_LOG_CSV, before_ack.ack_rx_seq, 3000U, ack_snap) : false;
+        bool storage_synced = false;
+        if (tx_ok && ack_received && ack_snap.ack_ok) {
+          (void)radio_link::sendGetStorageStatus();
+          storage_synced = waitForStorageRevision(before_storage.revision, 2000U, storage_status);
+        } else {
+          storage_status = radio_link::remoteStorageStatus();
+        }
+        sendStorageOpResult(request, "csv", tx_ok, ack_received, ack_snap, storage_synced, storage_status);
+      });
   g_server.on(
       "/api/delete",
       HTTP_POST,
@@ -760,7 +1025,8 @@ void begin() {
 void loop() {
   g_ws_ctrl.cleanupClients();
   g_ws_state.cleanupClients();
-  broadcastState();
+  g_ws_raw.cleanupClients();
+  broadcastRawState();
 }
 
 uint32_t clientCount() {
@@ -772,6 +1038,8 @@ Stats stats() {
   out.clients = clientCount();
   out.ws_state_seq = g_ws_state_seq;
   out.last_state_seq_sent = g_last_state_seq_sent;
+  out.last_source_t_us_sent = g_last_source_t_us_sent;
+  out.last_radio_rx_ms_seen = g_last_radio_rx_ms_seen;
   out.last_ui_tx_ms = g_last_ui_tx_ms;
   out.last_ui_tx_latency_ms = g_last_ui_tx_latency_ms;
   out.max_ui_tx_latency_ms = g_max_ui_tx_latency_ms;
@@ -781,9 +1049,13 @@ Stats stats() {
 void resetCounters() {
   g_ws_state_seq = 0;
   g_last_state_seq_sent = 0;
+  g_last_source_t_us_sent = 0;
+  g_last_radio_rx_ms_seen = 0;
   g_last_ui_tx_ms = 0;
   g_last_ui_tx_latency_ms = 0;
   g_max_ui_tx_latency_ms = 0;
+  g_last_raw_seq_sent = 0;
+  g_last_raw_log_ms = 0;
   g_ws_event_head = 0;
   g_ws_event_count = 0;
   radio_link::resetStats();

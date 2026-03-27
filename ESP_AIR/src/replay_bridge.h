@@ -21,6 +21,8 @@ void begin();
 void poll();
 bool startLatest();
 bool startFile(const String& file_name);
+void setAverageFactor(uint8_t factor);
+uint8_t averageFactor();
 bool resume();
 bool pause();
 bool seekRelative(int32_t delta_records);

@@ -12,6 +12,8 @@
 
 namespace imu_fusion {
 bool readRawAccelGyro(float out6[6]);
+bool readRawAccel(float out3[3]);
+bool readRawGyro(float out3[3]);
 bool readRawMag(float& mx, float& my, float& mz);
 
 namespace {
@@ -28,6 +30,9 @@ constexpr uint16_t kDefaultFusionRecoverySamples = 1200U;
 constexpr int kFusionSettingsAddr = 256;
 constexpr uint32_t kFusionSettingsMagic = 0x46555331UL;  // "FUS1"
 constexpr uint16_t kFusionSettingsVersion = 1U;
+constexpr int kCaptureSettingsAddr = 320;
+constexpr uint32_t kCaptureSettingsMagic = 0x43505331UL;  // "CPS1"
+constexpr uint16_t kCaptureSettingsVersion = 1U;
 FusionAhrsSettings g_settings = {
     .convention = FusionConventionNed,
     .gain = kDefaultFusionGain,
@@ -49,6 +54,15 @@ struct PersistedFusionSettings {
   uint32_t checksum;
 };
 
+struct PersistedCaptureSettings {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint16_t sourceRateHz;
+  uint16_t reserved;
+  uint32_t checksum;
+};
+
 const FusionMatrix kGyroMisalignment = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
 const FusionVector kGyroSensitivity = {1.0f, 1.0f, 1.0f};
 FusionVector g_gyroOffset = {0.0f, 0.0f, 0.0f};
@@ -64,6 +78,11 @@ FusionVector g_hardIronOffset = {0.0f, 0.0f, 0.0f};
 float g_mx = 0.0f;
 float g_my = 0.0f;
 float g_mz = 0.0f;
+float g_ax = 0.0f;
+float g_ay = 0.0f;
+float g_az = 9.80665f;
+uint32_t g_lastAccelReadUs = 0U;
+uint32_t g_lastMagReadUs = 0U;
 FusionVector g_last_accel_body = {0.0f, 0.0f, 1.0f};
 FusionVector g_last_mag_body = {1.0f, 0.0f, 0.0f};
 FusionVector g_last_mag_fusion = {1.0f, 0.0f, 0.0f};
@@ -71,17 +90,20 @@ DebugMagMode g_debugMagMode = DebugMagMode::Live;
 FusionVector g_debugSyntheticEarthMag = {1.0f, 0.0f, 0.5f};
 uint32_t g_sampleRate = 100;
 constexpr float kGravityMps2 = 9.80665f;
-constexpr float kFusionDtSec = 0.0025f;  // 400 Hz
-constexpr uint32_t kFusionPeriodUs = 2500U;
+constexpr uint16_t kDefaultSourceRateHz = 400U;
+constexpr float kDefaultFusionDtSec = 0.0025f;  // 400 Hz
+constexpr uint32_t kDefaultAccelPeriodUs = 1000000UL / kDefaultSourceRateHz;
+constexpr uint32_t kLiveMagPeriodUs = 100000UL; // 10 Hz cached mag updates
 constexpr uint8_t kAccelLeastFilteredBwp = BMI2_ACC_OSR4_AVG1;
 constexpr uint8_t kAccelLeastFilteredPerf = 1U;
 constexpr uint8_t kGyroLeastFilteredBwp = BMI2_GYR_OSR4_MODE;
 constexpr uint8_t kGyroLeastFilteredNoisePerf = 1U;
 constexpr uint8_t kGyroLeastFilteredPerf = 1U;
-constexpr float kMinFusionDtSec = 0.0005f;
+constexpr float kMinFusionDtSec = 0.0001f;
 constexpr float kMaxFusionDtSec = 0.05f;
 float g_accLsbPerG = 16384.0f;
 float g_gyrLsbPerDps = 16.384f;
+uint32_t g_accelPeriodUs = kDefaultAccelPeriodUs;
 constexpr FusionAxesAlignment kSensorToBodyAlignment = FusionAxesAlignmentPXNYNZ; // sensor X fwd, Y left, Z up -> body X fwd, Y right, Z down
 
 uint32_t crc32(const uint8_t* data, size_t length) {
@@ -100,6 +122,10 @@ uint32_t fusionSettingsChecksum(const PersistedFusionSettings& cfg) {
   return crc32(reinterpret_cast<const uint8_t*>(&cfg), offsetof(PersistedFusionSettings, checksum));
 }
 
+uint32_t captureSettingsChecksum(const PersistedCaptureSettings& cfg) {
+  return crc32(reinterpret_cast<const uint8_t*>(&cfg), offsetof(PersistedCaptureSettings, checksum));
+}
+
 void initDefaultFusionSettings(PersistedFusionSettings& cfg) {
   memset(&cfg, 0, sizeof(cfg));
   cfg.magic = kFusionSettingsMagic;
@@ -109,6 +135,14 @@ void initDefaultFusionSettings(PersistedFusionSettings& cfg) {
   cfg.accelerationRejection = kDefaultFusionAccelRejectDeg;
   cfg.magneticRejection = kDefaultFusionMagRejectDeg;
   cfg.recoveryTriggerPeriod = kDefaultFusionRecoverySamples;
+}
+
+void initDefaultCaptureSettings(PersistedCaptureSettings& cfg) {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.magic = kCaptureSettingsMagic;
+  cfg.version = kCaptureSettingsVersion;
+  cfg.size = sizeof(PersistedCaptureSettings);
+  cfg.sourceRateHz = kDefaultSourceRateHz;
 }
 
 void applyFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod) {
@@ -129,6 +163,7 @@ struct ImuFrame {
   float mx = 0.0f;
   float my = 0.0f;
   float mz = 0.0f;
+  uint32_t seq = 0U;
   uint32_t t_us = 0U;
   bool valid = false;
   bool processed_body = false;
@@ -136,7 +171,7 @@ struct ImuFrame {
 
 constexpr uint8_t kImuFrameQueueDepth = 4;
 constexpr uint8_t kReplayDebugQueueDepth = 64;
-constexpr bool kUseFrameAveraging = true;
+constexpr uint8_t kRawReplayQueueDepth = 128;
 constexpr bool kUseGyroOffsetFilter = true;
 ImuFrame g_frameQueue[kImuFrameQueueDepth];
 uint8_t g_frameHead = 0;
@@ -146,14 +181,107 @@ FusionReplayDebug g_replayDebugQueue[kReplayDebugQueueDepth] = {};
 uint8_t g_replayDebugHead = 0U;
 uint8_t g_replayDebugTail = 0U;
 uint8_t g_replayDebugCount = 0U;
+telem::ReplayInputRecord160 g_rawReplayQueue[kRawReplayQueueDepth] = {};
+uint8_t g_rawReplayHead = 0U;
+uint8_t g_rawReplayTail = 0U;
+uint8_t g_rawReplayCount = 0U;
 uint32_t g_nextReadUs = 0;
 uint32_t g_nextFusionUs = 0;
 uint32_t g_lastFusionUpdateUs = 0;
+uint32_t g_sourceReadCount = 0U;
+uint32_t g_sourceUpdateCount = 0U;
+uint32_t g_sourceScheduledTickCount = 0U;
+uint32_t g_frameDropCount = 0U;
+uint32_t g_rawReplayDropCount = 0U;
+uint16_t g_sourceRateHz = kDefaultSourceRateHz;
+uint32_t g_sourcePeriodUs = 1000000UL / kDefaultSourceRateHz;
+
+struct SourceRateConfig {
+  uint16_t hz;
+  uint8_t accOdr;
+  uint8_t gyrOdr;
+  uint8_t accBwp;
+  uint8_t accFilterPerf;
+  uint8_t gyrBwp;
+  uint8_t gyrNoisePerf;
+  uint8_t gyrFilterPerf;
+};
+
+struct PerfAccumulator {
+  uint32_t count = 0U;
+  uint64_t total_us = 0U;
+  uint32_t max_us = 0U;
+};
+
+constexpr SourceRateConfig kSourceRateConfigs[] = {
+    {25U, BMI2_ACC_ODR_25HZ, BMI2_GYR_ODR_25HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+    {50U, BMI2_ACC_ODR_50HZ, BMI2_GYR_ODR_50HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+    {100U, BMI2_ACC_ODR_100HZ, BMI2_GYR_ODR_100HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+    {200U, BMI2_ACC_ODR_200HZ, BMI2_GYR_ODR_200HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+    {400U, BMI2_ACC_ODR_400HZ, BMI2_GYR_ODR_400HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+    {800U, BMI2_ACC_ODR_800HZ, BMI2_GYR_ODR_800HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+    {1600U, BMI2_ACC_ODR_1600HZ, BMI2_GYR_ODR_1600HZ,
+     kAccelLeastFilteredBwp, kAccelLeastFilteredPerf,
+     kGyroLeastFilteredBwp, kGyroLeastFilteredNoisePerf, kGyroLeastFilteredPerf},
+};
+constexpr size_t kSourceRateConfigCount = sizeof(kSourceRateConfigs) / sizeof(kSourceRateConfigs[0]);
+PerfAccumulator g_read_accel_gyro_us = {};
+PerfAccumulator g_read_mag_us = {};
+PerfAccumulator g_read_frame_us = {};
+PerfAccumulator g_apply_frame_us = {};
+PerfAccumulator g_fusion_ahrs_us = {};
+
+void recordPerf(PerfAccumulator& perf, uint32_t duration_us) {
+  perf.count++;
+  perf.total_us += duration_us;
+  if (duration_us > perf.max_us) perf.max_us = duration_us;
+}
+
+uint32_t avgPerfUs(const PerfAccumulator& perf) {
+  return (perf.count == 0U) ? 0U : (uint32_t)(perf.total_us / (uint64_t)perf.count);
+}
+
+void resetSourcePerfStatsInternal() {
+  g_read_accel_gyro_us = {};
+  g_read_mag_us = {};
+  g_read_frame_us = {};
+  g_apply_frame_us = {};
+  g_fusion_ahrs_us = {};
+}
 
 void clearFrameQueue() {
   g_frameHead = 0U;
   g_frameTail = 0U;
   g_frameCount = 0U;
+}
+
+void clearRawReplayQueue() {
+  g_rawReplayHead = 0U;
+  g_rawReplayTail = 0U;
+  g_rawReplayCount = 0U;
+}
+
+void queueRawReplayInput(const telem::ReplayInputRecord160& replay) {
+  if (g_rawReplayCount >= kRawReplayQueueDepth) {
+    g_rawReplayTail = (uint8_t)((g_rawReplayTail + 1U) % kRawReplayQueueDepth);
+    g_rawReplayCount--;
+    g_rawReplayDropCount++;
+  }
+  g_rawReplayQueue[g_rawReplayHead] = replay;
+  g_rawReplayHead = (uint8_t)((g_rawReplayHead + 1U) % kRawReplayQueueDepth);
+  g_rawReplayCount++;
 }
 
 void clearReplayDebugQueue() {
@@ -190,53 +318,37 @@ void resetFusionSchedulers() {
   g_lastFusionUpdateUs = 0U;
 }
 
+const SourceRateConfig& chooseSourceRateConfig(uint16_t requested_hz) {
+  const SourceRateConfig* choice = &kSourceRateConfigs[0];
+  for (const SourceRateConfig& cfg : kSourceRateConfigs) {
+    if (requested_hz < cfg.hz) break;
+    choice = &cfg;
+  }
+  return *choice;
+}
+
+const SourceRateConfig* findSourceRateConfig(uint16_t hz) {
+  for (const SourceRateConfig& cfg : kSourceRateConfigs) {
+    if (cfg.hz == hz) return &cfg;
+  }
+  return nullptr;
+}
+
+void applyRuntimeSourceRate(uint16_t hz) {
+  g_sourceRateHz = hz ? hz : kDefaultSourceRateHz;
+  g_sourcePeriodUs = 1000000UL / (uint32_t)g_sourceRateHz;
+}
+
 void queueFrame(const ImuFrame& f) {
   if (g_frameCount >= kImuFrameQueueDepth) {
     // Drop oldest frame if producer outruns consumer.
     g_frameTail = (uint8_t)((g_frameTail + 1U) % kImuFrameQueueDepth);
     g_frameCount--;
+    g_frameDropCount++;
   }
   g_frameQueue[g_frameHead] = f;
   g_frameHead = (uint8_t)((g_frameHead + 1U) % kImuFrameQueueDepth);
   g_frameCount++;
-}
-
-bool takeAveragedFrame(ImuFrame& out) {
-  if (g_frameCount == 0U) return false;
-  double sumAx = 0.0, sumAy = 0.0, sumAz = 0.0;
-  double sumGx = 0.0, sumGy = 0.0, sumGz = 0.0;
-  double sumMx = 0.0, sumMy = 0.0, sumMz = 0.0;
-  uint32_t latest_t_us = 0U;
-  uint8_t n = 0;
-  bool all_processed_body = true;
-  while (g_frameCount > 0U) {
-    const ImuFrame& f = g_frameQueue[g_frameTail];
-    if (f.valid) {
-      sumAx += f.ax; sumAy += f.ay; sumAz += f.az;
-      sumGx += f.gx; sumGy += f.gy; sumGz += f.gz;
-      sumMx += f.mx; sumMy += f.my; sumMz += f.mz;
-      latest_t_us = f.t_us;
-      n++;
-      all_processed_body = all_processed_body && f.processed_body;
-    }
-    g_frameTail = (uint8_t)((g_frameTail + 1U) % kImuFrameQueueDepth);
-    g_frameCount--;
-  }
-  if (n == 0U) return false;
-  const double invN = 1.0 / (double)n;
-  out.ax = (float)(sumAx * invN);
-  out.ay = (float)(sumAy * invN);
-  out.az = (float)(sumAz * invN);
-  out.gx = (float)(sumGx * invN);
-  out.gy = (float)(sumGy * invN);
-  out.gz = (float)(sumGz * invN);
-  out.mx = (float)(sumMx * invN);
-  out.my = (float)(sumMy * invN);
-  out.mz = (float)(sumMz * invN);
-  out.t_us = latest_t_us;
-  out.valid = true;
-  out.processed_body = all_processed_body;
-  return true;
 }
 
 bool takeQueuedFrame(ImuFrame& out) {
@@ -247,39 +359,111 @@ bool takeQueuedFrame(ImuFrame& out) {
   return out.valid;
 }
 
-bool readImuFrame(ImuFrame& out) {
-  float sensor[6];
-  if (!readRawAccelGyro(sensor)) return false;
+bool buildLiveReplayInputRecord(const State& s, const ImuFrame& f,
+                                const FusionVector& accelBody,
+                                const FusionVector& gyroBody,
+                                const FusionVector& magBody,
+                                telem::ReplayInputRecord160& replay) {
+  memset(&replay, 0, sizeof(replay));
+  replay.hdr.magic = telem::kReplayMagic;
+  replay.hdr.version = telem::kReplayVersion;
+  replay.hdr.kind = (uint8_t)telem::ReplayRecordKind::Input;
+  replay.hdr.flags = 0U;
+  replay.hdr.seq = f.seq;
+  replay.hdr.t_us = f.t_us;
 
-  float mxNew = g_mx, myNew = g_my, mzNew = g_mz;
-  if (readRawMag(mxNew, myNew, mzNew)) {
-    g_mx = mxNew;
-    g_my = myNew;
-    g_mz = mzNew;
-  }
+  uint32_t present_mask = telem::kSensorPresentImu | telem::kSensorPresentMag;
+  if (s.last_gps_ms != 0U) present_mask |= telem::kSensorPresentGps;
+  if (s.last_baro_ms != 0U) present_mask |= telem::kSensorPresentBaro;
 
-  out.ax = sensor[0];
-  out.ay = sensor[1];
-  out.az = sensor[2];
-  out.gx = sensor[3];
-  out.gy = sensor[4];
-  out.gz = sensor[5];
-  out.mx = g_mx;
-  out.my = g_my;
-  out.mz = g_mz;
-  out.t_us = micros();
-  out.valid = true;
-  out.processed_body = false;
+  replay.payload.present_mask = present_mask;
+  replay.payload.source_flags = 0U;
+  replay.payload.imu_seq = f.seq;
+  replay.payload.gps_seq = f.seq;
+  replay.payload.baro_seq = f.seq;
+  replay.payload.accel_milli_mps2[0] = (int32_t)lroundf(accelBody.axis.x * 1000.0f);
+  replay.payload.accel_milli_mps2[1] = (int32_t)lroundf(accelBody.axis.y * 1000.0f);
+  replay.payload.accel_milli_mps2[2] = (int32_t)lroundf(accelBody.axis.z * 1000.0f);
+  replay.payload.gyro_milli_dps[0] = (int32_t)lroundf(gyroBody.axis.x * 1000.0f);
+  replay.payload.gyro_milli_dps[1] = (int32_t)lroundf(gyroBody.axis.y * 1000.0f);
+  replay.payload.gyro_milli_dps[2] = (int32_t)lroundf(gyroBody.axis.z * 1000.0f);
+  replay.payload.mag_milli_uT[0] = (int32_t)lroundf(magBody.axis.x * 1000.0f);
+  replay.payload.mag_milli_uT[1] = (int32_t)lroundf(magBody.axis.y * 1000.0f);
+  replay.payload.mag_milli_uT[2] = (int32_t)lroundf(magBody.axis.z * 1000.0f);
+  replay.payload.iTOW_ms = s.iTOW;
+  replay.payload.fixType = s.fixType;
+  replay.payload.numSV = s.numSV;
+  replay.payload.gps_flags = 0U;
+  replay.payload.lat_1e7 = s.lat;
+  replay.payload.lon_1e7 = s.lon;
+  replay.payload.hMSL_mm = s.hMSL;
+  replay.payload.gSpeed_mms = s.gSpeed;
+  replay.payload.headMot_1e5deg = s.headMot;
+  replay.payload.hAcc_mm = s.hAcc;
+  replay.payload.sAcc_mms = s.sAcc;
+  replay.payload.baro_temp_milli_c = (int32_t)lroundf(s.baro_temp_c * 1000.0f);
+  replay.payload.baro_press_milli_hpa = (int32_t)lroundf(s.baro_press_hpa * 1000.0f);
+  replay.payload.baro_alt_mm = (int32_t)lroundf(s.baro_alt_m * 1000.0f);
+  replay.payload.baro_vsi_milli_mps = (int32_t)lroundf(s.baro_vsi_mps * 1000.0f);
+  memcpy(replay.payload.reserved + 0, &s.last_gps_ms, sizeof(s.last_gps_ms));
+  memcpy(replay.payload.reserved + 4, &s.last_imu_ms, sizeof(s.last_imu_ms));
+  memcpy(replay.payload.reserved + 8, &s.last_baro_ms, sizeof(s.last_baro_ms));
   return true;
 }
 
-bool takeLatestFrame(ImuFrame& out) {
-  if (g_frameCount == 0U) return false;
-  const uint8_t latestIndex = (uint8_t)((g_frameHead + kImuFrameQueueDepth - 1U) % kImuFrameQueueDepth);
-  out = g_frameQueue[latestIndex];
-  g_frameTail = g_frameHead;
-  g_frameCount = 0U;
-  return out.valid;
+bool readImuFrame(ImuFrame& out) {
+  const uint32_t start_us = micros();
+  const uint32_t sample_t_us = start_us;
+  float gyro[3];
+  if (g_accelPeriodUs <= g_sourcePeriodUs) {
+    float sensor[6];
+    if (!readRawAccelGyro(sensor)) return false;
+    g_ax = sensor[0];
+    g_ay = sensor[1];
+    g_az = sensor[2];
+    g_lastAccelReadUs = sample_t_us;
+    gyro[0] = sensor[3];
+    gyro[1] = sensor[4];
+    gyro[2] = sensor[5];
+  } else {
+    if (!readRawGyro(gyro)) return false;
+
+    if ((g_lastAccelReadUs == 0U) || ((uint32_t)(sample_t_us - g_lastAccelReadUs) >= g_accelPeriodUs)) {
+      float accel[3];
+      if (readRawAccel(accel)) {
+        g_ax = accel[0];
+        g_ay = accel[1];
+        g_az = accel[2];
+        g_lastAccelReadUs = sample_t_us;
+      }
+    }
+  }
+
+  if ((g_lastMagReadUs == 0U) || ((uint32_t)(sample_t_us - g_lastMagReadUs) >= kLiveMagPeriodUs)) {
+    float mxNew = g_mx, myNew = g_my, mzNew = g_mz;
+    if (readRawMag(mxNew, myNew, mzNew)) {
+      g_mx = mxNew;
+      g_my = myNew;
+      g_mz = mzNew;
+      g_lastMagReadUs = sample_t_us;
+    }
+  }
+
+  out.ax = g_ax;
+  out.ay = g_ay;
+  out.az = g_az;
+  out.gx = gyro[0];
+  out.gy = gyro[1];
+  out.gz = gyro[2];
+  out.mx = g_mx;
+  out.my = g_my;
+  out.mz = g_mz;
+  out.seq = g_sourceReadCount + 1U;
+  out.t_us = sample_t_us;
+  out.valid = true;
+  out.processed_body = false;
+  recordPerf(g_read_frame_us, micros() - start_us);
+  return true;
 }
 
 float accelLsbPerG(uint8_t range) {
@@ -383,6 +567,7 @@ FusionVector currentMagBodyVector(float mx, float my, float mz) {
 }
 
 void applyFrameToState(const ImuFrame& f, State& s) {
+  const uint32_t apply_start_us = micros();
   FusionVector gyro = {f.gx, f.gy, f.gz};
   FusionVector accelBody = {f.ax, f.ay, f.az};
   FusionVector magBody = {};
@@ -413,17 +598,19 @@ void applyFrameToState(const ImuFrame& f, State& s) {
   }
 
   const uint32_t sample_t_us = (f.t_us != 0U) ? f.t_us : micros();
-  float dtSec = kFusionDtSec;
+  float dtSec = (g_sourcePeriodUs > 0U) ? ((float)g_sourcePeriodUs * 1.0e-6f) : kDefaultFusionDtSec;
   if (g_lastFusionUpdateUs != 0U) {
     dtSec = (float)(sample_t_us - g_lastFusionUpdateUs) * 1.0e-6f;
     if (!isfinite(dtSec) || dtSec < kMinFusionDtSec || dtSec > kMaxFusionDtSec) {
-      dtSec = kFusionDtSec;
+      dtSec = (g_sourcePeriodUs > 0U) ? ((float)g_sourcePeriodUs * 1.0e-6f) : kDefaultFusionDtSec;
     }
   }
   g_lastFusionUpdateUs = sample_t_us;
 
   const float headingDeg = computeHeadingDeg(magBody.axis.x, magBody.axis.y);
+  const uint32_t fusion_start_us = micros();
   FusionAhrsUpdate(&g_ahrs, gyro, accel, magFusion, dtSec);
+  recordPerf(g_fusion_ahrs_us, micros() - fusion_start_us);
   s.accel_x_mps2 = accelBody.axis.x;
   s.accel_y_mps2 = accelBody.axis.y;
   s.accel_z_mps2 = accelBody.axis.z;
@@ -443,9 +630,16 @@ void applyFrameToState(const ImuFrame& f, State& s) {
   s.yaw = wrapHeading180(fusionHeadingCol);
   s.mag_heading = headingDeg;
   s.last_imu_ms = millis();
+  if (!g_replayMode) {
+    telem::ReplayInputRecord160 replay = {};
+    if (buildLiveReplayInputRecord(s, f, accelBody, gyro, magBody, replay)) {
+      queueRawReplayInput(replay);
+    }
+  }
   if (g_replayMode && f.processed_body) {
     queueReplayDebug();
   }
+  recordPerf(g_apply_frame_us, micros() - apply_start_us);
 }
 
 bool begin(Stream* dbg) {
@@ -458,8 +652,10 @@ bool begin(Stream* dbg) {
     return false;
   }
 
-  g_sampleRate = (uint32_t)(g_imu.accelerationSampleRate() + 0.5f);
+  g_sampleRate = (uint32_t)(g_imu.gyroscopeSampleRate() + 0.5f);
   if (g_sampleRate == 0U) g_sampleRate = 100U;
+  const uint32_t accelRate = (uint32_t)(g_imu.accelerationSampleRate() + 0.5f);
+  g_accelPeriodUs = (accelRate > 0U) ? (1000000UL / accelRate) : kDefaultAccelPeriodUs;
   g_ready = true;
   ImuConfig cfg{};
   if (getImuConfig(cfg)) {
@@ -475,13 +671,24 @@ bool begin(Stream* dbg) {
     g_gyrLsbPerDps = gyroLsbPerDps(cfg.gyrRange);
     g_settings.gyroscopeRange = gyroRangeDps(cfg.gyrRange);
   }
+  uint16_t applied_source_hz = 0U;
+  (void)setSourceRateHz(kDefaultSourceRateHz, &applied_source_hz);
 
   FusionOffsetInitialise(&g_offset, g_sampleRate);
   FusionAhrsInitialise(&g_ahrs);
   FusionAhrsSetSettings(&g_ahrs, &g_settings);
   g_replayMode = false;
   clearFrameQueue();
+  g_lastAccelReadUs = 0U;
+  g_lastMagReadUs = 0U;
+  g_sourceScheduledTickCount = 0U;
+  g_sourceReadCount = 0U;
+  g_sourceUpdateCount = 0U;
+  g_frameDropCount = 0U;
+  g_rawReplayDropCount = 0U;
+  resetSourcePerfStatsInternal();
   resetFusionSchedulers();
+  clearRawReplayQueue();
   return true;
 }
 
@@ -497,6 +704,12 @@ void setReplayMode(bool active) {
   }
   clearFrameQueue();
   clearReplayDebugQueue();
+  clearRawReplayQueue();
+  g_lastAccelReadUs = 0U;
+  g_lastMagReadUs = 0U;
+  g_sourceScheduledTickCount = 0U;
+  g_frameDropCount = 0U;
+  g_rawReplayDropCount = 0U;
   resetFusionSchedulers();
 }
 
@@ -509,6 +722,14 @@ bool takeReplayDebug(FusionReplayDebug& out) {
   out = g_replayDebugQueue[g_replayDebugTail];
   g_replayDebugTail = (uint8_t)((g_replayDebugTail + 1U) % kReplayDebugQueueDepth);
   g_replayDebugCount--;
+  return true;
+}
+
+bool takeRawReplayInput(telem::ReplayInputRecord160& out) {
+  if (g_rawReplayCount == 0U) return false;
+  out = g_rawReplayQueue[g_rawReplayTail];
+  g_rawReplayTail = (uint8_t)((g_rawReplayTail + 1U) % kRawReplayQueueDepth);
+  g_rawReplayCount--;
   return true;
 }
 
@@ -539,8 +760,10 @@ bool submitReplaySample(float ax_mps2, float ay_mps2, float az_mps2,
 
 bool readRawAccelGyro(float out6[6]) {
   if (!g_ready || !out6) return false;
+  const uint32_t start_us = micros();
   imu_data_t d{};
   const int rc = g_imu.readGyroAccel(d, true);  // raw counts
+  recordPerf(g_read_accel_gyro_us, micros() - start_us);
   if (rc != BMI2_OK) return false;
 
   // Convert raw counts -> physical units with float precision.
@@ -550,6 +773,30 @@ bool readRawAccelGyro(float out6[6]) {
   out6[3] = (float)d.gyr.x / g_gyrLsbPerDps;
   out6[4] = (float)d.gyr.y / g_gyrLsbPerDps;
   out6[5] = (float)d.gyr.z / g_gyrLsbPerDps;
+  return true;
+}
+
+bool readRawAccel(float out3[3]) {
+  if (!g_ready || !out3) return false;
+  int16_t x = 0, y = 0, z = 0;
+  const int rc = g_imu.readAccelerationRaw(x, y, z);
+  if (rc != BMI2_OK) return false;
+  out3[0] = ((float)x / g_accLsbPerG) * kGravityMps2;
+  out3[1] = ((float)y / g_accLsbPerG) * kGravityMps2;
+  out3[2] = ((float)z / g_accLsbPerG) * kGravityMps2;
+  return true;
+}
+
+bool readRawGyro(float out3[3]) {
+  if (!g_ready || !out3) return false;
+  const uint32_t start_us = micros();
+  int16_t x = 0, y = 0, z = 0;
+  const int rc = g_imu.readGyroscopeRaw(x, y, z);
+  recordPerf(g_read_accel_gyro_us, micros() - start_us);
+  if (rc != BMI2_OK) return false;
+  out3[0] = (float)x / g_gyrLsbPerDps;
+  out3[1] = (float)y / g_gyrLsbPerDps;
+  out3[2] = (float)z / g_gyrLsbPerDps;
   return true;
 }
 
@@ -597,19 +844,15 @@ bool readCorrectedAccelGyro(float out6[6]) {
 
 bool readRawMag(float& mx, float& my, float& mz) {
   if (!g_ready) return false;
+  const uint32_t start_us = micros();
   const int rc = g_imu.readMagneticField(mx, my, mz);
+  recordPerf(g_read_mag_us, micros() - start_us);
   return rc == BMI2_OK;
 }
 
 bool readTemperatureC(float& tempC) {
   if (!g_ready) return false;
   return g_imu.readTemperatureC(tempC);
-}
-
-bool sampleAvailable() {
-  if (!g_ready) return false;
-  // Poll BMI270 status (DRDY bits) via library helper.
-  return g_imu.gyroscopeAvailable();
 }
 
 void getGyroBiasDps(float& gx, float& gy, float& gz) {
@@ -697,6 +940,42 @@ bool savePersistedFusionSettings() {
   return true;
 }
 
+bool getCaptureSettings(CaptureSettings& cfg) {
+  if (!g_ready) return false;
+  cfg.sourceRateHz = g_sourceRateHz;
+  return true;
+}
+
+bool setCaptureSettings(const CaptureSettings& cfg, uint16_t* applied_hz) {
+  if (!g_ready) return false;
+  return setSourceRateHz(cfg.sourceRateHz, applied_hz);
+}
+
+bool loadPersistedCaptureSettings() {
+  if (!g_ready) return false;
+  PersistedCaptureSettings cfg{};
+  EEPROM.get(kCaptureSettingsAddr, cfg);
+  if (cfg.magic != kCaptureSettingsMagic ||
+      cfg.version != kCaptureSettingsVersion ||
+      cfg.size != sizeof(PersistedCaptureSettings) ||
+      cfg.checksum != captureSettingsChecksum(cfg)) {
+    return false;
+  }
+  CaptureSettings runtime{};
+  runtime.sourceRateHz = cfg.sourceRateHz;
+  return setCaptureSettings(runtime, nullptr);
+}
+
+bool savePersistedCaptureSettings() {
+  if (!g_ready) return false;
+  PersistedCaptureSettings cfg{};
+  initDefaultCaptureSettings(cfg);
+  cfg.sourceRateHz = g_sourceRateHz;
+  cfg.checksum = captureSettingsChecksum(cfg);
+  EEPROM.put(kCaptureSettingsAddr, cfg);
+  return true;
+}
+
 bool getImuConfig(ImuConfig& cfg) {
   if (!g_ready) return false;
   if (!g_imu.getAccelConfig(cfg.accOdr, cfg.accRange, cfg.accBwp, cfg.accFilterPerf)) return false;
@@ -712,11 +991,82 @@ bool setImuConfig(const ImuConfig& cfg) {
   g_gyrLsbPerDps = gyroLsbPerDps(cfg.gyrRange);
   g_settings.gyroscopeRange = gyroRangeDps(cfg.gyrRange);
 
-  g_sampleRate = (uint32_t)(g_imu.accelerationSampleRate() + 0.5f);
+  g_sampleRate = (uint32_t)(g_imu.gyroscopeSampleRate() + 0.5f);
   if (g_sampleRate == 0U) g_sampleRate = 100U;
+  const uint32_t accelRate = (uint32_t)(g_imu.accelerationSampleRate() + 0.5f);
+  g_accelPeriodUs = (accelRate > 0U) ? (1000000UL / accelRate) : kDefaultAccelPeriodUs;
+  applyRuntimeSourceRate((uint16_t)g_sampleRate);
   FusionOffsetInitialise(&g_offset, g_sampleRate);
-  g_lastFusionUpdateUs = 0U;
+  resetFusionSchedulers();
   return true;
+}
+
+bool setSourceRateHz(uint16_t requested_hz, uint16_t* applied_hz) {
+  if (!g_ready) return false;
+  const SourceRateConfig& rate_cfg = chooseSourceRateConfig(requested_hz);
+  ImuConfig cfg{};
+  if (!getImuConfig(cfg)) return false;
+  cfg.accOdr = rate_cfg.accOdr;
+  cfg.gyrOdr = rate_cfg.gyrOdr;
+  cfg.accBwp = rate_cfg.accBwp;
+  cfg.accFilterPerf = rate_cfg.accFilterPerf;
+  cfg.gyrBwp = rate_cfg.gyrBwp;
+  cfg.gyrNoisePerf = rate_cfg.gyrNoisePerf;
+  cfg.gyrFilterPerf = rate_cfg.gyrFilterPerf;
+  if (!setImuConfig(cfg)) return false;
+  resetSourcePerfStatsInternal();
+  if (applied_hz) *applied_hz = g_sourceRateHz;
+  return true;
+}
+
+bool isSupportedSourceRateHz(uint16_t hz) {
+  return findSourceRateConfig(hz) != nullptr;
+}
+
+size_t supportedSourceRateCount() {
+  return kSourceRateConfigCount;
+}
+
+uint16_t supportedSourceRateHzAt(size_t index) {
+  if (index >= kSourceRateConfigCount) return 0U;
+  return kSourceRateConfigs[index].hz;
+}
+
+uint16_t sourceRateHz() {
+  return g_sourceRateHz;
+}
+
+uint32_t sourcePeriodUs() {
+  return g_sourcePeriodUs;
+}
+
+uint32_t sourceReadCount() {
+  return g_sourceReadCount;
+}
+
+uint32_t sourceUpdateCount() {
+  return g_sourceUpdateCount;
+}
+
+void getSourcePerfSnapshot(SourcePerfSnapshot& out) {
+  out.read_accel_gyro_avg_us = avgPerfUs(g_read_accel_gyro_us);
+  out.read_accel_gyro_max_us = g_read_accel_gyro_us.max_us;
+  out.read_mag_avg_us = avgPerfUs(g_read_mag_us);
+  out.read_mag_max_us = g_read_mag_us.max_us;
+  out.read_frame_avg_us = avgPerfUs(g_read_frame_us);
+  out.read_frame_max_us = g_read_frame_us.max_us;
+  out.apply_frame_avg_us = avgPerfUs(g_apply_frame_us);
+  out.apply_frame_max_us = g_apply_frame_us.max_us;
+  out.fusion_ahrs_avg_us = avgPerfUs(g_fusion_ahrs_us);
+  out.fusion_ahrs_max_us = g_fusion_ahrs_us.max_us;
+}
+
+void getSourceFlowSnapshot(SourceFlowSnapshot& out) {
+  out.scheduled_ticks = g_sourceScheduledTickCount;
+  out.successful_reads = g_sourceReadCount;
+  out.applied_updates = g_sourceUpdateCount;
+  out.frame_drops = g_frameDropCount;
+  out.raw_record_drops = g_rawReplayDropCount;
 }
 
 bool getImuSampleRates(float& accHz, float& gyrHz) {
@@ -843,9 +1193,10 @@ void getDebugMagSyntheticEarth(float& north, float& east, float& down) {
   down = g_debugSyntheticEarthMag.axis.z;
 }
 
-void update400Hz(State& s) {
+void updateSourceRate(State& s) {
   if (!g_ready) return;
   const uint32_t nowUs = micros();
+  const uint32_t periodUs = g_sourcePeriodUs ? g_sourcePeriodUs : (1000000UL / kDefaultSourceRateHz);
   if (g_nextReadUs == 0U) {
     g_nextReadUs = nowUs;
     g_nextFusionUs = nowUs;
@@ -854,11 +1205,13 @@ void update400Hz(State& s) {
   if (!g_replayMode) {
     uint32_t readGuard = 0;
     while ((int32_t)(nowUs - g_nextReadUs) >= 0 && readGuard < 4U) {
+      g_sourceScheduledTickCount++;
       ImuFrame f{};
       if (readImuFrame(f)) {
         queueFrame(f);
+        g_sourceReadCount++;
       }
-      g_nextReadUs += kFusionPeriodUs;
+      g_nextReadUs += periodUs;
       readGuard++;
     }
   }
@@ -867,16 +1220,20 @@ void update400Hz(State& s) {
   while (((g_replayMode && g_frameCount > 0U) || (!g_replayMode && (int32_t)(nowUs - g_nextFusionUs) >= 0)) &&
          fuseGuard < 4U) {
     ImuFrame f{};
-    const bool haveFrame = g_replayMode ? takeQueuedFrame(f)
-                                        : (kUseFrameAveraging ? takeAveragedFrame(f) : takeLatestFrame(f));
+    const bool haveFrame = takeQueuedFrame(f);
     if (haveFrame) {
       applyFrameToState(f, s);
+      g_sourceUpdateCount++;
     }
     if (!g_replayMode) {
-      g_nextFusionUs += kFusionPeriodUs;
+      g_nextFusionUs += periodUs;
     }
     fuseGuard++;
   }
+}
+
+void update400Hz(State& s) {
+  updateSourceRate(s);
 }
 
 }  // namespace imu_fusion

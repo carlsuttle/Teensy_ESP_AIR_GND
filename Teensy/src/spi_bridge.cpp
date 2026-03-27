@@ -54,6 +54,7 @@ enum MsgType : uint16_t {
   kMsgReplayData = 2U,
   kMsgControl = 3U,
   kMsgStatus = 4U,
+  kMsgReplayInputData = 5U,
 };
 
 class RecordRing {
@@ -180,11 +181,13 @@ DMAMEM static uint32_t g_rx_dma_words[kTransactionBytes / sizeof(uint32_t)] __at
 DMAChannel g_tx_dma;
 DMAChannel g_rx_dma;
 RecordRing g_state_tx_ring;
+RecordRing g_raw_tx_ring;
 RecordRing g_replay_rx_ring;
 volatile bool g_ready_state = false;
 volatile bool g_transaction_armed = false;
 volatile bool g_transaction_complete = false;
 uint8_t g_pending_state_pop_count = 0U;
+uint8_t g_pending_raw_pop_count = 0U;
 uint32_t g_tx_message_seq = 0U;
 uint32_t g_last_activity_us = 0U;
 Stats g_stats = {};
@@ -277,6 +280,7 @@ void configureDma() {
 void buildTxFrame() {
   memset(g_tx_dma_words, 0, kTransactionBytes);
   g_pending_state_pop_count = 0U;
+  g_pending_raw_pop_count = 0U;
 
   auto* header = reinterpret_cast<SpiMsgHeader*>(g_tx_dma_words);
   uint8_t* payload = reinterpret_cast<uint8_t*>(g_tx_dma_words) + sizeof(SpiMsgHeader);
@@ -290,6 +294,10 @@ void buildTxFrame() {
 
   const uint8_t* src = nullptr;
   uint16_t contiguous = 0U;
+  // Live fused state must win over raw replay-input samples. If raw records
+  // are preferred here, the AIR side can be flooded with type-5 payloads and
+  // never see any type-1 state frames, which makes the radio/UI path look
+  // connected but permanently stale.
   if (g_state_tx_ring.peekContiguous(src, contiguous) && contiguous != 0U) {
     const uint16_t records_to_send = (contiguous < kMaxRecordsPerPayload) ? contiguous : kMaxRecordsPerPayload;
     const uint16_t payload_len = (uint16_t)(records_to_send * kRecordBytes);
@@ -301,8 +309,19 @@ void buildTxFrame() {
     return;
   }
 
+  if (g_raw_tx_ring.peekContiguous(src, contiguous) && contiguous != 0U) {
+    const uint16_t records_to_send = (contiguous < kMaxRecordsPerPayload) ? contiguous : kMaxRecordsPerPayload;
+    const uint16_t payload_len = (uint16_t)(records_to_send * kRecordBytes);
+    memcpy(payload, src, payload_len);
+    header->type = kMsgReplayInputData;
+    header->payload_len = payload_len;
+    header->crc32 = crc32Compute(payload, payload_len);
+    g_pending_raw_pop_count = (uint8_t)records_to_send;
+    return;
+  }
+
   StatusPayload status = {};
-  status.tx_free = g_state_tx_ring.freeSlots();
+  status.tx_free = g_raw_tx_ring.freeSlots();
   status.rx_free = g_replay_rx_ring.freeSlots();
   status.tx_overflow = (uint16_t)((g_stats.tx_overflows > 0xFFFFU) ? 0xFFFFU : g_stats.tx_overflows);
   status.rx_overflow = (uint16_t)((g_stats.rx_overflows > 0xFFFFU) ? 0xFFFFU : g_stats.rx_overflows);
@@ -354,12 +373,14 @@ void parseRxFrame() {
 
 void begin() {
   g_state_tx_ring.reset();
+  g_raw_tx_ring.reset();
   g_replay_rx_ring.reset();
   g_stats = {};
   g_ready_state = false;
   g_transaction_armed = false;
   g_transaction_complete = false;
   g_pending_state_pop_count = 0U;
+  g_pending_raw_pop_count = 0U;
   g_tx_message_seq = 0U;
   g_last_activity_us = micros();
 
@@ -380,6 +401,11 @@ void poll() {
   if (completed) {
     arm_dcache_delete(g_rx_dma_words, kTransactionBytes);
     parseRxFrame();
+    if (g_pending_raw_pop_count != 0U) {
+      g_raw_tx_ring.popMany(g_pending_raw_pop_count);
+      g_stats.tx_records += g_pending_raw_pop_count;
+      g_pending_raw_pop_count = 0U;
+    }
     if (g_pending_state_pop_count != 0U) {
       g_state_tx_ring.popMany(g_pending_state_pop_count);
       g_stats.tx_records += g_pending_state_pop_count;
@@ -432,6 +458,13 @@ void poll() {
 bool pushStateRecord(const uint8_t* record_bytes, size_t len) {
   if (!record_bytes || len != kRecordBytes) return false;
   const bool ok = g_state_tx_ring.push(record_bytes);
+  if (!ok) g_stats.tx_overflows++;
+  return ok;
+}
+
+bool pushRawRecord(const uint8_t* record_bytes, size_t len) {
+  if (!record_bytes || len != kRecordBytes) return false;
+  const bool ok = g_raw_tx_ring.push(record_bytes);
   if (!ok) g_stats.tx_overflows++;
   return ok;
 }

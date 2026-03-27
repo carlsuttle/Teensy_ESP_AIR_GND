@@ -3,7 +3,7 @@ body { font-family: Arial, sans-serif; margin: 0; background: #0f172a; color: #e
 .app-shell-frame { width: 100%; min-height: 100vh; display: flex; justify-content: center; align-items: flex-start; overflow: hidden; }
 .app-shell { width: 430px; transform-origin: top center; }
 .top { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; padding: 10px 14px; background: #111827; align-items: center; }
-.title-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; min-width: 0; }
+.title-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 8px; min-width: 0; }
 .title { font-weight: 700; white-space: nowrap; }
 #status { font-weight: 600; white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .title-row #rec { text-align: center; white-space: nowrap; justify-self: end; }
@@ -72,6 +72,11 @@ input, select, button { padding: 6px 8px; }
 .fusion-light.on.red { background: #ef4444; border-color: #fca5a5; }
 .fusion-light.off { background: #334155; border-color: #475569; }
 .logs-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.sd-grid { display: grid; gap: 8px; margin-top: 8px; }
+.sd-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+.sd-row span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prefix-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-top: 10px; }
+.prefix-row label { font-size: 12px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
 .logs-card { margin: 10px 0 12px; padding: 10px 12px; background: #111827; border: 1px solid #374151; border-radius: 14px; }
 .logs-card-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .logs-card h3 { margin: 0; }
@@ -145,6 +150,7 @@ input, select, button { padding: 6px 8px; }
   .transport-state { min-width: 64px; }
   .transport-strip { gap: 4px; }
   .file-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .prefix-row { grid-template-columns: 1fr; }
 }
 .pfd-wrap {
   display: flex;

@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Telemetry Raw Sequence</title>
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    body { overflow: auto; }
+    .raw-shell { max-width: 720px; margin: 0 auto; padding: 20px; }
+    .raw-card { background: #111827; border: 1px solid #374151; border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+    .raw-title { font-size: 24px; font-weight: 700; }
+    .raw-note { margin-top: 8px; color: #94a3b8; }
+    .raw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }
+    .raw-metric { background: #0f172a; border: 1px solid #1f2937; border-radius: 10px; padding: 12px; }
+    .raw-label { color: #94a3b8; font-size: 12px; text-transform: uppercase; }
+    .raw-value { margin-top: 6px; font-size: 28px; font-weight: 700; }
+    .raw-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+    .raw-json { min-height: 160px; font-size: 14px; line-height: 1.5; }
+    .raw-log { min-height: 200px; max-height: 320px; overflow: auto; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="raw-shell">
+    <div class="raw-card">
+      <div class="raw-title">Raw WebSocket Sequence</div>
+      <div class="raw-note">Dedicated browser test page. No telemetry parsing, no DQI, no link heuristics. This page only listens on <code>/ws_raw</code> and shows the latest received telemetry sequence number from GND.</div>
+      <div class="raw-grid">
+        <div class="raw-metric">
+          <div class="raw-label">Socket</div>
+          <div id="socketState" class="raw-value">Connecting</div>
+        </div>
+        <div class="raw-metric">
+          <div class="raw-label">Sequence</div>
+          <div id="counterValue" class="raw-value">-</div>
+        </div>
+        <div class="raw-metric">
+          <div class="raw-label">Packets</div>
+          <div id="packetCount" class="raw-value">0</div>
+        </div>
+        <div class="raw-metric">
+          <div class="raw-label">Delta Seq</div>
+          <div id="deltaSeqValue" class="raw-value">-</div>
+        </div>
+        <div class="raw-metric">
+          <div class="raw-label">Delta Ms</div>
+          <div id="deltaMsValue" class="raw-value">-</div>
+        </div>
+        <div class="raw-metric">
+          <div class="raw-label">Last Update</div>
+          <div id="lastUpdate" class="raw-value">-</div>
+        </div>
+      </div>
+      <div class="raw-actions">
+        <button id="reconnectBtn" type="button">Reconnect</button>
+        <button id="disconnectBtn" type="button">Disconnect</button>
+        <button id="clearBtn" type="button">Clear</button>
+      </div>
+    </div>
+
+    <div class="raw-card">
+      <pre id="rawJson" class="raw-json">{}</pre>
+    </div>
+
+    <div class="raw-card">
+      <div class="raw-title">Transfer Log</div>
+      <div class="raw-note">Sequence number just before each payload is handed to the page over <code>/ws_raw</code>.</div>
+      <pre id="transferLog" class="raw-log">(waiting)</pre>
+    </div>
+  </div>
+
+  <script>
+    const socketStateEl = document.getElementById('socketState');
+    const counterValueEl = document.getElementById('counterValue');
+    const packetCountEl = document.getElementById('packetCount');
+    const deltaSeqValueEl = document.getElementById('deltaSeqValue');
+    const deltaMsValueEl = document.getElementById('deltaMsValue');
+    const lastUpdateEl = document.getElementById('lastUpdate');
+    const rawJsonEl = document.getElementById('rawJson');
+    const transferLogEl = document.getElementById('transferLog');
+    const reconnectBtn = document.getElementById('reconnectBtn');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const clearBtn = document.getElementById('clearBtn');
+
+    let ws = null;
+    let reconnectTimer = null;
+    let reconnectGeneration = 0;
+    let packetCount = 0;
+    let manualDisconnect = false;
+    let lastSeq = null;
+    let lastMessageMs = 0;
+    let transferLines = [];
+
+    function setSocketState(text) {
+      socketStateEl.textContent = text;
+    }
+
+    function resetDisplay() {
+      packetCount = 0;
+      packetCountEl.textContent = '0';
+      counterValueEl.textContent = '-';
+      deltaSeqValueEl.textContent = '-';
+      deltaMsValueEl.textContent = '-';
+      lastUpdateEl.textContent = '-';
+      rawJsonEl.textContent = '{}';
+      transferLines = ['(waiting)'];
+      transferLogEl.textContent = transferLines[0];
+      lastSeq = null;
+      lastMessageMs = 0;
+    }
+
+    function appendTransferLine(line) {
+      if (!line) return;
+      if (transferLines.length === 1 && transferLines[0] === '(waiting)') {
+        transferLines = [];
+      }
+      transferLines.push(line);
+      if (transferLines.length > 40) {
+        transferLines = transferLines.slice(transferLines.length - 40);
+      }
+      transferLogEl.textContent = transferLines.join('\n');
+      transferLogEl.scrollTop = transferLogEl.scrollHeight;
+    }
+
+    function clearReconnectTimer() {
+      if (!reconnectTimer) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    function scheduleReconnect(expectedGeneration) {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (expectedGeneration !== reconnectGeneration) return;
+        connect({ forced: false });
+      }, 1000);
+    }
+
+    function detachSocketHandlers(socket) {
+      if (!socket) return;
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onclose = null;
+      socket.onerror = null;
+    }
+
+    function connect(options = {}) {
+      const forced = !!options.forced;
+      manualDisconnect = false;
+      clearReconnectTimer();
+      reconnectGeneration += 1;
+      const generation = reconnectGeneration;
+      const previous = ws;
+      if (previous) {
+        detachSocketHandlers(previous);
+        ws = null;
+        if (previous.readyState === WebSocket.OPEN || previous.readyState === WebSocket.CONNECTING) {
+          try { previous.close(); } catch (_) {}
+        }
+      }
+      setSocketState(forced ? 'Reconnecting' : 'Connecting');
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socket = new WebSocket(`${proto}//${location.host}/ws_raw`);
+      ws = socket;
+      socket.onopen = () => {
+        if (ws !== socket || generation !== reconnectGeneration) return;
+        setSocketState('Open');
+      };
+      socket.onmessage = (event) => {
+        if (ws !== socket || generation !== reconnectGeneration) return;
+        packetCount += 1;
+        packetCountEl.textContent = String(packetCount);
+        lastUpdateEl.textContent = new Date().toLocaleTimeString();
+        try {
+          const payload = JSON.parse(event.data);
+          const nowMs = Date.now();
+          const seq = payload.seq != null ? Number(payload.seq) : null;
+          const deltaSeq = (seq !== null && lastSeq !== null) ? (seq - lastSeq) : null;
+          const deltaMs = lastMessageMs ? (nowMs - lastMessageMs) : null;
+          counterValueEl.textContent = seq !== null ? String(seq) : '-';
+          deltaSeqValueEl.textContent = deltaSeq !== null ? String(deltaSeq) : '-';
+          deltaMsValueEl.textContent = deltaMs !== null ? String(deltaMs) : '-';
+          if (seq !== null) {
+            appendTransferLine(
+              `${new Date(nowMs).toLocaleTimeString()}  seq=${seq}  dseq=${deltaSeq !== null ? deltaSeq : '-'}  dms=${deltaMs !== null ? deltaMs : '-'}`
+            );
+            lastSeq = seq;
+            lastMessageMs = nowMs;
+          }
+          rawJsonEl.textContent = JSON.stringify(payload, null, 2);
+        } catch (err) {
+          counterValueEl.textContent = 'ERR';
+          rawJsonEl.textContent = `JSON parse error\n\n${String(err)}\n\n${event.data}`;
+        }
+      };
+      socket.onclose = () => {
+        if (ws === socket) ws = null;
+        if (generation !== reconnectGeneration) return;
+        setSocketState('Closed');
+        if (!manualDisconnect) {
+          scheduleReconnect(generation);
+        }
+      };
+      socket.onerror = () => {
+        if (ws !== socket || generation !== reconnectGeneration) return;
+        setSocketState('Error');
+      };
+    }
+
+    reconnectBtn.addEventListener('click', () => {
+      connect({ forced: true });
+    });
+
+    disconnectBtn.addEventListener('click', () => {
+      manualDisconnect = true;
+      clearReconnectTimer();
+      reconnectGeneration += 1;
+      const socket = ws;
+      ws = null;
+      if (socket) {
+        detachSocketHandlers(socket);
+        try { socket.close(); } catch (_) {}
+      }
+      setSocketState('Disconnected');
+    });
+
+    clearBtn.addEventListener('click', resetDisplay);
+
+    resetDisplay();
+    connect({ forced: false });
+  </script>
+</body>
+</html>

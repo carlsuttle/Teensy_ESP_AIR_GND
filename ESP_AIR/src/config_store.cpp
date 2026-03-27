@@ -8,6 +8,10 @@ namespace {
 
 Preferences g_prefs;
 AppConfig g_cfg;
+constexpr char kCfgKey[] = "cfg";
+constexpr char kNextSessionKey[] = "next_sess";
+constexpr char kLastSessionKey[] = "last_sess";
+constexpr char kLastNameKey[] = "last_name";
 
 struct LegacyAppConfigV1 {
   char ap_ssid[33];
@@ -72,11 +76,32 @@ void setDefaults(AppConfig& c) {
   c.log_mode = 1;
   c.radio_state_only = 0;
   c.radio_lr_mode = 1;
+  c.standalone_bench = 1;
   c.max_log_bytes = 4UL * 1024UL * 1024UL;
+  strncpy(c.record_prefix, "air", sizeof(c.record_prefix) - 1);
+}
+
+void sanitizeRecordPrefix(char* prefix, size_t len) {
+  if (!prefix || len == 0U) return;
+  bool have_visible = false;
+  for (size_t i = 0; i + 1U < len && prefix[i] != '\0'; ++i) {
+    const char c = prefix[i];
+    const bool ok = (c >= 'a' && c <= 'z') ||
+                    (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') ||
+                    (c == '-');
+    prefix[i] = ok ? c : '-';
+    if (prefix[i] != '-') have_visible = true;
+  }
+  prefix[len - 1U] = '\0';
+  if (!have_visible || prefix[0] == '\0') {
+    strncpy(prefix, "air", len - 1U);
+    prefix[len - 1U] = '\0';
+  }
 }
 
 void sanitize(AppConfig& c) {
-  c.source_rate_hz = clampv<uint16_t>(c.source_rate_hz, 1U, 400U);
+  c.source_rate_hz = clampv<uint16_t>(c.source_rate_hz, 50U, 1600U);
   c.ui_rate_hz = 30U;
   c.log_rate_hz = c.source_rate_hz;
   if (c.max_log_bytes < 512UL * 1024UL) c.max_log_bytes = 512UL * 1024UL;
@@ -85,13 +110,15 @@ void sanitize(AppConfig& c) {
   if (c.ap_pass[0] == '\0') strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
   c.ap_ssid[sizeof(c.ap_ssid) - 1] = '\0';
   c.ap_pass[sizeof(c.ap_pass) - 1] = '\0';
+  sanitizeRecordPrefix(c.record_prefix, sizeof(c.record_prefix));
   c.log_mode = 1;
   c.radio_state_only = c.radio_state_only ? 1U : 0U;
   c.radio_lr_mode = c.radio_lr_mode ? 1U : 0U;
+  c.standalone_bench = c.standalone_bench ? 1U : 0U;
 }
 
 void saveInternal() {
-  g_prefs.putBytes("cfg", &g_cfg, sizeof(g_cfg));
+  g_prefs.putBytes(kCfgKey, &g_cfg, sizeof(g_cfg));
 }
 
 }  // namespace
@@ -99,8 +126,8 @@ void saveInternal() {
 void begin() {
   setDefaults(g_cfg);
   g_prefs.begin("air_cfg", false);
-  if (g_prefs.getBytesLength("cfg") == sizeof(g_cfg)) {
-    g_prefs.getBytes("cfg", &g_cfg, sizeof(g_cfg));
+  if (g_prefs.getBytesLength(kCfgKey) == sizeof(g_cfg)) {
+    g_prefs.getBytes(kCfgKey, &g_cfg, sizeof(g_cfg));
     // One-time UART migration: move bridge to UART1, RX=3, TX=4
     // Handles known legacy mappings (RX=5/TX=6, RX=4/TX=5, RX=D2/TX=D3).
     if ((g_cfg.uart_rx_pin == 5 && g_cfg.uart_tx_pin == 6) ||
@@ -112,9 +139,9 @@ void begin() {
         g_cfg.uart_baud = 921600;
         saveInternal();
     }
-  } else if (g_prefs.getBytesLength("cfg") == sizeof(LegacyAppConfigV3)) {
+  } else if (g_prefs.getBytesLength(kCfgKey) == sizeof(LegacyAppConfigV3)) {
     LegacyAppConfigV3 legacy = {};
-    g_prefs.getBytes("cfg", &legacy, sizeof(legacy));
+    g_prefs.getBytes(kCfgKey, &legacy, sizeof(legacy));
     strlcpy(g_cfg.ap_ssid, legacy.ap_ssid, sizeof(g_cfg.ap_ssid));
     strlcpy(g_cfg.ap_pass, legacy.ap_pass, sizeof(g_cfg.ap_pass));
     g_cfg.uart_port = legacy.uart_port;
@@ -127,9 +154,9 @@ void begin() {
     g_cfg.log_mode = legacy.log_mode;
     g_cfg.max_log_bytes = legacy.max_log_bytes;
     saveInternal();
-  } else if (g_prefs.getBytesLength("cfg") == sizeof(LegacyAppConfigV2)) {
+  } else if (g_prefs.getBytesLength(kCfgKey) == sizeof(LegacyAppConfigV2)) {
     LegacyAppConfigV2 legacy = {};
-    g_prefs.getBytes("cfg", &legacy, sizeof(legacy));
+    g_prefs.getBytes(kCfgKey, &legacy, sizeof(legacy));
     strlcpy(g_cfg.ap_ssid, legacy.ap_ssid, sizeof(g_cfg.ap_ssid));
     strlcpy(g_cfg.ap_pass, legacy.ap_pass, sizeof(g_cfg.ap_pass));
     g_cfg.uart_port = legacy.uart_port;
@@ -142,9 +169,9 @@ void begin() {
     g_cfg.log_mode = legacy.log_mode;
     g_cfg.max_log_bytes = legacy.max_log_bytes;
     saveInternal();
-  } else if (g_prefs.getBytesLength("cfg") == sizeof(LegacyAppConfigV1)) {
+  } else if (g_prefs.getBytesLength(kCfgKey) == sizeof(LegacyAppConfigV1)) {
     LegacyAppConfigV1 legacy = {};
-    g_prefs.getBytes("cfg", &legacy, sizeof(legacy));
+    g_prefs.getBytes(kCfgKey, &legacy, sizeof(legacy));
     strlcpy(g_cfg.ap_ssid, legacy.ap_ssid, sizeof(g_cfg.ap_ssid));
     strlcpy(g_cfg.ap_pass, legacy.ap_pass, sizeof(g_cfg.ap_pass));
     g_cfg.uart_port = legacy.uart_port;
@@ -200,6 +227,44 @@ void factoryReset() {
   setDefaults(g_cfg);
   sanitize(g_cfg);
   saveInternal();
+}
+
+uint32_t nextLogSessionId() {
+  uint32_t next = g_prefs.getULong(kNextSessionKey, 1U);
+  if (next == 0U) next = 1U;
+  const uint32_t current = next;
+  uint32_t following = current + 1U;
+  if (following == 0U) following = 1U;
+  g_prefs.putULong(kNextSessionKey, following);
+  return current;
+}
+
+void noteLogSessionUsed(uint32_t session_id) {
+  if (session_id == 0U) return;
+  uint32_t next = session_id + 1U;
+  if (next == 0U) next = 1U;
+  const uint32_t stored = g_prefs.getULong(kNextSessionKey, 1U);
+  if (stored < next) g_prefs.putULong(kNextSessionKey, next);
+}
+
+bool lastClosedLogName(String& out_name) {
+  out_name = g_prefs.getString(kLastNameKey, "");
+  return !out_name.isEmpty();
+}
+
+bool lastClosedLogNameForSession(uint32_t session_id, String& out_name) {
+  out_name = "";
+  if (session_id == 0U) return false;
+  const uint32_t stored_session = g_prefs.getULong(kLastSessionKey, 0U);
+  if (stored_session != session_id) return false;
+  out_name = g_prefs.getString(kLastNameKey, "");
+  return !out_name.isEmpty();
+}
+
+void noteClosedLog(uint32_t session_id, const String& name) {
+  if (session_id == 0U || name.isEmpty()) return;
+  g_prefs.putULong(kLastSessionKey, session_id);
+  g_prefs.putString(kLastNameKey, name);
 }
 
 }  // namespace config_store

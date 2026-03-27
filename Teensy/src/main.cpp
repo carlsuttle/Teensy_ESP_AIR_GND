@@ -16,6 +16,7 @@
 #include "gps_ubx.h"
 #include "imu_fusion.h"
 #include "MagCal.h"
+#include "spi_bridge.h"
 #include "telemetry_crsf.h"
 
 namespace {
@@ -64,6 +65,7 @@ CommandMode g_mode = CommandMode::Idle;
 uint32_t g_mode_start_ms = 0;
 uint32_t g_mode_last_print_ms = 0;
 bool g_stats_streaming = false;
+bool g_quiet_serial = false;
 uint32_t g_spdtest_next_us = 0;
 uint32_t g_spdtest_sent = 0;
 uint32_t g_spdtest_drop = 0;
@@ -100,6 +102,119 @@ struct RunningStats {
     return sqrt(m2 / (double)(n - 1));
   }
 };
+
+struct PerfCounter {
+  uint32_t calls = 0;
+  uint64_t total_us = 0;
+  uint32_t max_us = 0;
+  void reset() {
+    calls = 0;
+    total_us = 0;
+    max_us = 0;
+  }
+  void record(uint32_t elapsed_us) {
+    calls++;
+    total_us += elapsed_us;
+    if (elapsed_us > max_us) max_us = elapsed_us;
+  }
+  uint32_t avgUs() const {
+    return (calls > 0U) ? (uint32_t)(total_us / (uint64_t)calls) : 0U;
+  }
+};
+
+struct CountCounter {
+  uint32_t calls = 0;
+  uint64_t total = 0;
+  uint32_t max_value = 0;
+  void reset() {
+    calls = 0;
+    total = 0;
+    max_value = 0;
+  }
+  void record(uint32_t value) {
+    calls++;
+    total += value;
+    if (value > max_value) max_value = value;
+  }
+  uint32_t avg() const {
+    return (calls > 0U) ? (uint32_t)(total / (uint64_t)calls) : 0U;
+  }
+};
+
+struct LoopPerfStats {
+  PerfCounter loop_total;
+  PerfCounter handle_cmd;
+  PerfCounter mirror_rx;
+  PerfCounter gps_baro;
+  PerfCounter telemetry;
+  PerfCounter fusion;
+  PerfCounter raw_tx;
+  PerfCounter mirror_tx;
+  PerfCounter summary;
+  PerfCounter command_mode;
+  PerfCounter logger;
+  CountCounter replay_outputs_per_loop;
+  CountCounter raw_records_per_loop;
+  CountCounter mirror_ticks_per_loop;
+  void reset() {
+    loop_total.reset();
+    handle_cmd.reset();
+    mirror_rx.reset();
+    gps_baro.reset();
+    telemetry.reset();
+    fusion.reset();
+    raw_tx.reset();
+    mirror_tx.reset();
+    summary.reset();
+    command_mode.reset();
+    logger.reset();
+    replay_outputs_per_loop.reset();
+    raw_records_per_loop.reset();
+    mirror_ticks_per_loop.reset();
+  }
+} g_loop_perf;
+
+void resetLoopPerf() {
+  g_loop_perf.reset();
+}
+
+void printLoopPerf() {
+  const PerfCounter& loop = g_loop_perf.loop_total;
+  const double loop_hz = (loop.total_us > 0U) ? ((1000000.0 * (double)loop.calls) / (double)loop.total_us) : 0.0;
+  Serial.printf(
+      "LOOP PERF loop_hz=%.2f loop_us[avg/max]=%lu/%lu handle_cmd=%lu/%lu mirror_rx=%lu/%lu gps_baro=%lu/%lu telemetry=%lu/%lu fusion=%lu/%lu raw_tx=%lu/%lu mirror_tx=%lu/%lu summary=%lu/%lu cmd_mode=%lu/%lu logger=%lu/%lu\r\n",
+      loop_hz,
+      (unsigned long)loop.avgUs(),
+      (unsigned long)loop.max_us,
+      (unsigned long)g_loop_perf.handle_cmd.avgUs(),
+      (unsigned long)g_loop_perf.handle_cmd.max_us,
+      (unsigned long)g_loop_perf.mirror_rx.avgUs(),
+      (unsigned long)g_loop_perf.mirror_rx.max_us,
+      (unsigned long)g_loop_perf.gps_baro.avgUs(),
+      (unsigned long)g_loop_perf.gps_baro.max_us,
+      (unsigned long)g_loop_perf.telemetry.avgUs(),
+      (unsigned long)g_loop_perf.telemetry.max_us,
+      (unsigned long)g_loop_perf.fusion.avgUs(),
+      (unsigned long)g_loop_perf.fusion.max_us,
+      (unsigned long)g_loop_perf.raw_tx.avgUs(),
+      (unsigned long)g_loop_perf.raw_tx.max_us,
+      (unsigned long)g_loop_perf.mirror_tx.avgUs(),
+      (unsigned long)g_loop_perf.mirror_tx.max_us,
+      (unsigned long)g_loop_perf.summary.avgUs(),
+      (unsigned long)g_loop_perf.summary.max_us,
+      (unsigned long)g_loop_perf.command_mode.avgUs(),
+      (unsigned long)g_loop_perf.command_mode.max_us,
+      (unsigned long)g_loop_perf.logger.avgUs(),
+      (unsigned long)g_loop_perf.logger.max_us);
+  Serial.printf(
+      "LOOP WORK replay_out_per_loop[avg/max]=%lu/%lu raw_records_per_loop[avg/max]=%lu/%lu mirror_ticks_per_loop[avg/max]=%lu/%lu\r\n",
+      (unsigned long)g_loop_perf.replay_outputs_per_loop.avg(),
+      (unsigned long)g_loop_perf.replay_outputs_per_loop.max_value,
+      (unsigned long)g_loop_perf.raw_records_per_loop.avg(),
+      (unsigned long)g_loop_perf.raw_records_per_loop.max_value,
+      (unsigned long)g_loop_perf.mirror_ticks_per_loop.avg(),
+      (unsigned long)g_loop_perf.mirror_ticks_per_loop.max_value);
+}
 
 struct ImuErrorStats {
   RunningStats gnorm;
@@ -294,8 +409,11 @@ MagCal g_mag_cal;
 
 void printSummary2Hz();
 void printImuConfig();
+void printSourceRateConfig();
 void printSetImuCfgUsage();
+void printSetSourceRateUsage();
 bool applySetImuCfg(const char* cmd);
+bool applySetSourceRate(const char* cmd);
 void runTeensyLoopbackTest();
 
 void printFusionSettingsSummary(const char* source) {
@@ -597,6 +715,10 @@ void printCommandHelp() {
   Serial.println("  magvec     - use synthetic earth-frame mag vector: magvec <north> <east> <down>");
   Serial.println("  showimucfg - print live accel/gyro config");
   Serial.println("  setimucfg  - set accel/gyro config (see usage)");
+  Serial.println("  showsource - print active fusion/source-rate profile and loop perf");
+  Serial.println("  resetloopperf - clear loop performance counters");
+  Serial.println("  setsourcehz- set source-rate profile: 50|100|200|400|800|1600");
+  Serial.println("  benchgyro  - time raw gyro reads: benchgyro [iterations]");
   Serial.println("  showimudata- print corrected accel/gyro data");
   Serial.println("  showimuerror- FAST/BIAS IMU noise+bias stats");
   Serial.println("  testimurot - 2s still bias + rotate Y-axis test");
@@ -605,6 +727,7 @@ void printCommandHelp() {
   Serial.println("  showcrsfin - show CRSF RX frame stats");
   Serial.println("  x          - exit active mode");
   Serial.println("  stats      - start 2Hz summary stream");
+  Serial.println("  quiet on/off/status - stop or resume unsolicited serial chatter");
   Serial.println("  zero       - zero attitude state");
 }
 
@@ -685,12 +808,112 @@ void printImuConfig() {
   Serial.printf("IMU CAL acc_scale=%.6f\r\n", (double)accScale);
   Serial.printf("IMU CAL accel_bias_mps2=(%+.4f, %+.4f, %+.4f) gyro_bias_dps=(%+.4f, %+.4f, %+.4f)\r\n",
                 (double)bax, (double)bay, (double)baz, (double)bgx, (double)bgy, (double)bgz);
+  printSourceRateConfig();
+}
+
+void printSourceRateConfig() {
+  float accHz = 0.0f, gyrHz = 0.0f;
+  const bool haveSampleRates = imu_fusion::getImuSampleRates(accHz, gyrHz);
+  imu_fusion::SourcePerfSnapshot perf = {};
+  imu_fusion::SourceFlowSnapshot flow = {};
+  mirror::ReplayPerfSnapshot replay_perf = {};
+  imu_fusion::getSourcePerfSnapshot(perf);
+  imu_fusion::getSourceFlowSnapshot(flow);
+  mirror::getReplayPerfSnapshot(replay_perf);
+  Serial.printf("SOURCE CFG rate=%uHz period_us=%lu ticks=%lu reads=%lu updates=%lu frame_drop=%lu raw_drop=%lu imu_acc_hz=%.2f imu_gyr_hz=%.2f supported=",
+                (unsigned)imu_fusion::sourceRateHz(),
+                (unsigned long)imu_fusion::sourcePeriodUs(),
+                (unsigned long)flow.scheduled_ticks,
+                (unsigned long)flow.successful_reads,
+                (unsigned long)flow.applied_updates,
+                (unsigned long)flow.frame_drops,
+                (unsigned long)flow.raw_record_drops,
+                (double)(haveSampleRates ? accHz : NAN),
+                (double)(haveSampleRates ? gyrHz : NAN));
+  const size_t count = imu_fusion::supportedSourceRateCount();
+  for (size_t i = 0; i < count; ++i) {
+    const uint16_t hz = imu_fusion::supportedSourceRateHzAt(i);
+    if (hz == 0U) continue;
+    if (i != 0U) Serial.print("|");
+    Serial.print((unsigned)hz);
+  }
+  Serial.println();
+  Serial.printf(
+      "SOURCE PERF read_ag_us[avg/max]=%lu/%lu read_mag_us[avg/max]=%lu/%lu read_frame_us[avg/max]=%lu/%lu apply_us[avg/max]=%lu/%lu ahrs_us[avg/max]=%lu/%lu\r\n",
+      (unsigned long)perf.read_accel_gyro_avg_us,
+      (unsigned long)perf.read_accel_gyro_max_us,
+      (unsigned long)perf.read_mag_avg_us,
+      (unsigned long)perf.read_mag_max_us,
+      (unsigned long)perf.read_frame_avg_us,
+      (unsigned long)perf.read_frame_max_us,
+      (unsigned long)perf.apply_frame_avg_us,
+      (unsigned long)perf.apply_frame_max_us,
+      (unsigned long)perf.fusion_ahrs_avg_us,
+      (unsigned long)perf.fusion_ahrs_max_us);
+  Serial.printf(
+      "REPLAY PERF poll_rx_us[avg/max]=%lu/%lu apply_input_us[avg/max]=%lu/%lu submit_sample_us[avg/max]=%lu/%lu queue_meta_us[avg/max]=%lu/%lu send_state_us[avg/max]=%lu/%lu push_state_us[avg/max]=%lu/%lu inputs_per_poll[avg/max]=%lu/%lu ctrls_per_poll[avg/max]=%lu/%lu outq_max=%lu\r\n",
+      (unsigned long)replay_perf.poll_rx_avg_us,
+      (unsigned long)replay_perf.poll_rx_max_us,
+      (unsigned long)replay_perf.apply_input_avg_us,
+      (unsigned long)replay_perf.apply_input_max_us,
+      (unsigned long)replay_perf.submit_sample_avg_us,
+      (unsigned long)replay_perf.submit_sample_max_us,
+      (unsigned long)replay_perf.queue_meta_avg_us,
+      (unsigned long)replay_perf.queue_meta_max_us,
+      (unsigned long)replay_perf.send_state_avg_us,
+      (unsigned long)replay_perf.send_state_max_us,
+      (unsigned long)replay_perf.push_state_avg_us,
+      (unsigned long)replay_perf.push_state_max_us,
+      (unsigned long)replay_perf.replay_inputs_per_poll_avg,
+      (unsigned long)replay_perf.replay_inputs_per_poll_max,
+      (unsigned long)replay_perf.replay_ctrls_per_poll_avg,
+      (unsigned long)replay_perf.replay_ctrls_per_poll_max,
+      (unsigned long)replay_perf.replay_output_queue_depth_max);
+  printLoopPerf();
 }
 
 void printSetImuCfgUsage() {
   Serial.println("setimucfg usage:");
   Serial.println("  setimucfg acc_hz=<25|50|100|200|400|800|1600> acc_range=<2|4|8|16> gyr_hz=<25|50|100|200|400|800|1600|3200> gyr_range=<125|250|500|1000|2000>");
   Serial.println("  optional raw overrides: acc_odr=<hex/dec> gyr_odr=<hex/dec> acc_bwp=<n> gyr_bwp=<n> acc_perf=<0|1> gyr_noise=<0|1> gyr_perf=<0|1>");
+}
+
+void printSetSourceRateUsage() {
+  Serial.println("setsourcehz usage:");
+  Serial.println("  setsourcehz <50|100|200|400|800|1600>");
+  Serial.println("  setsourcehz hz=<50|100|200|400|800|1600>");
+}
+
+void runGyroReadBenchmark(uint32_t iterations = 10000U) {
+  if (iterations == 0U) iterations = 10000U;
+
+  float gyro[3] = {0.0f, 0.0f, 0.0f};
+  uint32_t okCount = 0U;
+  uint32_t failCount = 0U;
+  const uint32_t startUs = micros();
+  for (uint32_t i = 0; i < iterations; ++i) {
+    if (imu_fusion::readRawGyro(gyro)) {
+      ++okCount;
+    } else {
+      ++failCount;
+    }
+  }
+  const uint32_t elapsedUs = micros() - startUs;
+  const float avgUs = (iterations > 0U) ? ((float)elapsedUs / (float)iterations) : NAN;
+  const float okHz = (elapsedUs > 0U) ? ((1000000.0f * (float)okCount) / (float)elapsedUs) : NAN;
+
+  Serial.printf(
+      "GYROBENCH iterations=%lu ok=%lu fail=%lu total_us=%lu total_ms=%.3f avg_us=%.3f ok_hz=%.2f last_dps=(%.3f, %.3f, %.3f)\r\n",
+      (unsigned long)iterations,
+      (unsigned long)okCount,
+      (unsigned long)failCount,
+      (unsigned long)elapsedUs,
+      (double)((float)elapsedUs / 1000.0f),
+      (double)avgUs,
+      (double)okHz,
+      (double)gyro[0],
+      (double)gyro[1],
+      (double)gyro[2]);
 }
 
 bool applySetImuCfg(const char* cmd) {
@@ -728,6 +951,36 @@ bool applySetImuCfg(const char* cmd) {
   return imu_fusion::setImuConfig(cfg);
 }
 
+bool applySetSourceRate(const char* cmd) {
+  if (!cmd) return false;
+  const char* args = cmd + strlen("setsourcehz");
+  while (*args == ' ' || *args == '\t') ++args;
+  if (*args == '\0') return false;
+
+  uint32_t requested = 0U;
+  if (startsWith(args, "hz=")) {
+    char* end = nullptr;
+    requested = (uint32_t)strtoul(args + 3, &end, 0);
+    if (!end || *end != '\0') return false;
+  } else {
+    char* end = nullptr;
+    requested = (uint32_t)strtoul(args, &end, 0);
+    if (!end || *end != '\0') return false;
+  }
+
+  if (requested == 0U || requested > 65535U) return false;
+  if (!imu_fusion::isSupportedSourceRateHz((uint16_t)requested)) return false;
+
+  uint16_t applied = 0U;
+  if (!imu_fusion::setSourceRateHz((uint16_t)requested, &applied)) return false;
+  resetLoopPerf();
+  mirror::resetReplayPerf();
+  Serial.printf("setsourcehz applied requested=%u applied=%u\r\n",
+                (unsigned)requested,
+                (unsigned)applied);
+  return true;
+}
+
 void setMode(CommandMode mode) {
   g_mode = mode;
   g_mode_start_ms = millis();
@@ -744,51 +997,65 @@ void setMode(CommandMode mode) {
 
   switch (g_mode) {
     case CommandMode::Idle:
-      Serial.println("MODE IDLE");
+      if (!g_quiet_serial) Serial.println("MODE IDLE");
       break;
     case CommandMode::CalMag:
-      Serial.println("CALMAG START");
-      Serial.println("Rotate sensor through all orientations.");
+      if (!g_quiet_serial) {
+        Serial.println("CALMAG START");
+        Serial.println("Rotate sensor through all orientations.");
+      }
       break;
     case CommandMode::CalImu:
-      Serial.println("CALIMU START");
-      Serial.println("Keep unit stationary.");
+      if (!g_quiet_serial) {
+        Serial.println("CALIMU START");
+        Serial.println("Keep unit stationary.");
+      }
       break;
     case CommandMode::GetHdg:
-      Serial.println("GETHDG START");
+      if (!g_quiet_serial) Serial.println("GETHDG START");
       break;
     case CommandMode::ShowYawCmp:
-      Serial.println("SHOWYAWCMP START");
-      Serial.println("YAWCMP\tgx_raw\tgy_raw\tgz_raw\tmx_raw\tmy_raw\tmz_raw\tmx_corr\tmy_corr\tmz_corr\traw_hdg\tfusion_roll\tfusion_pitch\tfusion_yaw\tfusion_hdg_col\tfusion_hdg_row\tfusion_hdg_tc\tmag_heading\tmagE_body_hdg\tmagE_fusion_hdg");
+      if (!g_quiet_serial) {
+        Serial.println("SHOWYAWCMP START");
+        Serial.println("YAWCMP\tgx_raw\tgy_raw\tgz_raw\tmx_raw\tmy_raw\tmz_raw\tmx_corr\tmy_corr\tmz_corr\traw_hdg\tfusion_roll\tfusion_pitch\tfusion_yaw\tfusion_hdg_col\tfusion_hdg_row\tfusion_hdg_tc\tmag_heading\tmagE_body_hdg\tmagE_fusion_hdg");
+      }
       break;
     case CommandMode::SpdTest:
-      Serial.println("SPDTEST START");
+      if (!g_quiet_serial) Serial.println("SPDTEST START");
       break;
     case CommandMode::ShowCrsfIn:
-      Serial.println("SHOWCRSFIN START");
+      if (!g_quiet_serial) Serial.println("SHOWCRSFIN START");
       break;
     case CommandMode::ShowImuData:
-      Serial.println("SHOWIMUDATA START");
-      Serial.println("IMU\tax_g\t\tay_g\t\taz_g\t\tgx_dps\t\tgy_dps\t\tgz_dps");
+      if (!g_quiet_serial) {
+        Serial.println("SHOWIMUDATA START");
+        Serial.println("IMU\tax_g\t\tay_g\t\taz_g\t\tgx_dps\t\tgy_dps\t\tgz_dps");
+      }
       break;
     case CommandMode::ShowImuError:
       g_imu_err.resetAll();
-      Serial.println("SHOWIMUERROR START");
-      Serial.println("IMUFAST\tN\t|g|corr_mean\t|g|corr_std\t|g|corr-1\tgx_raw_dps\tgy_raw_dps\tgz_raw_dps\tgx_corr_dps\tgy_corr_dps\tgz_corr_dps\tbias_x_dps\tbias_y_dps\tbias_z_dps\tgy_raw_counts\tdps_per_lsb\twmean_dps\twstd_dps\ttemp_C\tdt_us_mean\tdt_us_min\tdt_us_max\thz_est");
-      Serial.println("IMUBIAS\tN\tok\t|g|corr_mean\t|g|corr_std\tg_scale_err\tgx_raw_dps\tgy_raw_dps\tgz_raw_dps\tgx_corr_dps\tgy_corr_dps\tgz_corr_dps\tbias_x_dps\tbias_y_dps\tbias_z_dps\tgy_raw_counts\tdps_per_lsb\t|bias|_dps\tdrift_deg_min\ttemp_C");
+      if (!g_quiet_serial) {
+        Serial.println("SHOWIMUERROR START");
+        Serial.println("IMUFAST\tN\t|g|corr_mean\t|g|corr_std\t|g|corr-1\tgx_raw_dps\tgy_raw_dps\tgz_raw_dps\tgx_corr_dps\tgy_corr_dps\tgz_corr_dps\tbias_x_dps\tbias_y_dps\tbias_z_dps\tgy_raw_counts\tdps_per_lsb\twmean_dps\twstd_dps\ttemp_C\tdt_us_mean\tdt_us_min\tdt_us_max\thz_est");
+        Serial.println("IMUBIAS\tN\tok\t|g|corr_mean\t|g|corr_std\tg_scale_err\tgx_raw_dps\tgy_raw_dps\tgz_raw_dps\tgx_corr_dps\tgy_corr_dps\tgz_corr_dps\tbias_x_dps\tbias_y_dps\tbias_z_dps\tgy_raw_counts\tdps_per_lsb\t|bias|_dps\tdrift_deg_min\ttemp_C");
+      }
       break;
     case CommandMode::TestImuRot:
       g_rot_test.reset();
-      Serial.println("TESTIMUROT START");
-      Serial.println("Hold still for 2s, then rotate around Y axis about 90 deg in ~1s and stop.");
+      if (!g_quiet_serial) {
+        Serial.println("TESTIMUROT START");
+        Serial.println("Hold still for 2s, then rotate around Y axis about 90 deg in ~1s and stop.");
+      }
       break;
     case CommandMode::EspComTest:
       g_esp_com_test.reset();
       g_esp_com_test.active = true;
       g_esp_com_test.startMs = millis();
-      Serial.println("ESPCOMTEST START");
-      Serial.println("Waiting for ESPTEST_ACK on Serial3 (mirror link).");
-      Serial.println("Press 'x' to abort.");
+      if (!g_quiet_serial) {
+        Serial.println("ESPCOMTEST START");
+        Serial.println("Waiting for ESPTEST_ACK on Serial3 (mirror link).");
+        Serial.println("Press 'x' to abort.");
+      }
       break;
   }
 }
@@ -817,6 +1084,19 @@ void processCommand(const char* cmd) {
     g_stats_streaming = true;
     g_summary_timer_us = 0;
     Serial.println("STATS STREAM START (2Hz)");
+  } else if (strcmp(cmd, "quiet on") == 0) {
+    g_quiet_serial = true;
+    g_stats_streaming = false;
+    if (g_mode != CommandMode::Idle) setMode(CommandMode::Idle);
+    Serial.println("QUIET on");
+  } else if (strcmp(cmd, "quiet off") == 0) {
+    g_quiet_serial = false;
+    Serial.println("QUIET off");
+  } else if (strcmp(cmd, "quiet status") == 0) {
+    Serial.printf("QUIET enabled=%u stats=%u mode=%u\r\n",
+                  g_quiet_serial ? 1U : 0U,
+                  g_stats_streaming ? 1U : 0U,
+                  (unsigned)g_mode);
   } else if (strcmp(cmd, "zero") == 0) {
     g_state.roll = 0.0f;
     g_state.pitch = 0.0f;
@@ -874,6 +1154,33 @@ void processCommand(const char* cmd) {
   } else if (strcmp(cmd, "showcrsfin") == 0) {
     setMode(CommandMode::ShowCrsfIn);
   } else if (strcmp(cmd, "showimucfg") == 0) {
+    printImuConfig();
+  } else if (strcmp(cmd, "showsource") == 0) {
+    printSourceRateConfig();
+  } else if (strcmp(cmd, "resetloopperf") == 0) {
+    resetLoopPerf();
+    mirror::resetReplayPerf();
+    Serial.println("loop perf reset");
+  } else if (startsWith(cmd, "benchgyro")) {
+    uint32_t iterations = 10000U;
+    if (strlen(cmd) > strlen("benchgyro")) {
+      if (sscanf(cmd + strlen("benchgyro"), "%lu", &iterations) != 1) {
+        Serial.println("benchgyro usage: benchgyro [iterations]");
+        return;
+      }
+    }
+    runGyroReadBenchmark(iterations);
+  } else if (startsWith(cmd, "setsourcehz")) {
+    const bool hasArgs = (strlen(cmd) > strlen("setsourcehz"));
+    if (!hasArgs) {
+      printSetSourceRateUsage();
+      return;
+    }
+    if (!applySetSourceRate(cmd)) {
+      Serial.println("setsourcehz failed (unsupported rate or IMU write error)");
+      printSetSourceRateUsage();
+      return;
+    }
     printImuConfig();
   } else if (startsWith(cmd, "setimucfg")) {
     const bool hasArgs = (strlen(cmd) > strlen("setimucfg"));
@@ -1536,7 +1843,9 @@ void setup() {
                 (unsigned long)GPS_BAUD, (unsigned)GPS_TX_PIN, (unsigned)GPS_RX_PIN);
   Serial.printf("i2c=wire sda=%u scl=%u hz=%lu\r\n",
                 (unsigned)I2C_SDA_PIN, (unsigned)I2C_SCL_PIN, (unsigned long)I2C_BUS_HZ);
-  Serial.printf("loops: imu=400Hz(drdy) mirror=%uHz summary=2Hz\r\n", (unsigned)mirror::streamRateHz());
+  Serial.printf("loops: imu=%uHz(source) mirror=%uHz summary=2Hz\r\n",
+                (unsigned)imu_fusion::sourceRateHz(),
+                (unsigned)mirror::streamRateHz());
 
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
@@ -1555,6 +1864,7 @@ void setup() {
   if (g_imu_ok) {
     // Load persisted calibration first so printed config reflects active runtime calibration.
     loadCalibrationAtBoot();
+    (void)imu_fusion::loadPersistedCaptureSettings();
     const bool fusionLoaded = imu_fusion::loadPersistedFusionSettings();
     printFusionSettingsSummary(fusionLoaded ? "loaded" : "default");
     printImuConfig();
@@ -1569,29 +1879,72 @@ void setup() {
 
   g_summary_timer_us = 0;
   g_mirror_timer_us = 0;
+  resetLoopPerf();
 }
 
 void loop() {
+  static telem::ReplayInputRecord160 pending_raw_record = {};
+  static bool have_pending_raw_record = false;
+  const uint32_t loop_start_us = micros();
+  uint32_t section_start_us = loop_start_us;
+  uint32_t raw_records_sent = 0U;
+  uint32_t replay_outputs_sent = 0U;
+  uint32_t mirror_ticks_sent = 0U;
   handleCommandInputs();
+  g_loop_perf.handle_cmd.record(micros() - section_start_us);
+
+  section_start_us = micros();
   mirror::pollRx(g_state);
+  g_loop_perf.mirror_rx.record(micros() - section_start_us);
   const bool replayActive = mirror::replayActive();
   const bool imuDiagActive = (g_mode == CommandMode::ShowImuError) || (g_mode == CommandMode::TestImuRot);
 
   if (!imuDiagActive) {
+    section_start_us = micros();
     if (!replayActive) {
       gpsPollContinuous();
       baroPollAndFilter();
     } else if (!isnan(g_state.baro_alt_m)) {
       g_last_baro_alt_m = g_state.baro_alt_m;
     }
-    telemetry_loop(g_state);
+    g_loop_perf.gps_baro.record(micros() - section_start_us);
 
-    // IMU update is micros-scheduled at 400 Hz in imu_fusion::update400Hz(); in replay mode
-    // it consumes injected SPI sensor samples instead of the live IMU.
+    section_start_us = micros();
+    telemetry_loop(g_state);
+    g_loop_perf.telemetry.record(micros() - section_start_us);
+
+    // Keep the original 400 Hz loop structure, but let imu_fusion select the
+    // active read/fusion period from the commanded source-rate profile.
+    section_start_us = micros();
     imu_fusion::update400Hz(g_state);
+    g_loop_perf.fusion.record(micros() - section_start_us);
+
+    section_start_us = micros();
+    if (!replayActive) {
+      if (have_pending_raw_record &&
+          spi_bridge::pushRawRecord(reinterpret_cast<const uint8_t*>(&pending_raw_record),
+                                    sizeof(pending_raw_record))) {
+        have_pending_raw_record = false;
+        raw_records_sent++;
+      }
+      while (!have_pending_raw_record) {
+        telem::ReplayInputRecord160 raw_record = {};
+        if (!imu_fusion::takeRawReplayInput(raw_record)) break;
+        if (!spi_bridge::pushRawRecord(reinterpret_cast<const uint8_t*>(&raw_record), sizeof(raw_record))) {
+          pending_raw_record = raw_record;
+          have_pending_raw_record = true;
+          break;
+        }
+        raw_records_sent++;
+      }
+    } else {
+      have_pending_raw_record = false;
+    }
+    g_loop_perf.raw_tx.record(micros() - section_start_us);
   }
 
   const uint32_t mirrorPeriodUs = mirror::streamPeriodUs();
+  section_start_us = micros();
   if (!imuDiagActive && replayActive) {
     mirror::ReplayOutputMeta replay_meta = {};
     while (mirror::takeReplayOutputMeta(replay_meta)) {
@@ -1599,23 +1952,40 @@ void loop() {
       const imu_fusion::FusionReplayDebug* replay_diag_ptr =
           imu_fusion::takeReplayDebug(replay_diag) ? &replay_diag : nullptr;
       mirrorSendFastState(replay_meta.seq, replay_meta.t_us, &replay_meta, replay_diag_ptr);
+      replay_outputs_sent++;
     }
   } else {
     while (g_mirror_timer_us >= mirrorPeriodUs) {
       g_mirror_timer_us -= mirrorPeriodUs;
       if (!imuDiagActive) {
         mirrorSendFastState(g_mirror_seq++, micros(), nullptr);
+        mirror_ticks_sent++;
       }
     }
   }
+  g_loop_perf.mirror_tx.record(micros() - section_start_us);
 
-  if (!imuDiagActive && g_stats_streaming && g_summary_timer_us >= SUMMARY_PERIOD_US) {
+  section_start_us = micros();
+  if (!g_quiet_serial && !imuDiagActive && g_stats_streaming && g_summary_timer_us >= SUMMARY_PERIOD_US) {
     g_summary_timer_us -= SUMMARY_PERIOD_US;
     printSummary2Hz();
   }
+  g_loop_perf.summary.record(micros() - section_start_us);
 
+  section_start_us = micros();
   serviceCommandMode();
-  g_logger.service(Serial, 8U);
+  g_loop_perf.command_mode.record(micros() - section_start_us);
+
+  section_start_us = micros();
+  if (!g_quiet_serial) {
+    g_logger.service(Serial, 8U);
+  }
+  g_loop_perf.logger.record(micros() - section_start_us);
+
+  g_loop_perf.raw_records_per_loop.record(raw_records_sent);
+  g_loop_perf.replay_outputs_per_loop.record(replay_outputs_sent);
+  g_loop_perf.mirror_ticks_per_loop.record(mirror_ticks_sent);
+  g_loop_perf.loop_total.record(micros() - loop_start_us);
 }
 
 

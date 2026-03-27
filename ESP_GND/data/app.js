@@ -24,6 +24,17 @@ const stopReplayBtn = document.getElementById("stopReplay");
 const fastForwardReplayBtn = document.getElementById("fastForwardReplay");
 const refreshReplayFilesBtn = document.getElementById("refreshReplayFiles");
 const deleteReplayFilesBtn = document.getElementById("deleteReplayFiles");
+const exportReplayCsvBtn = document.getElementById("exportReplayCsv");
+const replaySortKeyEl = document.getElementById("replaySortKey");
+const replaySortDirEl = document.getElementById("replaySortDir");
+const refreshStorageStatusBtn = document.getElementById("refreshStorageStatus");
+const mountStorageBtn = document.getElementById("mountStorage");
+const ejectStorageBtn = document.getElementById("ejectStorage");
+const saveRecordPrefixBtn = document.getElementById("saveRecordPrefix");
+const recordPrefixInputEl = document.getElementById("recordPrefixInput");
+const storageStateTextEl = document.getElementById("storageStateText");
+const storageSpaceTextEl = document.getElementById("storageSpaceText");
+const storageNextFileTextEl = document.getElementById("storageNextFileText");
 
 let wsCtrl = null;
 let wsState = null;
@@ -93,6 +104,7 @@ let ctrlClientErrors = 0;
 let ctrlReconnects = 0;
 let ctrlReconnectTimer = null;
 let ctrlErrorRecoveryTimer = null;
+let ctrlSocketGeneration = 0;
 let hasCtrlConnectedOnce = false;
 let lastCtrlOpenAt = 0;
 let stateCloseCode = "-";
@@ -102,6 +114,7 @@ let stateClientErrors = 0;
 let stateReconnects = 0;
 let stateReconnectTimer = null;
 let stateErrorRecoveryTimer = null;
+let stateSocketGeneration = 0;
 let hasStateConnectedOnce = false;
 let lastStateSocketOpenAt = 0;
 let suppressStaleUntilMs = 0;
@@ -131,6 +144,10 @@ let pendingReplayEditFocus = false;
 let replayFilesPanelDirty = true;
 let lastReplayFileOp = null;
 let controlImpactGraceUntilMs = 0;
+let storageStatusFetchInFlight = false;
+let lastStorageOp = null;
+let replayFileSortKey = "date";
+let replayFileSortDir = "desc";
 let replayFilesState = {
   files: [],
   complete: false,
@@ -140,6 +157,22 @@ let replayFilesState = {
   stored_files: 0,
   truncated: false,
   last_update_ms: 0
+};
+let storageState = {
+  known: false,
+  revision: 0,
+  last_update_ms: 0,
+  media_state: 0,
+  mounted: false,
+  backend_ready: false,
+  media_present: false,
+  busy: false,
+  init_hz: 0,
+  free_bytes: 0xFFFFFFFF,
+  total_bytes: 0,
+  file_count: 0,
+  record_prefix: "air",
+  next_record_name: ""
 };
 let linkStatus = {
   transport: "ESP-NOW",
@@ -176,6 +209,20 @@ let linkStatus = {
   air_log_bytes_written: 0,
   air_log_free_bytes: null,
   air_log_last_change_ms: null,
+  storage_known: false,
+  storage_revision: 0,
+  storage_last_update_ms: 0,
+  storage_media_state: 0,
+  storage_mounted: false,
+  storage_backend_ready: false,
+  storage_media_present: false,
+  storage_busy: false,
+  storage_init_hz: 0,
+  storage_free_bytes: null,
+  storage_total_bytes: 0,
+  storage_file_count: 0,
+  storage_record_prefix: "air",
+  storage_next_record_name: "",
   has_replay_status: false,
   air_replay_active: false,
   air_replay_file_open: false,
@@ -211,7 +258,7 @@ const FILE_OP_POLL_MS = 300;
 const DQI_STARTUP_SETTLE_MS = 2500;
 const RENDER_PERIOD_MS = 50;
 const LINK_RENDER_PERIOD_MS = 250;
-const LINK_STATUS_PERIOD_MS = 250;
+const LINK_STATUS_PERIOD_MS = 1000;
 const PING_AVG_WINDOW = 30;
 const CLIENT_EVENT_CAPACITY = 256;
 const FUSION_SAMPLE_RATE_HZ = 400;
@@ -423,11 +470,26 @@ function sendReplaySeek(deltaRecords) {
   wsCtrl.send(JSON.stringify({ type: "seek_replay", req_id: allocCtrlReqId(), delta_records: Number(deltaRecords || 0) }));
 }
 
+function replayFileDateKey(name = "") {
+  const text = String(name || "");
+  const match = text.match(/_(\d+)_(\d+)\.[A-Za-z0-9]+$/);
+  return match ? Number(match[2] || 0) : 0;
+}
+
 function sortReplayFiles(files = []) {
   return [...files].sort((a, b) => {
-    const byName = String(b.name || "").localeCompare(String(a.name || ""));
-    if (byName !== 0) return byName;
-    return Number(b.size || 0) - Number(a.size || 0);
+    let delta = 0;
+    if (replayFileSortKey === "size") {
+      delta = Number(a.size || 0) - Number(b.size || 0);
+    } else if (replayFileSortKey === "name") {
+      delta = String(a.name || "").localeCompare(String(b.name || ""));
+    } else {
+      delta = replayFileDateKey(String(a.name || "")) - replayFileDateKey(String(b.name || ""));
+    }
+    if (delta === 0) {
+      delta = String(a.name || "").localeCompare(String(b.name || ""));
+    }
+    return replayFileSortDir === "asc" ? delta : -delta;
   });
 }
 
@@ -533,6 +595,55 @@ function applyReplayFilesPayload(payload = null) {
   linkDirty = true;
 }
 
+function storageStateText(code = storageState.media_state) {
+  if (code === 0) return "No Card";
+  if (code === 1) return "Unmounted";
+  if (code === 2) return "Ready";
+  if (code === 3) return "Error";
+  return "Unknown";
+}
+
+function applyStorageStatusPayload(payload = null) {
+  if (!payload) return;
+  const nextState = {
+    known: !!payload.known || !!payload.storage_known,
+    revision: Number(payload.revision ?? payload.storage_revision ?? storageState.revision),
+    last_update_ms: Number(payload.last_update_ms ?? payload.storage_last_update_ms ?? 0),
+    media_state: Number(payload.media_state ?? payload.storage_media_state ?? 0),
+    mounted: !!(payload.mounted ?? payload.storage_mounted),
+    backend_ready: !!(payload.backend_ready ?? payload.storage_backend_ready),
+    media_present: !!(payload.media_present ?? payload.storage_media_present),
+    busy: !!(payload.busy ?? payload.storage_busy),
+    init_hz: Number(payload.init_hz ?? payload.storage_init_hz ?? 0),
+    free_bytes: Number(payload.free_bytes ?? payload.storage_free_bytes ?? 0xFFFFFFFF),
+    total_bytes: Number(payload.total_bytes ?? payload.storage_total_bytes ?? 0),
+    file_count: Number(payload.file_count ?? payload.storage_file_count ?? 0),
+    record_prefix: String(payload.record_prefix ?? payload.storage_record_prefix ?? storageState.record_prefix ?? "air"),
+    next_record_name: String(payload.next_record_name ?? payload.storage_next_record_name ?? "")
+  };
+  storageState = nextState;
+  linkStatus.storage_known = nextState.known;
+  linkStatus.storage_revision = nextState.revision;
+  linkStatus.storage_last_update_ms = nextState.last_update_ms;
+  linkStatus.storage_media_state = nextState.media_state;
+  linkStatus.storage_mounted = nextState.mounted;
+  linkStatus.storage_backend_ready = nextState.backend_ready;
+  linkStatus.storage_media_present = nextState.media_present;
+  linkStatus.storage_busy = nextState.busy;
+  linkStatus.storage_init_hz = nextState.init_hz;
+  linkStatus.storage_free_bytes = nextState.free_bytes;
+  linkStatus.storage_total_bytes = nextState.total_bytes;
+  linkStatus.storage_file_count = nextState.file_count;
+  linkStatus.storage_record_prefix = nextState.record_prefix;
+  linkStatus.storage_next_record_name = nextState.next_record_name;
+  if (recordPrefixInputEl && document.activeElement !== recordPrefixInputEl) {
+    recordPrefixInputEl.value = nextState.record_prefix;
+  }
+  uiDirty = true;
+  linkDirty = true;
+  replayFilesPanelDirty = true;
+}
+
 function replayFilePresent(name = "") {
   const target = String(name || "");
   return !!target && replayFilesState.files.some((file) => file.name === target);
@@ -617,6 +728,13 @@ async function requestReplayFilesPayload({ refresh = true } = {}) {
   return resp.json();
 }
 
+async function requestStorageStatusPayload({ refresh = true } = {}) {
+  const url = refresh ? "/api/sd/status?refresh=1" : "/api/sd/status?refresh=0";
+  const resp = await fetch(url, { cache: "no-store" });
+  if (!resp.ok) throw new Error(`storage failed: ${resp.status}`);
+  return resp.json();
+}
+
 function holdControlImpact(ms = 2500) {
   const until = Date.now() + Math.max(0, Number(ms || 0));
   if (until > controlImpactGraceUntilMs) controlImpactGraceUntilMs = until;
@@ -663,6 +781,11 @@ function replayFileOpSummary(result = null) {
   return `${result.op || "-"} ok=${result.ok ? 1 : 0} tx=${result.tx_ok ? 1 : 0} ack=${result.ack_received ? 1 : 0}/${result.ack_ok ? 1 : 0} code=${result.ack_code} sync=${result.files_synced ? 1 : 0} rev=${result.files_revision}`;
 }
 
+function storageOpSummary(result = null) {
+  if (!result) return "-";
+  return `${result.op || "-"} ok=${result.ok ? 1 : 0} tx=${result.tx_ok ? 1 : 0} ack=${result.ack_received ? 1 : 0}/${result.ack_ok ? 1 : 0} code=${result.ack_code} sync=${result.storage_synced ? 1 : 0} rev=${result.storage_revision}`;
+}
+
 function queueReplayFilesRefresh(pollOnly = false, attempt = 0, nonce = replayFilesRefreshNonce) {
   clearTimeout(replayFilesFetchTimer);
   replayFilesFetchTimer = setTimeout(() => {
@@ -687,6 +810,68 @@ async function fetchReplayFiles({ refresh = true, attempt = 0, nonce = null } = 
   } catch (_err) {
     if (attempt < 3) queueReplayFilesRefresh(false, attempt + 1, activeNonce);
   }
+}
+
+async function fetchStorageStatus({ refresh = true } = {}) {
+  if (storageStatusFetchInFlight) return;
+  storageStatusFetchInFlight = true;
+  try {
+    const payload = await requestStorageStatusPayload({ refresh });
+    applyStorageStatusPayload(payload);
+  } catch (_err) {
+  } finally {
+    storageStatusFetchInFlight = false;
+  }
+}
+
+async function postStorageCommand(url, body = null, successLabel = "sd ok", refreshFiles = false) {
+  let resp = null;
+  try {
+    resp = await fetch(url, {
+      method: "POST",
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined
+    });
+  } catch (_err) {
+    setStatus(`Con / ${successLabel} tx failed`);
+    return null;
+  }
+  let payload = null;
+  try {
+    payload = await resp.json();
+  } catch (_err) {
+  }
+  if (!resp.ok || !payload) {
+    setStatus(`Con / ${successLabel} failed`);
+    return null;
+  }
+  lastStorageOp = {
+    at_ms: Date.now(),
+    op: String(payload.op || successLabel || ""),
+    ok: !!payload.ok,
+    tx_ok: !!payload.tx_ok,
+    ack_received: !!payload.ack_received,
+    ack_ok: !!payload.ack_ok,
+    ack_code: Number(payload.ack_code ?? 0),
+    storage_synced: !!payload.storage_synced,
+    storage_revision: Number(payload.storage_revision ?? payload.revision ?? 0)
+  };
+  applyStorageStatusPayload(payload);
+  if (payload.ok) {
+    setStatus(`Con / ${successLabel}`);
+  } else if (!payload.tx_ok) {
+    setStatus(`Con / ${successLabel} tx failed`);
+  } else if (!payload.ack_received) {
+    setStatus(`Con / ${successLabel} ack timeout`);
+  } else {
+    setStatus(`Con / ${successLabel} fail c${payload.ack_code ?? 0}`);
+  }
+  if (refreshFiles) {
+    fetchReplayFiles({ refresh: true });
+  }
+  uiDirty = true;
+  linkDirty = true;
+  return payload;
 }
 
 function selectReplayFile(name = "") {
@@ -817,6 +1002,17 @@ async function deleteSelectedReplayFile() {
   await deleteReplayFile(target, true);
 }
 
+async function exportSelectedReplayCsv() {
+  const target = String(selectedReplayFile || "");
+  if (!target || !replayFilePresent(target)) return;
+  await postStorageCommand("/api/csv", { name: target }, "csv export ok", false);
+}
+
+async function saveRecordPrefix() {
+  const prefix = String(recordPrefixInputEl?.value || "").trim();
+  await postStorageCommand("/api/logprefix", { prefix }, "prefix saved", false);
+}
+
 function renderReplayFilesPanel() {
   if (!replayFilesEl || !replayFileMetaEl) return;
   const files = sortReplayFiles(replayFilesState.files);
@@ -827,6 +1023,7 @@ function renderReplayFilesPanel() {
   let meta = mediaUnavailable
     ? "AIR SD unavailable"
     : (replayFilesState.refresh_inflight ? "Refreshing..." : `${replayFilesState.total_files} files`);
+  meta += ` | sort ${replayFileSortKey}/${replayFileSortDir}`;
   if (replayFilesState.truncated) meta += " | cache clipped";
   if (!mediaUnavailable && !replayFilesState.complete && !replayFilesState.refresh_inflight) meta += " | waiting for AIR";
   replayFileMetaEl.textContent = meta;
@@ -907,6 +1104,26 @@ function renderReplayFilesPanel() {
   replayFilesPanelDirty = false;
 }
 
+function renderStoragePanel() {
+  if (!storageStateTextEl || !storageSpaceTextEl || !storageNextFileTextEl) return;
+  const stateText = storageState.known
+    ? `${storageStateText(storageState.media_state)}${storageState.busy ? " / busy" : ""}`
+    : "Waiting for AIR SD status...";
+  storageStateTextEl.textContent = stateText;
+  storageSpaceTextEl.textContent = storageState.total_bytes
+    ? `${fmtBytes(storageState.free_bytes)} free / ${fmtBytes(storageState.total_bytes)} total`
+    : fmtBytes(storageState.free_bytes);
+  storageNextFileTextEl.textContent = storageState.next_record_name || "-";
+  storageNextFileTextEl.classList.toggle("empty", !storageState.next_record_name);
+
+  const canMount = !storageState.busy && (!storageState.mounted || storageState.media_state !== 2);
+  const canEject = !storageState.busy && storageState.mounted;
+  if (mountStorageBtn) mountStorageBtn.disabled = !canMount;
+  if (ejectStorageBtn) ejectStorageBtn.disabled = !canEject;
+  if (saveRecordPrefixBtn) saveRecordPrefixBtn.disabled = storageState.busy;
+  if (refreshStorageStatusBtn) refreshStorageStatusBtn.disabled = storageStatusFetchInFlight;
+}
+
 function syncReplayTransportUi() {
   if (!replaySelectionSummaryEl || !replayTransportStateEl || !replayTransportHintEl) return;
   const ctrlReady = !!wsCtrl && wsCtrl.readyState === WebSocket.OPEN;
@@ -966,9 +1183,13 @@ function syncReplayTransportUi() {
   syncRecorderControl();
   if (refreshReplayFilesBtn) refreshReplayFilesBtn.disabled = logRefreshDeferred();
   if (deleteReplayFilesBtn) deleteReplayFilesBtn.disabled = logRefreshDeferred() || !selectedFile || !replayFilePresent(selectedFile);
+  if (exportReplayCsvBtn) exportReplayCsvBtn.disabled = logRefreshDeferred() || !selectedFile || !replayFilePresent(selectedFile);
+  if (replaySortKeyEl) replaySortKeyEl.value = replayFileSortKey;
+  if (replaySortDirEl) replaySortDirEl.value = replayFileSortDir;
   if (!editingReplayFile || replayFilesPanelDirty) {
     renderReplayFilesPanel();
   }
+  renderStoragePanel();
 }
 
 function toggleHeaderRecording() {
@@ -1546,7 +1767,7 @@ function updateStatus() {
     return;
   }
   if (linkStatus.has_link_meta && !linkStatus.air_link_fresh) {
-    setStatus("Connected / AIR link waiting");
+    setStatus("Connected / AIR link stale");
     return;
   }
   if (waitingForTelemetry()) {
@@ -1625,6 +1846,7 @@ async function fetchStatus() {
         current_file: data.air_replay_current_file
       });
     }
+    applyStorageStatusPayload(data);
     setRecorderUi(
       linkStatus.has_log_status ? !!linkStatus.air_log_active : !!linkStatus.air_recorder_on,
       !!linkStatus.has_log_status || !!linkStatus.has_link_meta
@@ -2332,7 +2554,7 @@ function renderLinkPanel() {
   const stateSocketTxt = isStateOpen() ? "open" : "closed";
   const stateFpsTxt = isFresh(lastStateAt, STATE_STALE_MS) ? fmt(clientStateFps, 1) : "-";
   const stateAgeTxt = lastStateAt ? String(Date.now() - lastStateAt) : (waitingForTelemetry() ? "waiting" : "-");
-  const airLinkTxt = linkStatus.air_link_fresh ? "up" : "waiting";
+  const airLinkTxt = linkStatus.air_link_fresh ? "up" : "stale";
   const airRadioTxt = linkStatus.air_radio_ready ? "ready" : "starting";
   const airPeerTxt = linkStatus.air_peer_known ? "known" : "discovering";
   const radioModeTxt = linkStatus.radio_state_only ? "state-only stress" : "normal unified";
@@ -2442,6 +2664,8 @@ function renderLogsPanel() {
   const replayEofTxt = linkStatus.has_replay_status ? (linkStatus.air_replay_at_eof ? "yes" : "no") : "-";
   const fileOpTxt = replayFileOpSummary(lastReplayFileOp);
   const fileOpAgeTxt = lastReplayFileOp ? String(Date.now() - lastReplayFileOp.at_ms) : "-";
+  const storageOpTxt = storageOpSummary(lastStorageOp);
+  const storageOpAgeTxt = lastStorageOp ? String(Date.now() - lastStorageOp.at_ms) : "-";
   const uiDqiReasonTxt = topPenaltySummary(dqiDetail);
   logsEl.textContent =
 `notice: ${recorderNoticeTxt}
@@ -2467,8 +2691,20 @@ replay_last_command: ${logCommandText(linkStatus.air_replay_last_command)}
 replay_last_error: ${dash(linkStatus.air_replay_last_error)}
 replay_last_change_ms: ${dash(linkStatus.air_replay_last_change_ms)}
 
+storage_known: ${storageState.known ? "yes" : "no"}
+storage_state: ${storageStateText(storageState.media_state)}
+storage_mounted: ${storageState.mounted ? "yes" : "no"}
+storage_busy: ${storageState.busy ? "yes" : "no"}
+storage_prefix: ${dash(storageState.record_prefix)}
+storage_next_record: ${dash(storageState.next_record_name)}
+storage_free_bytes: ${fmtBytes(storageState.free_bytes)}
+storage_total_bytes: ${fmtBytes(storageState.total_bytes)}
+storage_file_count: ${dash(storageState.file_count)}
+
 last_file_op: ${fileOpTxt}
 last_file_op_age_ms: ${fileOpAgeTxt}
+last_storage_op: ${storageOpTxt}
+last_storage_op_age_ms: ${storageOpAgeTxt}
 ui_dqi: ${dash(dqiSmoothed)}
 ui_dqi_reason: ${uiDqiReasonTxt}`;
   syncReplayTransportUi();
@@ -2534,22 +2770,24 @@ function clearStateErrorRecoveryTimer() {
   stateErrorRecoveryTimer = null;
 }
 
-function scheduleCtrlReconnect(delayMs = RECONNECT_DELAY_MS) {
+function scheduleCtrlReconnect(expectedGeneration, delayMs = RECONNECT_DELAY_MS) {
   if (ctrlReconnectTimer) return;
   if (hasCtrlConnectedOnce) ctrlReconnects++;
   recordClientEvent("ctrl", "reconnect_scheduled");
   ctrlReconnectTimer = setTimeout(() => {
     ctrlReconnectTimer = null;
+    if (expectedGeneration !== ctrlSocketGeneration) return;
     connectCtrl();
   }, delayMs);
 }
 
-function scheduleStateReconnect(delayMs = STATE_RECONNECT_DELAY_MS) {
+function scheduleStateReconnect(expectedGeneration, delayMs = STATE_RECONNECT_DELAY_MS) {
   if (stateReconnectTimer) return;
   if (hasStateConnectedOnce) stateReconnects++;
   recordClientEvent("state", "reconnect_scheduled");
   stateReconnectTimer = setTimeout(() => {
     stateReconnectTimer = null;
+    if (expectedGeneration !== stateSocketGeneration) return;
     connectState();
   }, delayMs);
 }
@@ -2746,11 +2984,13 @@ function connectCtrl() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   clearCtrlReconnectTimer();
   clearCtrlErrorRecoveryTimer();
+  ctrlSocketGeneration++;
+  const generation = ctrlSocketGeneration;
   setStatus("Connecting");
   const socket = new WebSocket(`${proto}://${location.host}/ws_ctrl`);
   wsCtrl = socket;
   const connectTimeout = setTimeout(() => {
-    if (wsCtrl !== socket) return;
+    if (wsCtrl !== socket || generation !== ctrlSocketGeneration) return;
     if (socket.readyState === WebSocket.CONNECTING) {
       recordClientEvent("ctrl", "connect_timeout");
       try {
@@ -2758,12 +2998,12 @@ function connectCtrl() {
       } catch (_err) {
       }
       if (wsCtrl === socket) wsCtrl = null;
-      scheduleCtrlReconnect();
+      scheduleCtrlReconnect(generation);
     }
   }, SOCKET_CONNECT_TIMEOUT_MS);
 
   socket.onopen = () => {
-    if (wsCtrl !== socket) return;
+    if (wsCtrl !== socket || generation !== ctrlSocketGeneration) return;
     clearTimeout(connectTimeout);
     clearCtrlErrorRecoveryTimer();
     recordClientEvent("ctrl", "open");
@@ -2784,39 +3024,39 @@ function connectCtrl() {
   socket.onclose = (ev) => {
     clearTimeout(connectTimeout);
     clearCtrlErrorRecoveryTimer();
-    if (wsCtrl !== socket) return;
+    if (wsCtrl === socket) wsCtrl = null;
+    if (generation !== ctrlSocketGeneration) return;
     recordClientEvent("ctrl", "close", ev.code, ev.reason || "", ev.wasClean ? 1 : 0);
-    wsCtrl = null;
     ctrlCloseCode = dash(ev.code);
     ctrlCloseReason = ev.reason || "-";
     ctrlCloseClean = ev.wasClean ? "1" : "0";
     uiDirty = true;
     renderNow();
-    scheduleCtrlReconnect();
+    scheduleCtrlReconnect(generation);
   };
 
   socket.onerror = () => {
     clearTimeout(connectTimeout);
-    if (wsCtrl !== socket) return;
+    if (wsCtrl !== socket || generation !== ctrlSocketGeneration) return;
     recordClientEvent("ctrl", "error");
     ctrlClientErrors++;
     clearCtrlErrorRecoveryTimer();
     ctrlErrorRecoveryTimer = setTimeout(() => {
-      if (wsCtrl !== socket) return;
+      if (wsCtrl !== socket || generation !== ctrlSocketGeneration) return;
       if (socket.readyState === WebSocket.OPEN) return;
       try {
         socket.close();
       } catch (_err) {
       }
       if (wsCtrl === socket) wsCtrl = null;
-      scheduleCtrlReconnect();
+      scheduleCtrlReconnect(generation);
     }, SOCKET_ERROR_RECOVERY_MS);
     uiDirty = true;
     if (activeTab === "link") renderNow();
   };
 
   socket.onmessage = (ev) => {
-    if (wsCtrl !== socket || typeof ev.data !== "string") return;
+    if (wsCtrl !== socket || generation !== ctrlSocketGeneration || typeof ev.data !== "string") return;
     handleCtrlMessage(ev.data);
   };
 }
@@ -2826,11 +3066,13 @@ function connectState() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   clearStateReconnectTimer();
   clearStateErrorRecoveryTimer();
+  stateSocketGeneration++;
+  const generation = stateSocketGeneration;
   const socket = new WebSocket(`${proto}://${location.host}/ws_state`);
   wsState = socket;
   socket.binaryType = "arraybuffer";
   const connectTimeout = setTimeout(() => {
-    if (wsState !== socket) return;
+    if (wsState !== socket || generation !== stateSocketGeneration) return;
     if (socket.readyState === WebSocket.CONNECTING) {
       recordClientEvent("state", "connect_timeout");
       try {
@@ -2838,12 +3080,12 @@ function connectState() {
       } catch (_err) {
       }
       if (wsState === socket) wsState = null;
-      scheduleStateReconnect();
+      scheduleStateReconnect(generation);
     }
   }, SOCKET_CONNECT_TIMEOUT_MS);
 
   socket.onopen = () => {
-    if (wsState !== socket) return;
+    if (wsState !== socket || generation !== stateSocketGeneration) return;
     clearTimeout(connectTimeout);
     clearStateErrorRecoveryTimer();
     recordClientEvent("state", "open");
@@ -2863,40 +3105,40 @@ function connectState() {
   socket.onclose = (ev) => {
     clearTimeout(connectTimeout);
     clearStateErrorRecoveryTimer();
-    if (wsState !== socket) return;
+    if (wsState === socket) wsState = null;
+    if (generation !== stateSocketGeneration) return;
     recordClientEvent("state", "close", ev.code, ev.reason || "", ev.wasClean ? 1 : 0);
-    wsState = null;
     stateCloseCode = dash(ev.code);
     stateCloseReason = ev.reason || "-";
     stateCloseClean = ev.wasClean ? "1" : "0";
     forceStateRecoveryRender = true;
     uiDirty = true;
     renderNow();
-    scheduleStateReconnect();
+    scheduleStateReconnect(generation);
   };
 
   socket.onerror = () => {
     clearTimeout(connectTimeout);
-    if (wsState !== socket) return;
+    if (wsState !== socket || generation !== stateSocketGeneration) return;
     recordClientEvent("state", "error");
     stateClientErrors++;
     clearStateErrorRecoveryTimer();
     stateErrorRecoveryTimer = setTimeout(() => {
-      if (wsState !== socket) return;
+      if (wsState !== socket || generation !== stateSocketGeneration) return;
       if (socket.readyState === WebSocket.OPEN) return;
       try {
         socket.close();
       } catch (_err) {
       }
       if (wsState === socket) wsState = null;
-      scheduleStateReconnect();
+      scheduleStateReconnect(generation);
     }, SOCKET_ERROR_RECOVERY_MS);
     uiDirty = true;
     if (activeTab === "link") renderNow();
   };
 
   socket.onmessage = (ev) => {
-    if (wsState !== socket || typeof ev.data === "string") return;
+    if (wsState !== socket || generation !== stateSocketGeneration || typeof ev.data === "string") return;
     handleBinaryStateMessage(ev.data);
   };
 }
@@ -2925,19 +3167,6 @@ setInterval(() => {
 }, 1000);
 
 setInterval(() => {
-  if (isCtrlOpen() && isStateOpen() && lastStateAt) {
-    const now = Date.now();
-    const hardStale = (now - lastStateAt) > STATE_HARD_STALE_MS;
-    const canForceReset = (now - lastForcedStateResetAt) > STATE_HARD_STALE_COOLDOWN_MS;
-    if (hardStale && canForceReset) {
-      lastForcedStateResetAt = now;
-      recordClientEvent("state", "stale_reset");
-      try {
-        wsState.close();
-      } catch (_err) {
-      }
-    }
-  }
   const stale = !isFresh(lastStateAt, STATE_STALE_MS);
   if (activeTab === "link" || activeTab === "logs") {
     const now = Date.now();
@@ -2952,8 +3181,15 @@ setInterval(() => {
 }, RENDER_PERIOD_MS);
 
 setInterval(() => {
+  if (document.hidden) return;
   fetchStatus();
 }, LINK_STATUS_PERIOD_MS);
+
+setInterval(() => {
+  if (document.hidden) return;
+  if (activeTab !== "link" && activeTab !== "logs") return;
+  fetchStorageStatus({ refresh: false });
+}, 15000);
 
 document.querySelectorAll(".tabs button").forEach((b) => {
   b.addEventListener("click", () => {
@@ -3113,6 +3349,65 @@ deleteReplayFilesBtn.addEventListener("click", () => {
   void deleteSelectedReplayFile();
 });
 
+if (exportReplayCsvBtn) {
+  exportReplayCsvBtn.addEventListener("click", () => {
+    void exportSelectedReplayCsv();
+  });
+}
+
+if (replaySortKeyEl) {
+  replaySortKeyEl.addEventListener("change", () => {
+    replayFileSortKey = String(replaySortKeyEl.value || "date");
+    replayFilesPanelDirty = true;
+    uiDirty = true;
+    linkDirty = true;
+    renderNow();
+  });
+}
+
+if (replaySortDirEl) {
+  replaySortDirEl.addEventListener("change", () => {
+    replayFileSortDir = String(replaySortDirEl.value || "desc");
+    replayFilesPanelDirty = true;
+    uiDirty = true;
+    linkDirty = true;
+    renderNow();
+  });
+}
+
+if (refreshStorageStatusBtn) {
+  refreshStorageStatusBtn.addEventListener("click", () => {
+    void fetchStorageStatus({ refresh: true });
+  });
+}
+
+if (mountStorageBtn) {
+  mountStorageBtn.addEventListener("click", () => {
+    void postStorageCommand("/api/sd/mount", null, "sd mount ok", true);
+  });
+}
+
+if (ejectStorageBtn) {
+  ejectStorageBtn.addEventListener("click", () => {
+    void postStorageCommand("/api/sd/eject", null, "sd eject ok", true);
+  });
+}
+
+if (saveRecordPrefixBtn) {
+  saveRecordPrefixBtn.addEventListener("click", () => {
+    void saveRecordPrefix();
+  });
+}
+
+if (recordPrefixInputEl) {
+  recordPrefixInputEl.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      void saveRecordPrefix();
+    }
+  });
+}
+
 document.getElementById("resetAirNetwork").addEventListener("click", async () => {
   holdTelemetryFresh(10000);
   try {
@@ -3184,10 +3479,13 @@ setFusionUiValues(
   FUSION_DEFAULTS.magneticRejection,
   FUSION_DEFAULTS.recoveryTriggerPeriod
 );
+if (recordPrefixInputEl) {
+  recordPrefixInputEl.value = storageState.record_prefix;
+}
 updateUiScale();
 connectCtrl();
 connectState();
 setRecorderUi(false, false);
 fetchStatus();
-fetchReplayFiles({ refresh: true });
+fetchStorageStatus({ refresh: false });
 renderStale();

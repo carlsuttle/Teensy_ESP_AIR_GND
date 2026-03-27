@@ -1,21 +1,31 @@
 #include "replay_bridge.h"
 
-#include <SD.h>
-
+#include "sd_api.h"
 #include "sd_backend.h"
-#include "uart_telem.h"
+#include "teensy_link.h"
 
 namespace replay_bridge {
 namespace {
+using File = sd_api::File;
 
 constexpr char kLogDir[] = "/logs";
-constexpr uint32_t kReplayMinPeriodUs = 2500U;
-constexpr uint32_t kReplayMaxPeriodUs = 100000U;
+constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
+constexpr uint16_t kLogVersion = 2U;
+// Replay should feed the Teensy in batched transactions at the documented
+// 100 Hz cadence. When source metadata has usable timing, group records into
+// 10 ms source-time windows. Otherwise derive a batch count from the logged
+// source rate, falling back to the fastest replay profile we expect to use.
+constexpr uint32_t kReplayBatchRateHz = 100U;
+constexpr uint32_t kReplayBatchPeriodUs = 1000000UL / kReplayBatchRateHz;
+constexpr uint32_t kReplayFallbackFastestHz = 3200U;
+constexpr uint16_t kReplayFallbackRecordsPerBatch =
+    (uint16_t)(kReplayFallbackFastestHz / kReplayBatchRateHz);
 constexpr uint32_t kReplayErrorOpenFailed = 1U;
 constexpr uint32_t kReplayErrorNoLogFound = 2U;
 constexpr uint32_t kReplayErrorShortRead = 3U;
 constexpr uint32_t kReplayErrorUnsupportedRecord = 4U;
 constexpr uint32_t kReplayErrorSendFailed = 5U;
+constexpr uint8_t kReplayAverageMax = 32U;
 
 #pragma pack(push, 1)
 struct BinaryLogRecordV2 {
@@ -32,24 +42,70 @@ struct BinaryLogRecordV2 {
 
 static_assert(sizeof(BinaryLogRecordV2) == 180U, "BinaryLogRecordV2 must match logger record size");
 
-File g_file;
+sd_api::File g_file;
 Status g_status = {};
 bool g_status_dirty = false;
 bool g_have_pending = false;
 BinaryLogRecordV2 g_pending = {};
+bool g_prefer_replay_input = false;
+uint8_t g_average_factor = 1U;
 uint32_t g_next_send_us = 0U;
 uint32_t g_next_session_id = 1U;
 uint32_t g_last_progress_report_ms = 0U;
 uint32_t g_last_record_t_us = 0U;
+uint16_t g_metadata_source_rate_hz = 0U;
 struct OutputSourceStamp {
   uint32_t seq = 0U;
   uint32_t t_us = 0U;
 };
-constexpr uint8_t kOutputSourceDepth = 8U;
+constexpr uint16_t kOutputSourceDepth = 512U;
 OutputSourceStamp g_output_source_queue[kOutputSourceDepth] = {};
-uint8_t g_output_source_head = 0U;
-uint8_t g_output_source_tail = 0U;
-uint8_t g_output_source_count = 0U;
+uint16_t g_output_source_head = 0U;
+uint16_t g_output_source_tail = 0U;
+uint16_t g_output_source_count = 0U;
+portMUX_TYPE g_output_source_mux = portMUX_INITIALIZER_UNLOCKED;
+
+struct StateWindow {
+  uint8_t count = 0U;
+  uint32_t seq = 0U;
+  uint32_t first_t_us = 0U;
+  uint32_t t_us = 0U;
+  telem::TelemetryFullStateV1 latest = {};
+  float accel_sum[3] = {};
+  float gyro_sum[3] = {};
+  float mag_sum[3] = {};
+};
+
+struct ReplayInputWindow {
+  uint8_t count = 0U;
+  uint32_t seq = 0U;
+  uint32_t first_t_us = 0U;
+  uint32_t t_us = 0U;
+  telem::ReplayInputRecord160 latest = {};
+  int64_t accel_sum[3] = {};
+  int64_t gyro_sum[3] = {};
+  int64_t mag_sum[3] = {};
+};
+
+uint8_t clampAverageFactor(uint8_t factor) {
+  if (factor == 0U) return 1U;
+  if (factor > kReplayAverageMax) return kReplayAverageMax;
+  return factor;
+}
+
+uint16_t replayBatchRecordLimit() {
+  const uint8_t average_factor = clampAverageFactor(g_average_factor);
+  uint32_t source_rate_hz = (g_metadata_source_rate_hz != 0U)
+                                ? (uint32_t)g_metadata_source_rate_hz
+                                : kReplayFallbackFastestHz;
+  uint32_t output_rate_hz = source_rate_hz / average_factor;
+  if (output_rate_hz == 0U) output_rate_hz = 1U;
+  uint32_t records_per_batch =
+      (output_rate_hz + (kReplayBatchRateHz / 2U)) / kReplayBatchRateHz;
+  if (records_per_batch == 0U) records_per_batch = 1U;
+  if (records_per_batch > 51U) records_per_batch = 51U;
+  return (uint16_t)records_per_batch;
+}
 
 String displayFileName(const String& path) {
   if (path.startsWith("/logs/")) return path.substring(6);
@@ -77,9 +133,13 @@ void resetRuntime(bool preserve_session = true) {
   g_next_send_us = 0U;
   g_last_progress_report_ms = 0U;
   g_last_record_t_us = 0U;
+  g_metadata_source_rate_hz = 0U;
+  portENTER_CRITICAL(&g_output_source_mux);
   g_output_source_head = 0U;
   g_output_source_tail = 0U;
   g_output_source_count = 0U;
+  portEXIT_CRITICAL(&g_output_source_mux);
+  g_prefer_replay_input = false;
   const uint32_t session_id = preserve_session ? g_status.session_id : 0U;
   g_status = {};
   g_status.session_id = session_id;
@@ -110,7 +170,7 @@ bool openLatestLog(String& out_name) {
     if (!sd_backend::begin(&backend)) return false;
   }
 
-  File dir = SD.open(kLogDir);
+  File dir = sd_api::open(kLogDir);
   if (!dir || !dir.isDirectory()) return false;
 
   String best_name;
@@ -152,7 +212,7 @@ bool openLogByName(const String& requested_name, String& out_name) {
 
   String full_name = requested_name;
   if (!full_name.startsWith("/")) full_name = String(kLogDir) + "/" + full_name;
-  File file = SD.open(full_name, FILE_READ);
+  File file = sd_api::open(full_name);
   if (!file) return false;
 
   if (g_file) g_file.close();
@@ -184,22 +244,121 @@ bool loadNextRecord() {
   return true;
 }
 
-bool fillReplayInput(const BinaryLogRecordV2& record, telem::ReplayInputRecord160& replay) {
-  telem::TelemetryFullStateV1 state = {};
+bool preferReplayInputSource() {
+  if (!g_file) return false;
+  const uint32_t saved_pos = (uint32_t)g_file.position();
+  if (!g_file.seek(0U)) return false;
+  BinaryLogRecordV2 record = {};
+  uint32_t state_count = 0U;
+  uint32_t replay_input_count = 0U;
+  while (g_file.read((uint8_t*)&record, sizeof(record)) == sizeof(record)) {
+    if (record.magic != kLogMagic || record.version != kLogVersion || record.record_size != sizeof(record)) {
+      break;
+    }
+    switch ((telem::LogRecordKind)record.record_kind) {
+      case telem::LogRecordKind::State160:
+        state_count++;
+        break;
+      case telem::LogRecordKind::ReplayInput160:
+        replay_input_count++;
+        break;
+      default:
+        break;
+    }
+  }
+  g_file.seek(saved_pos);
+  if (replay_input_count == 0U) return false;
+  if (state_count == 0U) return true;
+  return replay_input_count > state_count;
+}
+
+uint16_t findReplaySourceRateHz() {
+  if (!g_file) return 0U;
+  const uint32_t saved_pos = (uint32_t)g_file.position();
+  if (!g_file.seek(0U)) return 0U;
+  BinaryLogRecordV2 record = {};
+  uint16_t found_hz = 0U;
+  while (g_file.read((uint8_t*)&record, sizeof(record)) == sizeof(record)) {
+    if (record.magic != kLogMagic || record.version != kLogVersion || record.record_size != sizeof(record)) {
+      break;
+    }
+    if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::ReplayControl160) continue;
+    telem::ReplayControlRecord160 replay = {};
+    memcpy(&replay, record.payload, sizeof(replay));
+    if (replay.payload.command_id != telem::CMD_SET_CAPTURE_SETTINGS) continue;
+    if (replay.payload.payload_len < sizeof(telem::CmdSetCaptureSettingsV1)) continue;
+    telem::CmdSetCaptureSettingsV1 cmd = {};
+    memcpy(&cmd, replay.payload.payload, sizeof(cmd));
+    if (cmd.source_rate_hz != 0U) found_hz = cmd.source_rate_hz;
+  }
+  g_file.seek(saved_pos);
+  return found_hz;
+}
+
+bool decodeStateRecord(const BinaryLogRecordV2& record, telem::TelemetryFullStateV1& state) {
+  if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::State160) return false;
   memcpy(&state, record.payload, sizeof(state));
+  return true;
+}
+
+bool decodeReplayInputRecord(const BinaryLogRecordV2& record, telem::ReplayInputRecord160& replay) {
+  if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::ReplayInput160) return false;
+  memcpy(&replay, record.payload, sizeof(replay));
+  return true;
+}
+
+void beginStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
+                      const telem::TelemetryFullStateV1& state) {
+  window = {};
+  window.count = 1U;
+  window.seq = record.seq;
+  window.first_t_us = record.t_us;
+  window.t_us = record.t_us;
+  window.latest = state;
+  window.accel_sum[0] = state.accel_x_mps2;
+  window.accel_sum[1] = state.accel_y_mps2;
+  window.accel_sum[2] = state.accel_z_mps2;
+  window.gyro_sum[0] = state.gyro_x_dps;
+  window.gyro_sum[1] = state.gyro_y_dps;
+  window.gyro_sum[2] = state.gyro_z_dps;
+  window.mag_sum[0] = state.mag_x_uT;
+  window.mag_sum[1] = state.mag_y_uT;
+  window.mag_sum[2] = state.mag_z_uT;
+}
+
+void extendStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
+                       const telem::TelemetryFullStateV1& state) {
+  window.count++;
+  window.seq = record.seq;
+  window.t_us = record.t_us;
+  window.latest = state;
+  window.accel_sum[0] += state.accel_x_mps2;
+  window.accel_sum[1] += state.accel_y_mps2;
+  window.accel_sum[2] += state.accel_z_mps2;
+  window.gyro_sum[0] += state.gyro_x_dps;
+  window.gyro_sum[1] += state.gyro_y_dps;
+  window.gyro_sum[2] += state.gyro_z_dps;
+  window.mag_sum[0] += state.mag_x_uT;
+  window.mag_sum[1] += state.mag_y_uT;
+  window.mag_sum[2] += state.mag_z_uT;
+}
+
+bool fillReplayInputFromState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us,
+                              telem::ReplayInputRecord160& replay) {
+  memset(&replay, 0, sizeof(replay));
 
   replay.hdr.magic = telem::kReplayMagic;
   replay.hdr.version = telem::kReplayVersion;
   replay.hdr.kind = (uint8_t)telem::ReplayRecordKind::Input;
   replay.hdr.flags = 0U;
-  replay.hdr.seq = record.seq;
-  replay.hdr.t_us = record.t_us;
+  replay.hdr.seq = seq;
+  replay.hdr.t_us = t_us;
 
   replay.payload.present_mask = state.raw_present_mask;
   replay.payload.source_flags = state.flags;
-  replay.payload.imu_seq = record.seq;
-  replay.payload.gps_seq = record.seq;
-  replay.payload.baro_seq = record.seq;
+  replay.payload.imu_seq = seq;
+  replay.payload.gps_seq = seq;
+  replay.payload.baro_seq = seq;
   replay.payload.accel_milli_mps2[0] = (int32_t)lroundf(state.accel_x_mps2 * 1000.0f);
   replay.payload.accel_milli_mps2[1] = (int32_t)lroundf(state.accel_y_mps2 * 1000.0f);
   replay.payload.accel_milli_mps2[2] = (int32_t)lroundf(state.accel_z_mps2 * 1000.0f);
@@ -230,57 +389,202 @@ bool fillReplayInput(const BinaryLogRecordV2& record, telem::ReplayInputRecord16
   return true;
 }
 
+bool fillReplayInputFromWindow(const StateWindow& window, telem::ReplayInputRecord160& replay) {
+  if (window.count == 0U) return false;
+  telem::TelemetryFullStateV1 state = window.latest;
+  const float inv_count = 1.0f / (float)window.count;
+  state.accel_x_mps2 = window.accel_sum[0] * inv_count;
+  state.accel_y_mps2 = window.accel_sum[1] * inv_count;
+  state.accel_z_mps2 = window.accel_sum[2] * inv_count;
+  state.gyro_x_dps = window.gyro_sum[0] * inv_count;
+  state.gyro_y_dps = window.gyro_sum[1] * inv_count;
+  state.gyro_z_dps = window.gyro_sum[2] * inv_count;
+  state.mag_x_uT = window.mag_sum[0] * inv_count;
+  state.mag_y_uT = window.mag_sum[1] * inv_count;
+  state.mag_z_uT = window.mag_sum[2] * inv_count;
+  uint32_t replay_t_us = window.t_us;
+  if (window.t_us >= window.first_t_us) {
+    replay_t_us = window.first_t_us + ((window.t_us - window.first_t_us) / 2U);
+  }
+  return fillReplayInputFromState(state, window.seq, replay_t_us, replay);
+}
+
+void beginReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& record,
+                            const telem::ReplayInputRecord160& replay) {
+  window = {};
+  window.count = 1U;
+  window.seq = record.seq;
+  window.first_t_us = record.t_us;
+  window.t_us = record.t_us;
+  window.latest = replay;
+  for (uint8_t i = 0U; i < 3U; ++i) {
+    window.accel_sum[i] = replay.payload.accel_milli_mps2[i];
+    window.gyro_sum[i] = replay.payload.gyro_milli_dps[i];
+    window.mag_sum[i] = replay.payload.mag_milli_uT[i];
+  }
+}
+
+void extendReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& record,
+                             const telem::ReplayInputRecord160& replay) {
+  window.count++;
+  window.seq = record.seq;
+  window.t_us = record.t_us;
+  window.latest = replay;
+  for (uint8_t i = 0U; i < 3U; ++i) {
+    window.accel_sum[i] += replay.payload.accel_milli_mps2[i];
+    window.gyro_sum[i] += replay.payload.gyro_milli_dps[i];
+    window.mag_sum[i] += replay.payload.mag_milli_uT[i];
+  }
+}
+
+bool fillReplayInputFromWindow(const ReplayInputWindow& window, telem::ReplayInputRecord160& replay) {
+  if (window.count == 0U) return false;
+  replay = window.latest;
+  replay.hdr.seq = window.seq;
+  replay.hdr.t_us = window.t_us;
+  if (window.t_us >= window.first_t_us) {
+    replay.hdr.t_us = window.first_t_us + ((window.t_us - window.first_t_us) / 2U);
+  }
+  for (uint8_t i = 0U; i < 3U; ++i) {
+    replay.payload.accel_milli_mps2[i] = (int32_t)(window.accel_sum[i] / (int64_t)window.count);
+    replay.payload.gyro_milli_dps[i] = (int32_t)(window.gyro_sum[i] / (int64_t)window.count);
+    replay.payload.mag_milli_uT[i] = (int32_t)(window.mag_sum[i] / (int64_t)window.count);
+  }
+  replay.payload.imu_seq = window.seq;
+  return true;
+}
+
+void finishSentRecord(uint32_t t_us) {
+  g_have_pending = false;
+  g_status.records_sent++;
+  g_last_record_t_us = t_us;
+  const uint32_t now_ms = millis();
+  if (g_last_progress_report_ms == 0U || (uint32_t)(now_ms - g_last_progress_report_ms) >= 250U) {
+    g_last_progress_report_ms = now_ms;
+    markStatusChanged();
+  }
+}
+
 bool sendPendingRecord() {
   if (!g_have_pending) return true;
 
+  while (g_have_pending && g_prefer_replay_input &&
+         (telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State160) {
+    g_have_pending = false;
+    g_status.records_sent++;
+    if (!loadNextRecord()) return true;
+  }
+
   switch ((telem::LogRecordKind)g_pending.record_kind) {
-    case telem::LogRecordKind::State160: {
+    case telem::LogRecordKind::ReplayInput160: {
+      ReplayInputWindow window = {};
       telem::ReplayInputRecord160 replay = {};
-      if (!fillReplayInput(g_pending, replay)) {
+      if (!decodeReplayInputRecord(g_pending, replay)) {
         g_status.last_error = kReplayErrorUnsupportedRecord;
         return false;
       }
-      if (!uart_telem::sendReplayInputRecord(replay)) {
+      beginReplayInputWindow(window, g_pending, replay);
+      g_have_pending = false;
+
+      const uint8_t average_factor = clampAverageFactor(g_average_factor);
+      while (window.count < average_factor) {
+        if (!loadNextRecord()) break;
+        if ((telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State160 && g_prefer_replay_input) {
+          g_have_pending = false;
+          g_status.records_sent++;
+          continue;
+        }
+        if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::ReplayInput160) {
+          break;
+        }
+        if (!decodeReplayInputRecord(g_pending, replay)) {
+          g_status.last_error = kReplayErrorUnsupportedRecord;
+          return false;
+        }
+        extendReplayInputWindow(window, g_pending, replay);
+        g_have_pending = false;
+      }
+
+      if (!fillReplayInputFromWindow(window, replay)) {
+        g_status.last_error = kReplayErrorUnsupportedRecord;
+        return false;
+      }
+      if (!teensy_link::sendReplayInputRecord(replay)) {
         g_status.last_error = kReplayErrorSendFailed;
         return false;
       }
+      portENTER_CRITICAL(&g_output_source_mux);
       if (g_output_source_count >= kOutputSourceDepth) {
-        g_output_source_tail = (uint8_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
+        g_output_source_tail = (uint16_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
         g_output_source_count--;
       }
-      g_output_source_queue[g_output_source_head].seq = g_pending.seq;
-      g_output_source_queue[g_output_source_head].t_us = g_pending.t_us;
-      g_output_source_head = (uint8_t)((g_output_source_head + 1U) % kOutputSourceDepth);
+      g_output_source_queue[g_output_source_head].seq = window.seq;
+      g_output_source_queue[g_output_source_head].t_us = window.t_us;
+      g_output_source_head = (uint16_t)((g_output_source_head + 1U) % kOutputSourceDepth);
       g_output_source_count++;
+      portEXIT_CRITICAL(&g_output_source_mux);
+      finishSentRecord(window.t_us);
+      break;
+    }
+    case telem::LogRecordKind::State160: {
+      StateWindow window = {};
+      telem::TelemetryFullStateV1 state = {};
+      if (!decodeStateRecord(g_pending, state)) {
+        g_status.last_error = kReplayErrorUnsupportedRecord;
+        return false;
+      }
+      beginStateWindow(window, g_pending, state);
+      g_have_pending = false;
+
+      const uint8_t average_factor = clampAverageFactor(g_average_factor);
+      while (window.count < average_factor) {
+        if (!loadNextRecord()) break;
+        if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::State160) {
+          break;
+        }
+        if (!decodeStateRecord(g_pending, state)) {
+          g_status.last_error = kReplayErrorUnsupportedRecord;
+          return false;
+        }
+        extendStateWindow(window, g_pending, state);
+        g_have_pending = false;
+      }
+
+      telem::ReplayInputRecord160 replay = {};
+      if (!fillReplayInputFromWindow(window, replay)) {
+        g_status.last_error = kReplayErrorUnsupportedRecord;
+        return false;
+      }
+      if (!teensy_link::sendReplayInputRecord(replay)) {
+        g_status.last_error = kReplayErrorSendFailed;
+        return false;
+      }
+      portENTER_CRITICAL(&g_output_source_mux);
+      if (g_output_source_count >= kOutputSourceDepth) {
+        g_output_source_tail = (uint16_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
+        g_output_source_count--;
+      }
+      g_output_source_queue[g_output_source_head].seq = window.seq;
+      g_output_source_queue[g_output_source_head].t_us = window.t_us;
+      g_output_source_head = (uint16_t)((g_output_source_head + 1U) % kOutputSourceDepth);
+      g_output_source_count++;
+      portEXIT_CRITICAL(&g_output_source_mux);
+      finishSentRecord(window.t_us);
       break;
     }
     case telem::LogRecordKind::ReplayControl160: {
       telem::ReplayControlRecord160 replay = {};
       memcpy(&replay, g_pending.payload, sizeof(replay));
-      if (!uart_telem::sendReplayControlRecord(replay)) {
+      if (!teensy_link::sendReplayControlRecord(replay)) {
         g_status.last_error = kReplayErrorSendFailed;
         return false;
       }
+      finishSentRecord(g_pending.t_us);
       break;
     }
     default:
       g_status.last_error = kReplayErrorUnsupportedRecord;
       return false;
-  }
-
-  g_have_pending = false;
-  g_status.records_sent++;
-  uint32_t next_period_us = kReplayMinPeriodUs;
-  if (g_last_record_t_us != 0U && g_pending.t_us > g_last_record_t_us) {
-    const uint32_t delta_us = g_pending.t_us - g_last_record_t_us;
-    next_period_us = constrain(delta_us, kReplayMinPeriodUs, kReplayMaxPeriodUs);
-  }
-  g_last_record_t_us = g_pending.t_us;
-  g_next_send_us = micros() + next_period_us;
-  const uint32_t now_ms = millis();
-  if (g_last_progress_report_ms == 0U || (uint32_t)(now_ms - g_last_progress_report_ms) >= 250U) {
-    g_last_progress_report_ms = now_ms;
-    markStatusChanged();
   }
   return true;
 }
@@ -291,21 +595,43 @@ void begin() {
   resetRuntime(false);
 }
 
+void setAverageFactor(uint8_t factor) {
+  g_average_factor = clampAverageFactor(factor);
+}
+
+uint8_t averageFactor() {
+  return clampAverageFactor(g_average_factor);
+}
+
 void poll() {
   if ((g_status.flags & telem::kReplayStatusFlagActive) == 0U) return;
 
   const uint32_t now_us = micros();
-  uint8_t burst_guard = 0U;
-  while ((g_status.flags & telem::kReplayStatusFlagActive) != 0U && burst_guard < 8U) {
-    if (g_next_send_us != 0U && (int32_t)(now_us - g_next_send_us) < 0) break;
+  if (g_next_send_us != 0U && (int32_t)(now_us - g_next_send_us) < 0) return;
+
+  if (!g_have_pending && !loadNextRecord()) return;
+
+  const uint16_t batch_limit = replayBatchRecordLimit();
+  const bool use_timestamp_window = (g_have_pending && g_pending.t_us != 0U);
+  const uint32_t batch_start_t_us = use_timestamp_window ? g_pending.t_us : 0U;
+  const uint32_t batch_end_t_us = batch_start_t_us + kReplayBatchPeriodUs;
+
+  uint16_t sent_in_batch = 0U;
+  while ((g_status.flags & telem::kReplayStatusFlagActive) != 0U && sent_in_batch < batch_limit) {
     if (!g_have_pending && !loadNextRecord()) break;
+    if (use_timestamp_window && sent_in_batch != 0U && g_pending.t_us != 0U &&
+        (int32_t)(g_pending.t_us - batch_end_t_us) >= 0) {
+      break;
+    }
     if (!sendPendingRecord()) {
       g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
       markStatusChanged();
       break;
     }
-    burst_guard++;
+    sent_in_batch++;
   }
+
+  g_next_send_us = now_us + kReplayBatchPeriodUs;
 }
 
 bool startLatest() {
@@ -324,6 +650,8 @@ bool startLatest() {
   g_status.last_command = telem::CMD_REPLAY_START;
   g_status.flags = telem::kReplayStatusFlagActive | telem::kReplayStatusFlagFileOpen;
   setCurrentFileName(file_name);
+  g_prefer_replay_input = preferReplayInputSource();
+  g_metadata_source_rate_hz = findReplaySourceRateHz();
   g_have_pending = false;
   g_next_send_us = micros();
   markStatusChanged();
@@ -346,6 +674,8 @@ bool startFile(const String& file_name) {
   g_status.last_command = telem::CMD_REPLAY_START;
   g_status.flags = telem::kReplayStatusFlagActive | telem::kReplayStatusFlagFileOpen;
   setCurrentFileName(opened_name);
+  g_prefer_replay_input = preferReplayInputSource();
+  g_metadata_source_rate_hz = findReplaySourceRateHz();
   g_have_pending = false;
   g_next_send_us = micros();
   markStatusChanged();
@@ -433,12 +763,17 @@ String currentFileName() {
 }
 
 bool takeOutputSourceStamp(uint32_t& seq, uint32_t& t_us) {
-  if (g_output_source_count == 0U) return false;
-  seq = g_output_source_queue[g_output_source_tail].seq;
-  t_us = g_output_source_queue[g_output_source_tail].t_us;
-  g_output_source_tail = (uint8_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
-  g_output_source_count--;
-  return true;
+  bool ok = false;
+  portENTER_CRITICAL(&g_output_source_mux);
+  if (g_output_source_count != 0U) {
+    seq = g_output_source_queue[g_output_source_tail].seq;
+    t_us = g_output_source_queue[g_output_source_tail].t_us;
+    g_output_source_tail = (uint16_t)((g_output_source_tail + 1U) % kOutputSourceDepth);
+    g_output_source_count--;
+    ok = true;
+  }
+  portEXIT_CRITICAL(&g_output_source_mux);
+  return ok;
 }
 
 }  // namespace replay_bridge

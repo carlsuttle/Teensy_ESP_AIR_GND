@@ -2,6 +2,8 @@
 
 #include <SPI.h>
 
+#include "sd_api.h"
+
 namespace sd_backend {
 namespace {
 
@@ -13,8 +15,6 @@ constexpr uint8_t kSdMosiPin = 9;
 constexpr uint32_t kInitFrequenciesHz[] = {
     26000000UL,
     20000000UL,
-    10000000UL,
-    4000000UL,
 };
 
 bool g_mounted = false;
@@ -22,7 +22,7 @@ uint32_t g_init_hz = 0U;
 SPIClass* g_sd_spi = nullptr;
 
 void markUnmounted() {
-  SD.end();
+  sd_api::end();
   if (g_sd_spi) g_sd_spi->end();
   g_mounted = false;
   g_init_hz = 0U;
@@ -39,12 +39,12 @@ void prepareSpiPinsForSdInit() {
 
 bool mountedMediaHealthy() {
   if (!g_mounted) return false;
-  const uint8_t card_type = SD.cardType();
+  const uint8_t card_type = sd_api::cardType();
   if (card_type == CARD_NONE) {
     markUnmounted();
     return false;
   }
-  File root = SD.open("/");
+  sd_api::File root = sd_api::open("/");
   const bool ok = root && root.isDirectory();
   if (root) root.close();
   if (!ok) {
@@ -70,10 +70,10 @@ bool populateStatus(Status& status) {
     status.begin_ok = false;
     return false;
   }
-  status.card_type = SD.cardType();
-  status.card_size_bytes = SD.cardSize();
-  status.total_bytes = SD.totalBytes();
-  status.used_bytes = SD.usedBytes();
+  status.card_type = sd_api::cardType();
+  status.card_size_bytes = sd_api::cardSize();
+  status.total_bytes = sd_api::totalBytes();
+  status.used_bytes = sd_api::usedBytes();
   return true;
 }
 
@@ -89,7 +89,7 @@ bool beginAtFrequency(uint32_t hz) {
   g_sd_spi->begin(kSdSckPin, kSdMisoPin, kSdMosiPin, kSdCsPin);
   digitalWrite(kSdCsPin, HIGH);
   delay(5);
-  if (!SD.begin(kSdCsPin, *g_sd_spi, hz)) {
+  if (!sd_api::begin(kSdCsPin, *g_sd_spi, hz)) {
     g_sd_spi->end();
     g_mounted = false;
     g_init_hz = 0U;
@@ -146,16 +146,32 @@ bool refreshStatus(Status& status) {
   return populateStatus(status);
 }
 
+bool mount(Status* status) {
+  return begin(status);
+}
+
 bool mounted() { return g_mounted; }
 
 bool mediaPresent() {
   return mountedMediaHealthy();
 }
 
+MediaState mediaState() {
+  if (g_mounted) {
+    return mountedMediaHealthy() ? MediaState::ready : MediaState::error;
+  }
+  return MediaState::unmounted;
+}
+
 uint32_t mountedFrequencyHz() { return g_init_hz; }
 
 void end() {
   markUnmounted();
+}
+
+bool eject() {
+  markUnmounted();
+  return true;
 }
 
 }  // namespace sd_backend

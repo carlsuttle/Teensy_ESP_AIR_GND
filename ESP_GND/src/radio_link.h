@@ -12,6 +12,8 @@ struct Stats {
   uint32_t rx_bytes = 0;
   uint32_t frames_ok = 0;
   uint32_t state_packets = 0;
+  uint32_t full_state_packets = 0;
+  uint32_t unified_state_packets = 0;
   uint32_t state_seq_gap = 0;
   uint32_t state_seq_rewind = 0;
   uint32_t crc_err = 0;
@@ -20,6 +22,9 @@ struct Stats {
   uint32_t unknown_msg = 0;
   uint32_t drop = 0;
   uint32_t last_rx_ms = 0;
+  uint32_t last_state_apply_ms = 0;
+  uint32_t last_state_seq = 0;
+  uint32_t last_state_source_t_us = 0;
 };
 
 struct Snapshot {
@@ -61,6 +66,23 @@ struct RemoteFilesStatus {
   bool truncated = false;
 };
 
+struct RemoteStorageStatus {
+  bool known = false;
+  uint32_t revision = 0;
+  uint32_t last_update_ms = 0;
+  uint8_t media_state = 0;
+  bool mounted = false;
+  bool backend_ready = false;
+  bool media_present = false;
+  bool busy = false;
+  uint32_t init_hz = 0;
+  uint32_t free_bytes = telem::kLogBytesUnknown;
+  uint32_t total_bytes = 0;
+  uint16_t file_count = 0;
+  char record_prefix[telem::kRecordPrefixBytes] = {};
+  char next_record_name[telem::kLogFileNameBytes] = {};
+};
+
 void begin(const AppConfig& cfg);
 void reconfigure(const AppConfig& cfg);
 void restart(const AppConfig& cfg);
@@ -84,8 +106,15 @@ bool sendGetReplayStatus();
 bool sendGetLogFileList();
 bool sendDeleteLogFile(const String& name);
 bool sendRenameLogFile(const String& src_name, const String& dst_name);
+bool sendGetStorageStatus();
+bool sendMountMedia();
+bool sendEjectMedia();
+bool sendExportLogCsv(const String& name);
+bool sendSetRecordPrefix(const String& prefix);
 RemoteFilesStatus remoteFilesStatus();
 String remoteFilesJson(bool refresh_requested);
+RemoteStorageStatus remoteStorageStatus();
+String remoteStorageJson(bool refresh_requested);
 bool hasLearnedSender();
 String targetSenderMac();
 String lastSenderMac();

@@ -1,11 +1,11 @@
 #include "sd_card_test.h"
 
-#include <SD.h>
-
+#include "sd_api.h"
 #include "sd_backend.h"
 
 namespace sd_card_test {
 namespace {
+using File = sd_api::File;
 
 constexpr char kProbePath[] = "/sdprobe.bin";
 
@@ -62,7 +62,7 @@ bool writeBinaryProbe(Status& status) {
       1UL,
   };
 
-  File file = SD.open(kProbePath, FILE_WRITE);
+  File file = sd_api::open(kProbePath, sd_api::OpenMode::write);
   if (!file) return false;
 
   const size_t expected = sizeof(record);
@@ -71,13 +71,13 @@ bool writeBinaryProbe(Status& status) {
   file.close();
 
   if (written != expected) {
-    SD.remove(kProbePath);
+    sd_api::remove(kProbePath);
     return false;
   }
 
   status.write_bytes = (uint32_t)written;
   status.write_ok = true;
-  (void)SD.remove(kProbePath);
+  (void)sd_api::remove(kProbePath);
   return true;
 }
 

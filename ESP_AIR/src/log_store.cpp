@@ -1,27 +1,32 @@
 #include "log_store.h"
 
 #include <Arduino.h>
-#include <SD.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
 
+#include "sd_api.h"
 #include "sd_backend.h"
 
 namespace log_store {
+using File = sd_api::File;
 namespace {
 
 constexpr char LOG_DIR[] = "/logs";
 constexpr char kBinaryExt[] = ".tlog";
+constexpr char kSessionMetaPath[] = "/logs/session.meta";
 constexpr size_t kBlockBytes = 10000U;
 constexpr size_t kBlockCount = 4U;
+constexpr size_t kBenchRingDepth = 512U;
 constexpr uint32_t kMaxReportableFreeBytes = telem::kLogBytesUnknown - 1U;
 constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
 constexpr uint16_t kLogVersion = 2U;
 constexpr uint8_t kWriteRetryCount = 8U;
 constexpr uint32_t kWriteRetryDelayMs = 2U;
+constexpr uint32_t kBenchFlushIntervalMs = 250U;
 constexpr uint32_t kMountedStatusRefreshMs = 1000U;
 constexpr uint32_t kMissingMediaProbeIntervalMs = 5000U;
 constexpr uint32_t kIdleMediaCheckMs = 1000U;
@@ -58,9 +63,48 @@ struct LockGuard {
   }
 };
 
+#pragma pack(push, 1)
+struct SessionMetaRecord {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint32_t next_session_id;
+  uint32_t last_closed_session_id;
+  char last_closed_name[96];
+};
+#pragma pack(pop)
+
+constexpr uint32_t kSessionMetaMagic = 0x4D455441UL;  // "META"
+constexpr uint16_t kSessionMetaVersion = 1U;
+
+bool parseLogNameParts(const String& path, uint32_t& session_id, uint32_t& stamp) {
+  session_id = 0U;
+  stamp = 0U;
+
+  String name = path;
+  if (name.startsWith("/logs/")) name = name.substring(6);
+  const int ext_pos = (int)name.length() - (int)strlen(kBinaryExt);
+  if (!name.endsWith(kBinaryExt)) return false;
+  const int last_sep = name.lastIndexOf('_', ext_pos - 1);
+  if (last_sep <= 0) return false;
+  const int second_last_sep = name.lastIndexOf('_', last_sep - 1);
+  if (second_last_sep <= 0) return false;
+
+  const String prefix_part = name.substring(0, second_last_sep);
+  const String session_part = name.substring(second_last_sep + 1, last_sep);
+  const String stamp_part = name.substring(last_sep + 1, ext_pos);
+  if (prefix_part.length() == 0 || session_part.length() == 0 || stamp_part.length() == 0) return false;
+
+  session_id = (uint32_t)strtoul(session_part.c_str(), nullptr, 10);
+  stamp = (uint32_t)strtoul(stamp_part.c_str(), nullptr, 10);
+  return session_id != 0U && stamp != 0U;
+}
+
 AppConfig g_cfg = {};
 File g_file;
 String g_current_name;
+String g_last_closed_name;
+uint32_t g_last_closed_session_id = 0U;
 TaskHandle_t g_writer_task = nullptr;
 SemaphoreHandle_t g_state_mutex = nullptr;
 QueueHandle_t g_free_block_queue = nullptr;
@@ -68,13 +112,71 @@ QueueHandle_t g_full_block_queue = nullptr;
 Stats g_stats = {};
 RecorderStatus g_recorder = {};
 Block g_blocks[kBlockCount] = {};
+BinaryLogRecordV2* g_bench_ring = nullptr;
+uint8_t* g_bench_write_buffer = nullptr;
 int g_active_block_index = -1;
 bool g_close_pending = false;
 uint32_t g_last_seq = 0U;
+uint32_t g_last_replay_input_seq = 0U;
+size_t g_bench_write_used = 0U;
+uint32_t g_bench_write_records = 0U;
+uint32_t g_bench_last_write_ms = 0U;
 uint32_t g_last_status_refresh_ms = 0U;
 uint32_t g_last_probe_attempt_ms = 0U;
 uint32_t g_last_idle_media_check_ms = 0U;
+uint16_t g_bench_ring_head = 0U;
+uint16_t g_bench_ring_tail = 0U;
 portMUX_TYPE g_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE g_bench_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+
+void defaultSessionMeta(SessionMetaRecord& meta) {
+  memset(&meta, 0, sizeof(meta));
+  meta.magic = kSessionMetaMagic;
+  meta.version = kSessionMetaVersion;
+  meta.next_session_id = 1U;
+}
+
+bool loadSessionMeta(SessionMetaRecord& meta) {
+  defaultSessionMeta(meta);
+  if (!sd_backend::mounted()) return false;
+  File f = sd_api::open(kSessionMetaPath);
+  if (!f) return false;
+  const bool ok = (f.read((uint8_t*)&meta, sizeof(meta)) == (int)sizeof(meta));
+  f.close();
+  if (!ok || meta.magic != kSessionMetaMagic || meta.version != kSessionMetaVersion) {
+    defaultSessionMeta(meta);
+    return false;
+  }
+  if (meta.next_session_id == 0U) meta.next_session_id = 1U;
+  meta.last_closed_name[sizeof(meta.last_closed_name) - 1U] = '\0';
+  return true;
+}
+
+bool saveSessionMeta(const SessionMetaRecord& meta) {
+  if (!sd_backend::mounted()) return false;
+  if (!sd_api::exists(LOG_DIR)) (void)sd_api::mkdir(LOG_DIR);
+  File f = sd_api::open(kSessionMetaPath, sd_api::OpenMode::write);
+  if (!f) return false;
+  f.seek(0);
+  const size_t written = f.write((const uint8_t*)&meta, sizeof(meta));
+  f.flush();
+  f.close();
+  return written == sizeof(meta);
+}
+
+void updateSessionMetaClosedLog(uint32_t session_id, const String& closed_name) {
+  SessionMetaRecord meta = {};
+  (void)loadSessionMeta(meta);
+  if (session_id != 0U) {
+    meta.last_closed_session_id = session_id;
+    const uint32_t next_id = session_id + 1U;
+    if (next_id > meta.next_session_id) meta.next_session_id = next_id;
+  }
+  memset(meta.last_closed_name, 0, sizeof(meta.last_closed_name));
+  const String short_name = closed_name.startsWith("/logs/") ? closed_name.substring(6) : closed_name;
+  short_name.substring(0, sizeof(meta.last_closed_name) - 1U).toCharArray(meta.last_closed_name, sizeof(meta.last_closed_name));
+  (void)saveSessionMeta(meta);
+}
 
 void recordDuration(uint32_t elapsed_ms, uint32_t& last_ms, uint32_t& max_ms) {
   last_ms = elapsed_ms;
@@ -100,6 +202,8 @@ void noteFreeDepth(UBaseType_t free_depth) {
 void refreshBackendStatus(bool force = false) {
   const uint32_t now = millis();
   const bool logger_busy = g_recorder.active || g_close_pending || (bool)g_file;
+  const bool sdcap_busy = false;
+  if ((logger_busy || sdcap_busy) && !force) return;
   const uint32_t refresh_interval_ms = sd_backend::mounted() ? kMountedStatusRefreshMs : kMissingMediaProbeIntervalMs;
   if (!force && (uint32_t)(now - g_last_status_refresh_ms) < refresh_interval_ms) return;
   g_last_status_refresh_ms = now;
@@ -129,8 +233,14 @@ void refreshBackendStatus(bool force = false) {
   }
 }
 
+String activeRecordPrefix() {
+  const AppConfig& cfg = config_store::get();
+  return (cfg.record_prefix[0] != '\0') ? String(cfg.record_prefix) : String("air");
+}
+
 String makeLogName(uint32_t session_id) {
-  return String(LOG_DIR) + "/air_" + String(session_id ? session_id : 1U) + "_" + String(millis()) + kBinaryExt;
+  return String(LOG_DIR) + "/" + activeRecordPrefix() + "_" + String(session_id ? session_id : 1U) + "_" +
+         String(millis()) + kBinaryExt;
 }
 
 String normalizeLogPath(const String& path) {
@@ -233,8 +343,58 @@ const char* recordKindName(uint16_t kind) {
   switch ((telem::LogRecordKind)kind) {
     case telem::LogRecordKind::State160: return "state160";
     case telem::LogRecordKind::ReplayControl160: return "replay_control160";
+    case telem::LogRecordKind::ReplayInput160: return "replay_input160";
     default: return "unknown";
   }
+}
+
+bool useSimpleBenchWriter() {
+  return config_store::get().standalone_bench != 0U && g_bench_ring && g_bench_write_buffer;
+}
+
+uint32_t benchRingCountUnsafe() {
+  return (uint16_t)(g_bench_ring_head - g_bench_ring_tail);
+}
+
+void resetBenchRuntime() {
+  portENTER_CRITICAL(&g_bench_ring_mux);
+  g_bench_ring_head = 0U;
+  g_bench_ring_tail = 0U;
+  portEXIT_CRITICAL(&g_bench_ring_mux);
+  g_bench_write_used = 0U;
+  g_bench_write_records = 0U;
+  g_bench_last_write_ms = 0U;
+}
+
+bool benchRingPush(const BinaryLogRecordV2& record, uint32_t& q_now) {
+  bool ok = false;
+  portENTER_CRITICAL(&g_bench_ring_mux);
+  const uint32_t q = benchRingCountUnsafe();
+  if (q < kBenchRingDepth) {
+    g_bench_ring[g_bench_ring_head % kBenchRingDepth] = record;
+    g_bench_ring_head = (uint16_t)(g_bench_ring_head + 1U);
+    q_now = benchRingCountUnsafe();
+    ok = true;
+  } else {
+    q_now = q;
+  }
+  portEXIT_CRITICAL(&g_bench_ring_mux);
+  return ok;
+}
+
+bool benchRingPop(BinaryLogRecordV2& record, uint32_t& q_now) {
+  bool ok = false;
+  portENTER_CRITICAL(&g_bench_ring_mux);
+  if (g_bench_ring_tail != g_bench_ring_head) {
+    record = g_bench_ring[g_bench_ring_tail % kBenchRingDepth];
+    g_bench_ring_tail = (uint16_t)(g_bench_ring_tail + 1U);
+    q_now = benchRingCountUnsafe();
+    ok = true;
+  } else {
+    q_now = 0U;
+  }
+  portEXIT_CRITICAL(&g_bench_ring_mux);
+  return ok;
 }
 
 bool writeCsvHeader(File& csv) {
@@ -486,6 +646,10 @@ enum class ReadStateResult : uint8_t {
   Error,
 };
 
+struct CoreComparableState {
+  telem::TelemetryFullStateV1 state = {};
+};
+
 ReadStateResult readNextStateRecord(File& file, BinaryLogRecordV2& record, telem::TelemetryFullStateV1& state,
                                     uint32_t& state_count) {
   for (;;) {
@@ -578,26 +742,115 @@ bool openCurrentLog() {
   if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
 
   const uint32_t t0 = millis();
-  if (!SD.exists(LOG_DIR)) (void)SD.mkdir(LOG_DIR);
+  if (!sd_api::exists(LOG_DIR)) (void)sd_api::mkdir(LOG_DIR);
   g_current_name = makeLogName(g_recorder.session_id);
-  g_file = SD.open(g_current_name, FILE_WRITE);
+  g_file = sd_api::open(g_current_name, sd_api::OpenMode::write);
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
-  refreshBackendStatus(false);
   return (bool)g_file;
+}
+
+bool recoverCurrentLogAfterWriteFailure() {
+  if (g_current_name.isEmpty()) return false;
+
+  if (g_file) {
+    g_file.close();
+  }
+
+  sd_backend::end();
+  delay(10);
+
+  sd_backend::Status backend = {};
+  const bool ready = sd_backend::begin(&backend);
+  g_recorder.backend_ready = ready;
+  g_recorder.media_present = ready && backend.card_type != CARD_NONE;
+  g_recorder.init_hz = ready ? backend.init_hz : 0U;
+  if (!ready || !g_recorder.media_present) return false;
+
+  g_file = sd_api::open(g_current_name, sd_api::OpenMode::write);
+  return (bool)g_file;
+}
+
+bool writeCurrentFileBytes(const uint8_t* data, size_t len, uint32_t& elapsed_ms) {
+  elapsed_ms = 0U;
+  if (!data || len == 0U) return true;
+  if (!openCurrentLog()) return false;
+
+  const uint32_t t0 = millis();
+  size_t total_written = 0U;
+  while (total_written < len) {
+    size_t written = 0U;
+    for (uint8_t attempt = 0U; attempt < kWriteRetryCount; ++attempt) {
+      written = g_file.write(data + total_written, len - total_written);
+      if (written > 0U) break;
+      delay(kWriteRetryDelayMs);
+    }
+    if (written == 0U) {
+      if (!recoverCurrentLogAfterWriteFailure()) {
+        elapsed_ms = millis() - t0;
+        return false;
+      }
+      continue;
+    }
+    total_written += written;
+  }
+
+  elapsed_ms = millis() - t0;
+  return true;
+}
+
+bool flushBenchBufferLocked() {
+  if (!g_bench_write_used) return true;
+
+  uint32_t elapsed_ms = 0U;
+  if (!writeCurrentFileBytes(g_bench_write_buffer, g_bench_write_used, elapsed_ms)) {
+    portENTER_CRITICAL(&g_stats_mux);
+    recordDuration(elapsed_ms, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
+    portEXIT_CRITICAL(&g_stats_mux);
+    return false;
+  }
+
+  portENTER_CRITICAL(&g_stats_mux);
+  g_stats.bytes_written += (uint32_t)g_bench_write_used;
+  g_stats.records_written += g_bench_write_records;
+  g_stats.blocks_written++;
+  g_stats.flushes++;
+  recordDuration(elapsed_ms, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
+  if (g_bench_write_used > g_stats.max_write_bytes) g_stats.max_write_bytes = (uint32_t)g_bench_write_used;
+  portEXIT_CRITICAL(&g_stats_mux);
+
+  g_recorder.bytes_written = g_stats.bytes_written;
+  g_bench_write_used = 0U;
+  g_bench_write_records = 0U;
+  return true;
+}
+
+bool appendBenchRecordLocked(const BinaryLogRecordV2& record) {
+  const size_t record_size = sizeof(record);
+  if ((g_bench_write_used + record_size) > kBlockBytes) {
+    if (!flushBenchBufferLocked()) return false;
+  }
+  memcpy(g_bench_write_buffer + g_bench_write_used, &record, sizeof(record));
+  g_bench_write_used += sizeof(record);
+  g_bench_write_records++;
+  return true;
 }
 
 void closeCurrentLog() {
   if (!g_file) return;
   const uint32_t t0 = millis();
+  const String closed_name = g_current_name;
+  const uint32_t closed_session_id = g_recorder.session_id;
   g_file.flush();
   g_file.close();
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_close_last_ms, g_stats.fs_close_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
   g_current_name = "";
-  refreshBackendStatus(false);
+  g_last_closed_name = closed_name;
+  g_last_closed_session_id = closed_session_id;
+  updateSessionMetaClosedLog(closed_session_id, closed_name);
 }
 
 void abandonCurrentLog() {
@@ -611,6 +864,7 @@ void abortSessionNoMedia() {
   g_recorder.active = false;
   g_close_pending = false;
   g_active_block_index = -1;
+  resetBenchRuntime();
   abandonCurrentLog();
   resetBlockQueues();
   g_recorder.backend_ready = false;
@@ -701,27 +955,14 @@ bool enqueueRecord(const BinaryLogRecordV2& record) {
 
 bool writeBlock(Block& block) {
   if (!block.used_bytes) return true;
-  if (!openCurrentLog()) return false;
-
-  const uint32_t t0 = millis();
-  size_t total_written = 0U;
-  while (total_written < block.used_bytes) {
-    size_t written = 0U;
-    for (uint8_t attempt = 0U; attempt < kWriteRetryCount; ++attempt) {
-      written = g_file.write(block.data + total_written, block.used_bytes - total_written);
-      if (written > 0U) break;
-      delay(kWriteRetryDelayMs);
-    }
-    if (written == 0U) {
-      portENTER_CRITICAL(&g_stats_mux);
-      recordDuration(millis() - t0, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
-      portEXIT_CRITICAL(&g_stats_mux);
-      return false;
-    }
-    total_written += written;
+  uint32_t elapsed_ms = 0U;
+  if (!writeCurrentFileBytes(block.data, block.used_bytes, elapsed_ms)) {
+    portENTER_CRITICAL(&g_stats_mux);
+    recordDuration(elapsed_ms, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
+    portEXIT_CRITICAL(&g_stats_mux);
+    return false;
   }
 
-  const uint32_t elapsed_ms = millis() - t0;
   portENTER_CRITICAL(&g_stats_mux);
   g_stats.bytes_written += (uint32_t)block.used_bytes;
   g_stats.records_written += block.record_count;
@@ -741,6 +982,46 @@ void writerTask(void* param) {
   (void)param;
   for (;;) {
     (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+    if (useSimpleBenchWriter()) {
+      BinaryLogRecordV2 record = {};
+      uint32_t q_now = 0U;
+      bool have = benchRingPop(record, q_now);
+      while (have) {
+        {
+          LockGuard lock(g_state_mutex);
+          if (g_recorder.active || g_bench_write_used != 0U) {
+            if (!appendBenchRecordLocked(record)) {
+              g_recorder.active = false;
+              g_close_pending = true;
+            }
+          }
+        }
+        have = benchRingPop(record, q_now);
+      }
+
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.queue_cur = q_now;
+      if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
+      portEXIT_CRITICAL(&g_stats_mux);
+
+      const uint32_t now = millis();
+      LockGuard lock(g_state_mutex);
+      if (g_bench_write_used != 0U && (uint32_t)(now - g_bench_last_write_ms) >= kBenchFlushIntervalMs) {
+        if (!flushBenchBufferLocked()) {
+          g_recorder.active = false;
+          g_close_pending = true;
+        }
+        g_bench_last_write_ms = now;
+      }
+      if (!g_recorder.active && g_close_pending && g_bench_write_used != 0U) {
+        if (!flushBenchBufferLocked()) {
+          g_close_pending = false;
+          abandonCurrentLog();
+        }
+        g_bench_last_write_ms = now;
+      }
+    }
+
     int block_index = -1;
     while (g_full_block_queue && xQueueReceive(g_full_block_queue, &block_index, 0) == pdTRUE) {
       if (block_index < 0 || block_index >= (int)kBlockCount) {
@@ -756,10 +1037,87 @@ void writerTask(void* param) {
       updateQueueCur();
     }
 
-    if (g_close_pending && (!g_full_block_queue || uxQueueMessagesWaiting(g_full_block_queue) == 0U)) {
+    if (g_close_pending &&
+        (!g_full_block_queue || uxQueueMessagesWaiting(g_full_block_queue) == 0U) &&
+        g_bench_write_used == 0U) {
       closeCurrentLog();
       g_close_pending = false;
     }
+  }
+}
+
+bool preferReplayInputCoreRecords(File& file) {
+  const uint32_t start_pos = (uint32_t)file.position();
+  BinaryLogRecordV2 record = {};
+  uint32_t state_count = 0U;
+  uint32_t replay_input_count = 0U;
+  for (;;) {
+    const size_t got = readExact(file, (uint8_t*)&record, sizeof(record));
+    if (got == 0U) break;
+    if (got != sizeof(record)) break;
+    if (record.magic != kLogMagic || record.version != kLogVersion || record.record_size != sizeof(record)) break;
+    switch ((telem::LogRecordKind)record.record_kind) {
+      case telem::LogRecordKind::State160:
+        state_count++;
+        break;
+      case telem::LogRecordKind::ReplayInput160:
+        replay_input_count++;
+        break;
+      default:
+        break;
+    }
+  }
+  file.seek(start_pos);
+  if (replay_input_count == 0U) return false;
+  if (state_count == 0U) return true;
+  return replay_input_count > state_count;
+}
+
+void fillCoreComparableStateFromReplayInput(CoreComparableState& out, const telem::ReplayInputRecord160& replay) {
+  memset(&out.state, 0, sizeof(out.state));
+  const telem::ReplayInputPayloadV1& p = replay.payload;
+  out.state.iTOW_ms = p.iTOW_ms;
+  out.state.fixType = p.fixType;
+  out.state.numSV = p.numSV;
+  out.state.lat_1e7 = p.lat_1e7;
+  out.state.lon_1e7 = p.lon_1e7;
+  out.state.hMSL_mm = p.hMSL_mm;
+  out.state.gSpeed_mms = p.gSpeed_mms;
+  out.state.headMot_1e5deg = p.headMot_1e5deg;
+  out.state.hAcc_mm = p.hAcc_mm;
+  out.state.sAcc_mms = p.sAcc_mms;
+  out.state.baro_temp_c = (float)p.baro_temp_milli_c * 0.001f;
+  out.state.baro_press_hpa = (float)p.baro_press_milli_hpa * 0.001f;
+  out.state.baro_alt_m = (float)p.baro_alt_mm * 0.001f;
+  out.state.baro_vsi_mps = (float)p.baro_vsi_milli_mps * 0.001f;
+  out.state.raw_present_mask = (uint16_t)p.present_mask;
+}
+
+ReadStateResult readNextCoreComparableRecord(File& file, bool prefer_replay_input,
+                                             BinaryLogRecordV2& record, CoreComparableState& core,
+                                             uint32_t& core_count) {
+  for (;;) {
+    const size_t got = readExact(file, (uint8_t*)&record, sizeof(record));
+    if (got == 0U) return ReadStateResult::Eof;
+    if (got != sizeof(record)) return ReadStateResult::Error;
+    if (record.magic != kLogMagic || record.version != kLogVersion || record.record_size != sizeof(record)) {
+      return ReadStateResult::Error;
+    }
+
+    const telem::LogRecordKind kind = (telem::LogRecordKind)record.record_kind;
+    if (prefer_replay_input) {
+      if (kind != telem::LogRecordKind::ReplayInput160) continue;
+      telem::ReplayInputRecord160 replay = {};
+      memcpy(&replay, record.payload, sizeof(replay));
+      fillCoreComparableStateFromReplayInput(core, replay);
+      core_count++;
+      return ReadStateResult::Ok;
+    }
+
+    if (kind != telem::LogRecordKind::State160) continue;
+    memcpy(&core.state, record.payload, sizeof(core.state));
+    core_count++;
+    return ReadStateResult::Ok;
   }
 }
 
@@ -771,6 +1129,7 @@ void begin(const AppConfig& cfg, bool enabled) {
   g_recorder = {};
   g_recorder.feature_enabled = enabled;
   g_last_seq = 0U;
+  g_last_replay_input_seq = 0U;
   g_last_status_refresh_ms = 0U;
   g_last_probe_attempt_ms = 0U;
   g_last_idle_media_check_ms = 0U;
@@ -778,7 +1137,15 @@ void begin(const AppConfig& cfg, bool enabled) {
   if (!g_state_mutex) g_state_mutex = xSemaphoreCreateMutex();
   if (!g_free_block_queue) g_free_block_queue = xQueueCreate(kBlockCount, sizeof(int));
   if (!g_full_block_queue) g_full_block_queue = xQueueCreate(kBlockCount, sizeof(int));
+  if (!g_bench_ring) {
+    g_bench_ring = (BinaryLogRecordV2*)heap_caps_malloc(sizeof(BinaryLogRecordV2) * kBenchRingDepth,
+                                                        MALLOC_CAP_8BIT);
+  }
+  if (!g_bench_write_buffer) {
+    g_bench_write_buffer = (uint8_t*)heap_caps_malloc(kBlockBytes, MALLOC_CAP_8BIT);
+  }
   resetBlockQueues();
+  resetBenchRuntime();
   refreshBackendStatus(true);
 
   if (!g_writer_task) {
@@ -810,10 +1177,12 @@ bool startSession(uint32_t session_id) {
 
   resetStats();
   resetBlockQueues();
+  resetBenchRuntime();
   closeCurrentLog();
   g_recorder.session_id = session_id;
   g_recorder.bytes_written = 0U;
   g_last_seq = 0U;
+  g_last_replay_input_seq = 0U;
   if (!openCurrentLog()) {
     refreshBackendStatus(true);
     return false;
@@ -825,6 +1194,13 @@ bool startSession(uint32_t session_id) {
 void stopSession() {
   LockGuard lock(g_state_mutex);
   if (!g_recorder.active && !g_file) return;
+
+  if (useSimpleBenchWriter()) {
+    g_recorder.active = false;
+    g_close_pending = true;
+    if (g_writer_task) xTaskNotifyGive(g_writer_task);
+    return;
+  }
 
   int final_block = -1;
   if (g_active_block_index >= 0) {
@@ -851,11 +1227,13 @@ void poll() {
   LockGuard lock(g_state_mutex);
   const uint32_t now = millis();
   const bool logger_busy = g_recorder.active || g_close_pending || (bool)g_file;
+  const bool sdcap_busy = false;
   if (logger_busy) {
-    refreshBackendStatus(false);
     if (!g_recorder.backend_ready || !g_recorder.media_present) {
       abortSessionNoMedia();
     }
+  } else if (sdcap_busy) {
+    return;
   } else if (!sd_backend::mounted()) {
     g_recorder.backend_ready = false;
     g_recorder.media_present = false;
@@ -895,6 +1273,40 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1
   record.seq = seq;
   record.t_us = t_us;
   memcpy(record.payload, &state, sizeof(state));
+  (void)enqueueRecord(record);
+}
+
+void enqueueReplayInput(uint32_t seq, uint32_t t_us, const telem::ReplayInputRecord160& replay) {
+  if (!g_recorder.feature_enabled || !g_recorder.active) return;
+  if (seq == g_last_replay_input_seq) return;
+  g_last_replay_input_seq = seq;
+
+  BinaryLogRecordV2 record = {};
+  record.magic = kLogMagic;
+  record.version = kLogVersion;
+  record.record_size = (uint16_t)sizeof(record);
+  record.record_kind = (uint16_t)telem::LogRecordKind::ReplayInput160;
+  record.seq = seq;
+  record.t_us = t_us;
+  memcpy(record.payload, &replay, sizeof(replay));
+  if (useSimpleBenchWriter()) {
+    uint32_t q_now = 0U;
+    if (benchRingPush(record, q_now)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.enqueued++;
+      g_stats.queue_cur = q_now;
+      if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
+      portEXIT_CRITICAL(&g_stats_mux);
+      if (g_writer_task) xTaskNotifyGive(g_writer_task);
+    } else {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      g_stats.queue_cur = q_now;
+      if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
+      portEXIT_CRITICAL(&g_stats_mux);
+    }
+    return;
+  }
   (void)enqueueRecord(record);
 }
 
@@ -960,29 +1372,140 @@ void resetStats() {
   portEXIT_CRITICAL(&g_stats_mux);
 }
 
-String filesJson() {
-  if (!sd_backend::mounted()) return "[]";
-  String out = "[";
-  bool first = true;
-  File dir = SD.open(LOG_DIR);
-  if (dir && dir.isDirectory()) {
-    File f = dir.openNextFile();
-    while (f) {
-      if (!f.isDirectory()) {
-        String p = f.name();
-        if (p.startsWith("/logs/")) p = p.substring(6);
-        if (!first) out += ',';
-        first = false;
-        out += "{\"name\":\"";
-        out += p;
-        out += "\",\"size\":";
-        out += String((uint32_t)f.size());
-        out += "}";
+struct ListedFileEntry {
+  String full_name;
+  String short_name;
+  String extension;
+  uint32_t size_bytes = 0U;
+  uint32_t session_id = 0U;
+  uint32_t stamp = 0U;
+  bool parsed = false;
+};
+
+bool shouldIncludeListedFile(const String& short_name, bool logs_only) {
+  if (short_name.length() == 0U) return false;
+  if (logs_only) return short_name.endsWith(kBinaryExt);
+  return short_name.endsWith(".tlog") || short_name.endsWith(".csv") || short_name.endsWith(".ndjson");
+}
+
+void sortListedFiles(ListedFileEntry* entries, size_t count, FileSortKey sort_key, FileSortDirection sort_dir) {
+  if (!entries || count < 2U) return;
+  for (size_t i = 0; i + 1U < count; ++i) {
+    for (size_t j = i + 1U; j < count; ++j) {
+      bool take_j = false;
+      switch (sort_key) {
+        case FileSortKey::size:
+          take_j = (sort_dir == FileSortDirection::ascending) ? (entries[j].size_bytes < entries[i].size_bytes)
+                                                              : (entries[j].size_bytes > entries[i].size_bytes);
+          if (entries[j].size_bytes == entries[i].size_bytes) {
+            take_j = entries[j].short_name < entries[i].short_name;
+          }
+          break;
+        case FileSortKey::date:
+          take_j = (sort_dir == FileSortDirection::ascending) ? (entries[j].stamp < entries[i].stamp)
+                                                              : (entries[j].stamp > entries[i].stamp);
+          if (entries[j].stamp == entries[i].stamp) {
+            take_j = entries[j].short_name < entries[i].short_name;
+          }
+          break;
+        case FileSortKey::name:
+        default:
+          take_j = (sort_dir == FileSortDirection::ascending) ? (entries[j].short_name < entries[i].short_name)
+                                                              : (entries[j].short_name > entries[i].short_name);
+          break;
       }
-      f = dir.openNextFile();
+      if (take_j) {
+        const ListedFileEntry tmp = entries[i];
+        entries[i] = entries[j];
+        entries[j] = tmp;
+      }
     }
   }
+}
+
+bool collectListedFiles(ListedFileEntry*& out_entries, size_t& out_count, bool logs_only,
+                        FileSortKey sort_key, FileSortDirection sort_dir) {
+  out_entries = nullptr;
+  out_count = 0U;
+
+  File dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  size_t count = 0U;
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String short_name = String(f.name());
+      if (short_name.startsWith("/logs/")) short_name = short_name.substring(6);
+      if (shouldIncludeListedFile(short_name, logs_only)) {
+        count++;
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  if (count == 0U) return true;
+  ListedFileEntry* entries = new ListedFileEntry[count];
+  if (!entries) return false;
+
+  dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) {
+    delete[] entries;
+    return false;
+  }
+
+  size_t index = 0U;
+  f = dir.openNextFile();
+  while (f && index < count) {
+    if (!f.isDirectory()) {
+      String short_name = String(f.name());
+      if (short_name.startsWith("/logs/")) short_name = short_name.substring(6);
+      if (shouldIncludeListedFile(short_name, logs_only)) {
+        ListedFileEntry& entry = entries[index++];
+        entry.short_name = short_name;
+        entry.full_name = normalizeLogPath(short_name);
+        entry.size_bytes = (uint32_t)f.size();
+        const int dot = short_name.lastIndexOf('.');
+        entry.extension = (dot >= 0) ? short_name.substring(dot + 1) : String("");
+        entry.parsed = parseLogNameParts(short_name, entry.session_id, entry.stamp);
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  out_entries = entries;
+  out_count = index;
+  sortListedFiles(out_entries, out_count, sort_key, sort_dir);
+  return true;
+}
+
+String filesJson(FileSortKey sort_key, FileSortDirection sort_dir) {
+  if (!sd_backend::mounted()) return "[]";
+  ListedFileEntry* entries = nullptr;
+  size_t count = 0U;
+  if (!collectListedFiles(entries, count, false, sort_key, sort_dir)) return "[]";
+
+  String out = "[";
+  for (size_t i = 0; i < count; ++i) {
+    if (i != 0U) out += ',';
+    out += "{\"name\":\"";
+    out += entries[i].short_name;
+    out += "\",\"size\":";
+    out += String(entries[i].size_bytes);
+    out += ",\"session\":";
+    out += String(entries[i].session_id);
+    out += ",\"date\":";
+    out += String(entries[i].stamp);
+    out += ",\"ext\":\"";
+    out += entries[i].extension;
+    out += "\"}";
+  }
   out += "]";
+  delete[] entries;
   return out;
 }
 
@@ -990,7 +1513,9 @@ bool listFiles(telem::LogFileInfoV1* out_files,
                uint16_t max_files,
                uint16_t offset,
                uint16_t& total_files,
-               uint16_t& returned_files) {
+               uint16_t& returned_files,
+               FileSortKey sort_key,
+               FileSortDirection sort_dir) {
   total_files = 0U;
   returned_files = 0U;
 
@@ -1000,39 +1525,65 @@ bool listFiles(telem::LogFileInfoV1* out_files,
     return false;
   }
 
-  File dir = SD.open(LOG_DIR);
-  if (!dir || !dir.isDirectory()) return false;
+  ListedFileEntry* entries = nullptr;
+  size_t count = 0U;
+  if (!collectListedFiles(entries, count, true, sort_key, sort_dir)) return false;
 
-  String candidate_name;
-  while (nextLogName(dir, candidate_name)) {
-    const String short_name = candidate_name.startsWith("/logs/") ? candidate_name.substring(6) : candidate_name;
-    File file = SD.open(candidate_name, FILE_READ);
-    const uint32_t size_bytes = file ? (uint32_t)file.size() : 0U;
-    if (file) file.close();
-
-    if (total_files >= offset && returned_files < max_files && out_files) {
-      telem::LogFileInfoV1& entry = out_files[returned_files];
-      memset(&entry, 0, sizeof(entry));
-      entry.size_bytes = size_bytes;
-      strncpy(entry.name, short_name.c_str(), sizeof(entry.name) - 1U);
-      returned_files++;
-    }
-    total_files++;
+  total_files = (count > 0xFFFFU) ? 0xFFFFU : (uint16_t)count;
+  for (size_t i = offset; i < count && returned_files < max_files; ++i) {
+    telem::LogFileInfoV1& entry = out_files[returned_files];
+    memset(&entry, 0, sizeof(entry));
+    entry.size_bytes = entries[i].size_bytes;
+    strncpy(entry.name, entries[i].short_name.c_str(), sizeof(entry.name) - 1U);
+    returned_files++;
   }
-  dir.close();
+  delete[] entries;
   return true;
 }
 
 bool latestLogNameLocked(String& out_name) {
   out_name = "";
+  if (g_last_closed_name.isEmpty()) {
+    SessionMetaRecord meta = {};
+    if (loadSessionMeta(meta) && meta.last_closed_name[0] != '\0') {
+      g_last_closed_name = normalizeLogPath(String(meta.last_closed_name));
+      g_last_closed_session_id = meta.last_closed_session_id;
+    }
+  }
+  if (!g_last_closed_name.isEmpty()) {
+    out_name = g_last_closed_name;
+    return true;
+  }
   if (!sd_backend::mounted()) return false;
-  File dir = SD.open(LOG_DIR);
+  File dir = sd_api::open(LOG_DIR);
   if (!dir || !dir.isDirectory()) return false;
 
   String best_name;
+  uint32_t best_session = 0U;
+  uint32_t best_stamp = 0U;
+  bool have_best = false;
   String candidate_name;
   while (nextLogName(dir, candidate_name)) {
-    if (candidate_name > best_name) best_name = candidate_name;
+    uint32_t candidate_session = 0U;
+    uint32_t candidate_stamp = 0U;
+    const bool parsed = parseLogNameParts(candidate_name, candidate_session, candidate_stamp);
+    if (!have_best) {
+      best_name = candidate_name;
+      best_session = candidate_session;
+      best_stamp = candidate_stamp;
+      have_best = true;
+      continue;
+    }
+    if (parsed) {
+      if (candidate_session > best_session ||
+          (candidate_session == best_session && candidate_stamp > best_stamp)) {
+        best_name = candidate_name;
+        best_session = candidate_session;
+        best_stamp = candidate_stamp;
+      }
+    } else if (best_name.isEmpty() || candidate_name > best_name) {
+      best_name = candidate_name;
+    }
   }
   dir.close();
   out_name = best_name;
@@ -1042,7 +1593,7 @@ bool latestLogNameLocked(String& out_name) {
 bool largestLogNameLocked(String& out_name) {
   out_name = "";
   if (!sd_backend::mounted()) return false;
-  File dir = SD.open(LOG_DIR);
+  File dir = sd_api::open(LOG_DIR);
   if (!dir || !dir.isDirectory()) return false;
 
   uint32_t best_size = 0U;
@@ -1069,21 +1620,65 @@ bool largestLogNameLocked(String& out_name) {
 
 bool latestLogNameForSessionLocked(uint32_t session_id, String& out_name) {
   out_name = "";
+  if (g_last_closed_session_id == 0U) {
+    SessionMetaRecord meta = {};
+    if (loadSessionMeta(meta) && meta.last_closed_session_id == session_id && meta.last_closed_name[0] != '\0') {
+      g_last_closed_session_id = meta.last_closed_session_id;
+      g_last_closed_name = normalizeLogPath(String(meta.last_closed_name));
+    }
+  }
+  if (g_last_closed_session_id == session_id && !g_last_closed_name.isEmpty()) {
+    out_name = g_last_closed_name;
+    return true;
+  }
   if (!sd_backend::mounted()) return false;
-  File dir = SD.open(LOG_DIR);
+  File dir = sd_api::open(LOG_DIR);
   if (!dir || !dir.isDirectory()) return false;
 
-  const String prefix = String(LOG_DIR) + "/air_" + String(session_id) + "_";
   String best_name;
+  uint32_t best_stamp = 0U;
+  bool have_best = false;
   String candidate_name;
   while (nextLogName(dir, candidate_name)) {
-    if (candidate_name.startsWith(prefix) && candidate_name > best_name) {
+    uint32_t candidate_session = 0U;
+    uint32_t candidate_stamp = 0U;
+    if (parseLogNameParts(candidate_name, candidate_session, candidate_stamp) &&
+        candidate_session == session_id) {
+      if (!have_best || candidate_stamp > best_stamp) {
+        best_name = candidate_name;
+        best_stamp = candidate_stamp;
+        have_best = true;
+      }
+    } else if (!have_best && (best_name.isEmpty() || candidate_name > best_name)) {
       best_name = candidate_name;
     }
   }
   dir.close();
   out_name = best_name;
   return !out_name.isEmpty();
+}
+
+uint32_t highestLogSessionIdLocked() {
+  SessionMetaRecord meta = {};
+  if (loadSessionMeta(meta) && meta.next_session_id > 0U) {
+    return meta.next_session_id - 1U;
+  }
+  if (!sd_backend::mounted()) return 0U;
+  File dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return 0U;
+
+  uint32_t best_session = 0U;
+  String candidate_name;
+  while (nextLogName(dir, candidate_name)) {
+    uint32_t candidate_session = 0U;
+    uint32_t candidate_stamp = 0U;
+    if (parseLogNameParts(candidate_name, candidate_session, candidate_stamp) &&
+        candidate_session > best_session) {
+      best_session = candidate_session;
+    }
+  }
+  dir.close();
+  return best_session;
 }
 
 bool isSafeName(const String& name) {
@@ -1101,12 +1696,12 @@ bool deleteFileByName(const String& name) {
   if (!sd_backend::mounted()) return false;
   if (!isSafeName(name)) return false;
   const String full = String(LOG_DIR) + "/" + name;
-  if (!SD.exists(full)) return false;
+  if (!sd_api::exists(full)) return false;
   if (g_current_name == full) {
     closeCurrentLog();
   }
   const uint32_t t0 = millis();
-  const bool ok = SD.remove(full);
+  const bool ok = sd_api::remove(full);
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_delete_last_ms, g_stats.fs_delete_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
@@ -1126,25 +1721,25 @@ bool renameFileByName(const String& src_name, const String& dst_name) {
   const String src_full = String(LOG_DIR) + "/" + src_name;
   const String dst_full = String(LOG_DIR) + "/" + dst_name;
   if (src_full == dst_full) return true;
-  if (!SD.exists(src_full) || SD.exists(dst_full)) return false;
+  if (!sd_api::exists(src_full) || sd_api::exists(dst_full)) return false;
 
   if (g_current_name == src_full) {
     closeCurrentLog();
   }
-  bool ok = SD.rename(src_full, dst_full);
+  bool ok = sd_api::rename(src_full, dst_full);
   if (!ok) {
-    File src = SD.open(src_full, FILE_READ);
+    File src = sd_api::open(src_full);
     if (src) {
-      if (SD.exists(dst_full)) (void)SD.remove(dst_full);
-      File dst = SD.open(dst_full, FILE_WRITE);
+      if (sd_api::exists(dst_full)) (void)sd_api::remove(dst_full);
+      File dst = sd_api::open(dst_full, sd_api::OpenMode::write);
       if (dst) {
         ok = copyFileRaw(src, dst);
         dst.flush();
         dst.close();
         if (ok) {
-          ok = SD.remove(src_full);
-        } else if (SD.exists(dst_full)) {
-          (void)SD.remove(dst_full);
+          ok = sd_api::remove(src_full);
+        } else if (sd_api::exists(dst_full)) {
+          (void)sd_api::remove(dst_full);
         }
       }
       src.close();
@@ -1152,6 +1747,62 @@ bool renameFileByName(const String& src_name, const String& dst_name) {
   }
   refreshBackendStatus(true);
   return ok;
+}
+
+bool exportLogToCsvByName(const String& name, Stream* out) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending) {
+    if (out) out->println("AIRCSV export_ok=0 reason=logger_busy");
+    return false;
+  }
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    if (out) out->println("AIRCSV export_ok=0 reason=backend_not_ready");
+    return false;
+  }
+  if (!isSafeName(name) || !name.endsWith(kBinaryExt)) {
+    if (out) out->printf("AIRCSV file=%s export_ok=0 reason=invalid_name\r\n", name.c_str());
+    return false;
+  }
+
+  const String src_path = normalizeLogPath(name);
+  File src = sd_api::open(src_path);
+  if (!src) {
+    if (out) out->printf("AIRCSV file=%s export_ok=0 reason=open_src_failed\r\n", src_path.c_str());
+    return false;
+  }
+
+  const String csv_path = makeCsvName(src_path);
+  if (sd_api::exists(csv_path)) (void)sd_api::remove(csv_path);
+  File csv = sd_api::open(csv_path, sd_api::OpenMode::write);
+  if (!csv) {
+    src.close();
+    if (out) out->printf("AIRCSV file=%s export_ok=0 reason=open_csv_failed\r\n", src_path.c_str());
+    return false;
+  }
+
+  uint32_t rows = 0U;
+  uint32_t unsupported_rows = 0U;
+  const bool ok = exportSingleLogToCsv(src, csv, rows, unsupported_rows);
+  csv.flush();
+  csv.close();
+  src.close();
+
+  if (!ok) {
+    if (sd_api::exists(csv_path)) (void)sd_api::remove(csv_path);
+    if (out) out->printf("AIRCSV file=%s export_ok=0 reason=convert_failed\r\n", src_path.c_str());
+    return false;
+  }
+
+  if (out) {
+    const String csv_name = csv_path.startsWith("/logs/") ? csv_path.substring(6) : csv_path;
+    out->printf("AIRCSV file=%s csv=%s export_ok=1 rows=%lu unsupported=%lu\r\n",
+                src_path.c_str(),
+                csv_name.c_str(),
+                (unsigned long)rows,
+                (unsigned long)unsupported_rows);
+  }
+  return true;
 }
 
 bool exportAllLogsToCsv(Stream& out) {
@@ -1167,7 +1818,7 @@ bool exportAllLogsToCsv(Stream& out) {
     return false;
   }
 
-  File dir = SD.open(LOG_DIR);
+  File dir = sd_api::open(LOG_DIR);
   if (!dir || !dir.isDirectory()) {
     out.println("AIRCSV export_ok=0 reason=no_logs_dir");
     return false;
@@ -1196,8 +1847,8 @@ bool exportAllLogsToCsv(Stream& out) {
     }
 
     const String csv_path = makeCsvName(src_path);
-    if (SD.exists(csv_path)) (void)SD.remove(csv_path);
-    File csv = SD.open(csv_path, FILE_WRITE);
+    if (sd_api::exists(csv_path)) (void)sd_api::remove(csv_path);
+    File csv = sd_api::open(csv_path, sd_api::OpenMode::write);
     if (!csv) {
       out.printf("AIRCSV file=%s export_ok=0 reason=open_csv_failed\r\n", src_path.c_str());
       failed++;
@@ -1216,7 +1867,7 @@ bool exportAllLogsToCsv(Stream& out) {
     if (!ok) {
       out.printf("AIRCSV file=%s export_ok=0 reason=convert_failed\r\n", src_path.c_str());
       failed++;
-      if (SD.exists(csv_path)) (void)SD.remove(csv_path);
+      if (sd_api::exists(csv_path)) (void)sd_api::remove(csv_path);
     } else {
       const String csv_name = csv_path.startsWith("/logs/") ? csv_path.substring(6) : csv_path;
       out.printf("AIRCSV file=%s csv=%s export_ok=1 rows=%lu unsupported=%lu\r\n",
@@ -1253,10 +1904,22 @@ String currentFileName() {
   return g_current_name;
 }
 
+String previewLogName(uint32_t session_id) {
+  LockGuard lock(g_state_mutex);
+  const uint32_t resolved_session =
+      session_id ? session_id : ((g_last_closed_session_id != 0U) ? (g_last_closed_session_id + 1U) : 1U);
+  return makeLogName(resolved_session);
+}
+
+String recordPrefix() {
+  LockGuard lock(g_state_mutex);
+  return activeRecordPrefix();
+}
+
 bool latestLogName(String& out_name) {
   LockGuard lock(g_state_mutex);
-  refreshBackendStatus(true);
-  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+  if (!sd_backend::mounted()) refreshBackendStatus(true);
+  if (!sd_backend::mounted()) {
     out_name = "";
     return false;
   }
@@ -1265,8 +1928,8 @@ bool latestLogName(String& out_name) {
 
 bool largestLogName(String& out_name) {
   LockGuard lock(g_state_mutex);
-  refreshBackendStatus(true);
-  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+  if (!sd_backend::mounted()) refreshBackendStatus(true);
+  if (!sd_backend::mounted()) {
     out_name = "";
     return false;
   }
@@ -1275,12 +1938,21 @@ bool largestLogName(String& out_name) {
 
 bool latestLogNameForSession(uint32_t session_id, String& out_name) {
   LockGuard lock(g_state_mutex);
-  refreshBackendStatus(true);
-  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+  if (!sd_backend::mounted()) refreshBackendStatus(true);
+  if (!sd_backend::mounted()) {
     out_name = "";
     return false;
   }
   return latestLogNameForSessionLocked(session_id, out_name);
+}
+
+uint32_t highestLogSessionId() {
+  LockGuard lock(g_state_mutex);
+  if (!sd_backend::mounted()) refreshBackendStatus(true);
+  if (!sd_backend::mounted()) {
+    return 0U;
+  }
+  return highestLogSessionIdLocked();
 }
 
 bool copyLatestLogAndVerify(Stream& out) {
@@ -1303,15 +1975,15 @@ bool copyLatestLogAndVerify(Stream& out) {
   }
 
   const String dst_path = makeSiblingName(src_path, "_copy");
-  if (SD.exists(dst_path)) (void)SD.remove(dst_path);
+  if (sd_api::exists(dst_path)) (void)sd_api::remove(dst_path);
 
-  File src = SD.open(src_path, FILE_READ);
+  File src = sd_api::open(src_path);
   if (!src) {
     out.printf("AIRVERIFY ok=0 file=%s reason=open_src_failed\r\n", src_path.c_str());
     return false;
   }
 
-  File dst = SD.open(dst_path, FILE_WRITE);
+  File dst = sd_api::open(dst_path, sd_api::OpenMode::write);
   if (!dst) {
     src.close();
     out.printf("AIRVERIFY ok=0 file=%s reason=open_dst_failed\r\n", dst_path.c_str());
@@ -1330,7 +2002,7 @@ bool copyLatestLogAndVerify(Stream& out) {
   src.close();
 
   if (!ok) {
-    if (SD.exists(dst_path)) (void)SD.remove(dst_path);
+    if (sd_api::exists(dst_path)) (void)sd_api::remove(dst_path);
     out.printf("AIRVERIFY ok=0 file=%s reason=copy_failed\r\n", src_path.c_str());
     return false;
   }
@@ -1365,8 +2037,8 @@ bool compareLogs(Stream& out, const String& src_name, const String& dst_name) {
 
   const String src_path = normalizeLogPath(src_name);
   const String dst_path = normalizeLogPath(dst_name);
-  File src = SD.open(src_path, FILE_READ);
-  File dst = SD.open(dst_path, FILE_READ);
+  File src = sd_api::open(src_path);
+  File dst = sd_api::open(dst_path);
   if (!src || !dst) {
     if (src) src.close();
     if (dst) dst.close();
@@ -1603,6 +2275,453 @@ bool compareLogs(Stream& out, const String& src_name, const String& dst_name) {
     out.printf("AIRCOMPARE src_remaining=%lu\r\n", (unsigned long)src_remaining);
   }
   return ok;
+}
+
+bool compareLogsTimed(Stream& out, const String& src_name, const String& dst_name, uint16_t warmup_skip) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending || g_file) {
+    out.println("AIRCOMPARET ok=0 reason=logger_busy");
+    return false;
+  }
+
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    out.println("AIRCOMPARET ok=0 reason=backend_not_ready");
+    return false;
+  }
+
+  const String src_path = normalizeLogPath(src_name);
+  const String dst_path = normalizeLogPath(dst_name);
+  File src = sd_api::open(src_path);
+  File src_core = sd_api::open(src_path);
+  File dst = sd_api::open(dst_path);
+  if (!src || !src_core || !dst) {
+    if (src) src.close();
+    if (src_core) src_core.close();
+    if (dst) dst.close();
+    out.printf("AIRCOMPARET ok=0 reason=open_failed src=%s dst=%s\r\n", src_path.c_str(), dst_path.c_str());
+    return false;
+  }
+
+  const bool prefer_replay_input_core = preferReplayInputCoreRecords(src_core);
+  src_core.seek(0);
+
+  BinaryLogRecordV2 src_prev_record = {};
+  BinaryLogRecordV2 src_curr_record = {};
+  BinaryLogRecordV2 src_core_prev_record = {};
+  BinaryLogRecordV2 src_core_curr_record = {};
+  BinaryLogRecordV2 dst_record = {};
+  telem::TelemetryFullStateV1 src_prev_state = {};
+  telem::TelemetryFullStateV1 src_curr_state = {};
+  telem::TelemetryFullStateV1 dst_state = {};
+  CoreComparableState src_core_prev = {};
+  CoreComparableState src_core_curr = {};
+  uint32_t src_states = 0U;
+  uint32_t src_core_records = 0U;
+  uint32_t dst_states = 0U;
+
+  if (readNextStateRecord(src, src_prev_record, src_prev_state, src_states) != ReadStateResult::Ok) {
+    src.close();
+    src_core.close();
+    dst.close();
+    out.printf("AIRCOMPARET ok=0 reason=no_source_state src=%s\r\n", src_path.c_str());
+    return false;
+  }
+
+  bool have_src_curr = (readNextStateRecord(src, src_curr_record, src_curr_state, src_states) == ReadStateResult::Ok);
+  if (readNextCoreComparableRecord(src_core, prefer_replay_input_core, src_core_prev_record, src_core_prev,
+                                   src_core_records) != ReadStateResult::Ok) {
+    src.close();
+    src_core.close();
+    dst.close();
+    out.printf("AIRCOMPARET ok=0 reason=no_source_core src=%s\r\n", src_path.c_str());
+    return false;
+  }
+  bool have_src_core_curr =
+      (readNextCoreComparableRecord(src_core, prefer_replay_input_core, src_core_curr_record, src_core_curr,
+                                    src_core_records) == ReadStateResult::Ok);
+
+  for (uint16_t skipped = 0U; skipped < warmup_skip; ++skipped) {
+    if (readNextStateRecord(dst, dst_record, dst_state, dst_states) != ReadStateResult::Ok) {
+      src.close();
+      src_core.close();
+      dst.close();
+      out.printf("AIRCOMPARET ok=0 reason=no_dest_state_after_skip src=%s dst=%s warmup_skip=%u\r\n",
+                 src_path.c_str(), dst_path.c_str(), (unsigned)warmup_skip);
+      return false;
+    }
+  }
+
+  uint32_t compared = 0U;
+  uint32_t gps_mismatch = 0U;
+  uint32_t baro_mismatch = 0U;
+  uint32_t mask_mismatch = 0U;
+  uint32_t max_abs_delta_us = 0U;
+  double roll_abs_sum = 0.0;
+  double pitch_abs_sum = 0.0;
+  double yaw_abs_sum = 0.0;
+  double mag_heading_abs_sum = 0.0;
+  double accel_abs_sum[3] = {};
+  double gyro_abs_sum[3] = {};
+  float roll_abs_max = 0.0f;
+  float pitch_abs_max = 0.0f;
+  float yaw_abs_max = 0.0f;
+  float mag_heading_abs_max = 0.0f;
+  float accel_abs_max[3] = {};
+  float gyro_abs_max[3] = {};
+
+  while (readNextStateRecord(dst, dst_record, dst_state, dst_states) == ReadStateResult::Ok) {
+    while (have_src_curr && src_curr_record.t_us < dst_record.t_us) {
+      src_prev_record = src_curr_record;
+      src_prev_state = src_curr_state;
+      have_src_curr = (readNextStateRecord(src, src_curr_record, src_curr_state, src_states) == ReadStateResult::Ok);
+    }
+    while (have_src_core_curr && src_core_curr_record.t_us < dst_record.t_us) {
+      src_core_prev_record = src_core_curr_record;
+      src_core_prev = src_core_curr;
+      have_src_core_curr =
+          (readNextCoreComparableRecord(src_core, prefer_replay_input_core, src_core_curr_record, src_core_curr,
+                                        src_core_records) == ReadStateResult::Ok);
+    }
+
+    const telem::TelemetryFullStateV1* match_state = &src_prev_state;
+    const BinaryLogRecordV2* match_record = &src_prev_record;
+    if (have_src_curr) {
+      const uint32_t prev_delta = (src_prev_record.t_us > dst_record.t_us) ? (src_prev_record.t_us - dst_record.t_us)
+                                                                           : (dst_record.t_us - src_prev_record.t_us);
+      const uint32_t curr_delta = (src_curr_record.t_us > dst_record.t_us) ? (src_curr_record.t_us - dst_record.t_us)
+                                                                           : (dst_record.t_us - src_curr_record.t_us);
+      if (curr_delta < prev_delta) {
+        match_state = &src_curr_state;
+        match_record = &src_curr_record;
+      }
+    }
+    const telem::TelemetryFullStateV1* match_core_state = &src_core_prev.state;
+    const BinaryLogRecordV2* match_core_record = &src_core_prev_record;
+    if (have_src_core_curr) {
+      const uint32_t prev_delta =
+          (src_core_prev_record.t_us > dst_record.t_us) ? (src_core_prev_record.t_us - dst_record.t_us)
+                                                        : (dst_record.t_us - src_core_prev_record.t_us);
+      const uint32_t curr_delta =
+          (src_core_curr_record.t_us > dst_record.t_us) ? (src_core_curr_record.t_us - dst_record.t_us)
+                                                        : (dst_record.t_us - src_core_curr_record.t_us);
+      if (curr_delta < prev_delta) {
+        match_core_state = &src_core_curr.state;
+        match_core_record = &src_core_curr_record;
+      }
+    }
+
+    compared++;
+    const uint32_t delta_us = (match_core_record->t_us > dst_record.t_us) ? (match_core_record->t_us - dst_record.t_us)
+                                                                           : (dst_record.t_us - match_core_record->t_us);
+    if (delta_us > max_abs_delta_us) max_abs_delta_us = delta_us;
+
+    const float roll_diff = fabsf(match_state->roll_deg - dst_state.roll_deg);
+    const float pitch_diff = fabsf(match_state->pitch_deg - dst_state.pitch_deg);
+    const float yaw_diff = fabsf(wrappedAngleDiffDeg(match_state->yaw_deg, dst_state.yaw_deg));
+    const float mag_heading_diff = fabsf(wrappedAngleDiffDeg(match_state->mag_heading_deg, dst_state.mag_heading_deg));
+    const float accel_diff[3] = {
+        fabsf(match_state->accel_x_mps2 - dst_state.accel_x_mps2),
+        fabsf(match_state->accel_y_mps2 - dst_state.accel_y_mps2),
+        fabsf(match_state->accel_z_mps2 - dst_state.accel_z_mps2),
+    };
+    const float gyro_diff[3] = {
+        fabsf(match_state->gyro_x_dps - dst_state.gyro_x_dps),
+        fabsf(match_state->gyro_y_dps - dst_state.gyro_y_dps),
+        fabsf(match_state->gyro_z_dps - dst_state.gyro_z_dps),
+    };
+
+    roll_abs_sum += roll_diff;
+    pitch_abs_sum += pitch_diff;
+    yaw_abs_sum += yaw_diff;
+    mag_heading_abs_sum += mag_heading_diff;
+    if (roll_diff > roll_abs_max) roll_abs_max = roll_diff;
+    if (pitch_diff > pitch_abs_max) pitch_abs_max = pitch_diff;
+    if (yaw_diff > yaw_abs_max) yaw_abs_max = yaw_diff;
+    if (mag_heading_diff > mag_heading_abs_max) mag_heading_abs_max = mag_heading_diff;
+
+    for (uint8_t i = 0U; i < 3U; ++i) {
+      accel_abs_sum[i] += accel_diff[i];
+      gyro_abs_sum[i] += gyro_diff[i];
+      if (accel_diff[i] > accel_abs_max[i]) accel_abs_max[i] = accel_diff[i];
+      if (gyro_diff[i] > gyro_abs_max[i]) gyro_abs_max[i] = gyro_diff[i];
+    }
+
+    if (!gpsMatches(*match_core_state, dst_state)) gps_mismatch++;
+    if (!baroMatches(*match_core_state, dst_state)) baro_mismatch++;
+    if (match_core_state->raw_present_mask != dst_state.raw_present_mask) mask_mismatch++;
+  }
+
+  while (readNextStateRecord(src, src_prev_record, src_prev_state, src_states) == ReadStateResult::Ok) {}
+
+  src.close();
+  src_core.close();
+  dst.close();
+
+  if (compared == 0U) {
+    out.printf("AIRCOMPARET ok=0 reason=no_compared_states src=%s dst=%s\r\n", src_path.c_str(), dst_path.c_str());
+    return false;
+  }
+
+  const String src_short = src_path.startsWith("/logs/") ? src_path.substring(6) : src_path;
+  const String dst_short = dst_path.startsWith("/logs/") ? dst_path.substring(6) : dst_path;
+  out.printf(
+      "AIRCOMPARET src=%s dst=%s compared=%lu warmup_skip=%u src_states=%lu src_core=%lu src_core_kind=%s dst_states=%lu ts_max_delta_us=%lu gps_mismatch=%lu baro_mismatch=%lu mask_mismatch=%lu\r\n",
+      src_short.c_str(),
+      dst_short.c_str(),
+      (unsigned long)compared,
+      (unsigned)warmup_skip,
+      (unsigned long)src_states,
+      (unsigned long)src_core_records,
+      prefer_replay_input_core ? "replay_input160" : "state160",
+      (unsigned long)dst_states,
+      (unsigned long)max_abs_delta_us,
+      (unsigned long)gps_mismatch,
+      (unsigned long)baro_mismatch,
+      (unsigned long)mask_mismatch);
+  out.printf(
+      "AIRCOMPARET fusion roll_mean_abs=%.6f roll_max_abs=%.6f pitch_mean_abs=%.6f pitch_max_abs=%.6f yaw_mean_abs=%.6f yaw_max_abs=%.6f maghdg_mean_abs=%.6f maghdg_max_abs=%.6f\r\n",
+      roll_abs_sum / (double)compared,
+      (double)roll_abs_max,
+      pitch_abs_sum / (double)compared,
+      (double)pitch_abs_max,
+      yaw_abs_sum / (double)compared,
+      (double)yaw_abs_max,
+      mag_heading_abs_sum / (double)compared,
+      (double)mag_heading_abs_max);
+  out.printf(
+      "AIRCOMPARET imu accel_mean_abs=(%.6f,%.6f,%.6f) accel_max_abs=(%.6f,%.6f,%.6f) gyro_mean_abs=(%.6f,%.6f,%.6f) gyro_max_abs=(%.6f,%.6f,%.6f)\r\n",
+      accel_abs_sum[0] / (double)compared,
+      accel_abs_sum[1] / (double)compared,
+      accel_abs_sum[2] / (double)compared,
+      (double)accel_abs_max[0],
+      (double)accel_abs_max[1],
+      (double)accel_abs_max[2],
+      gyro_abs_sum[0] / (double)compared,
+      gyro_abs_sum[1] / (double)compared,
+      gyro_abs_sum[2] / (double)compared,
+      (double)gyro_abs_max[0],
+      (double)gyro_abs_max[1],
+      (double)gyro_abs_max[2]);
+  return true;
+}
+
+bool printRecordKindSummary(Stream& out, const String& log_name) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending || g_file) {
+    out.println("AIRLOGKINDS ok=0 reason=logger_busy");
+    return false;
+  }
+
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    out.println("AIRLOGKINDS ok=0 reason=backend_not_ready");
+    return false;
+  }
+
+  const String path = normalizeLogPath(log_name);
+  File file = sd_api::open(path);
+  if (!file) {
+    out.printf("AIRLOGKINDS ok=0 reason=open_failed file=%s\r\n", path.c_str());
+    return false;
+  }
+
+  BinaryLogRecordV2 record = {};
+  uint32_t total = 0U;
+  uint32_t state_count = 0U;
+  uint32_t replay_control_count = 0U;
+  uint32_t replay_input_count = 0U;
+  uint32_t unknown_count = 0U;
+
+  for (;;) {
+    const size_t got = readExact(file, (uint8_t*)&record, sizeof(record));
+    if (got == 0U) break;
+    if (got != sizeof(record) ||
+        record.magic != kLogMagic ||
+        record.version != kLogVersion ||
+        record.record_size != sizeof(record)) {
+      file.close();
+      out.printf("AIRLOGKINDS ok=0 reason=bad_record file=%s total=%lu\r\n",
+                 path.c_str(),
+                 (unsigned long)total);
+      return false;
+    }
+
+    total++;
+    switch ((telem::LogRecordKind)record.record_kind) {
+      case telem::LogRecordKind::State160:
+        state_count++;
+        break;
+      case telem::LogRecordKind::ReplayControl160:
+        replay_control_count++;
+        break;
+      case telem::LogRecordKind::ReplayInput160:
+        replay_input_count++;
+        break;
+      default:
+        unknown_count++;
+        break;
+    }
+  }
+
+  file.close();
+  out.printf(
+      "AIRLOGKINDS ok=1 file=%s total=%lu state160=%lu replay_control160=%lu replay_input160=%lu unknown=%lu\r\n",
+      path.c_str(),
+      (unsigned long)total,
+      (unsigned long)state_count,
+      (unsigned long)replay_control_count,
+      (unsigned long)replay_input_count,
+      (unsigned long)unknown_count);
+  return true;
+}
+
+bool printFusionSettingsSummary(Stream& out, const String& log_name) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending || g_file) {
+    out.println("AIRLOGFUSION ok=0 reason=logger_busy");
+    return false;
+  }
+
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    out.println("AIRLOGFUSION ok=0 reason=backend_not_ready");
+    return false;
+  }
+
+  const String path = normalizeLogPath(log_name);
+  File file = sd_api::open(path);
+  if (!file) {
+    out.printf("AIRLOGFUSION ok=0 reason=open_failed file=%s\r\n", path.c_str());
+    return false;
+  }
+
+  BinaryLogRecordV2 record = {};
+  telem::TelemetryFullStateV1 state = {};
+  uint32_t state_count = 0U;
+  if (readNextStateRecord(file, record, state, state_count) != ReadStateResult::Ok) {
+    file.close();
+    out.printf("AIRLOGFUSION ok=0 reason=no_state file=%s\r\n", path.c_str());
+    return false;
+  }
+
+  const float first_gain = state.fusion_gain;
+  const float first_acc = state.fusion_accel_rej;
+  const float first_mag = state.fusion_mag_rej;
+  const uint16_t first_rec = state.fusion_recovery_period;
+  float last_gain = first_gain;
+  float last_acc = first_acc;
+  float last_mag = first_mag;
+  uint16_t last_rec = first_rec;
+  uint32_t changed = 0U;
+  uint32_t match = 1U;
+
+  while (readNextStateRecord(file, record, state, state_count) == ReadStateResult::Ok) {
+    last_gain = state.fusion_gain;
+    last_acc = state.fusion_accel_rej;
+    last_mag = state.fusion_mag_rej;
+    last_rec = state.fusion_recovery_period;
+    const bool same =
+        floatNear(state.fusion_gain, first_gain, 0.0005f) &&
+        floatNear(state.fusion_accel_rej, first_acc, 0.005f) &&
+        floatNear(state.fusion_mag_rej, first_mag, 0.005f) &&
+        state.fusion_recovery_period == first_rec;
+    if (same) {
+      match++;
+    } else {
+      changed++;
+    }
+  }
+
+  file.close();
+  const String short_name = path.startsWith("/logs/") ? path.substring(6) : path;
+  out.printf(
+      "AIRLOGFUSION file=%s states=%lu first=(%.3f,%.2f,%.2f,%u) last=(%.3f,%.2f,%.2f,%u) match_first=%lu changed=%lu ok=1\r\n",
+      short_name.c_str(),
+      (unsigned long)state_count,
+      (double)first_gain,
+      (double)first_acc,
+      (double)first_mag,
+      (unsigned)first_rec,
+      (double)last_gain,
+      (double)last_acc,
+      (double)last_mag,
+      (unsigned)last_rec,
+      (unsigned long)match,
+      (unsigned long)changed);
+  return true;
+}
+
+bool printFusionFlagSummary(Stream& out, const String& log_name) {
+  LockGuard lock(g_state_mutex);
+  if (g_recorder.active || g_close_pending || g_file) {
+    out.println("AIRLOGFLAGS ok=0 reason=logger_busy");
+    return false;
+  }
+
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    out.println("AIRLOGFLAGS ok=0 reason=backend_not_ready");
+    return false;
+  }
+
+  const String path = normalizeLogPath(log_name);
+  File file = sd_api::open(path);
+  if (!file) {
+    out.printf("AIRLOGFLAGS ok=0 reason=open_failed file=%s\r\n", path.c_str());
+    return false;
+  }
+
+  BinaryLogRecordV2 record = {};
+  telem::TelemetryFullStateV1 state = {};
+  uint32_t state_count = 0U;
+  uint32_t accel_ignored = 0U;
+  uint32_t mag_ignored = 0U;
+  uint32_t accel_error_flag = 0U;
+  uint32_t mag_error_flag = 0U;
+  uint32_t mag_recovery = 0U;
+  uint32_t accel_recovery = 0U;
+  double accel_error_sum = 0.0;
+  double mag_error_sum = 0.0;
+  float accel_error_max = 0.0f;
+  float mag_error_max = 0.0f;
+
+  while (readNextStateRecord(file, record, state, state_count) == ReadStateResult::Ok) {
+    const FusionReplayDiagDecoded diag = decodeFusionReplayDiag(state);
+    accel_error_sum += diag.accel_error_deg;
+    mag_error_sum += diag.mag_error_deg;
+    if (diag.accel_error_deg > accel_error_max) accel_error_max = diag.accel_error_deg;
+    if (diag.mag_error_deg > mag_error_max) mag_error_max = diag.mag_error_deg;
+    if ((state.flags & telem::kStateFlagFusionAccelerometerIgnored) != 0U) accel_ignored++;
+    if ((state.flags & telem::kStateFlagFusionMagnetometerIgnored) != 0U) mag_ignored++;
+    if ((state.flags & telem::kStateFlagFusionAccelerationError) != 0U) accel_error_flag++;
+    if ((state.flags & telem::kStateFlagFusionMagneticError) != 0U) mag_error_flag++;
+    if ((state.flags & telem::kStateFlagFusionAccelerationRecovery) != 0U) accel_recovery++;
+    if ((state.flags & telem::kStateFlagFusionMagneticRecovery) != 0U) mag_recovery++;
+  }
+
+  file.close();
+  if (state_count == 0U) {
+    out.printf("AIRLOGFLAGS ok=0 reason=no_state file=%s\r\n", path.c_str());
+    return false;
+  }
+
+  const String short_name = path.startsWith("/logs/") ? path.substring(6) : path;
+  out.printf(
+      "AIRLOGFLAGS file=%s states=%lu accel_ignored=%lu mag_ignored=%lu accel_error_flag=%lu mag_error_flag=%lu accel_recovery=%lu mag_recovery=%lu accel_error_mean=%.6f accel_error_max=%.6f mag_error_mean=%.6f mag_error_max=%.6f ok=1\r\n",
+      short_name.c_str(),
+      (unsigned long)state_count,
+      (unsigned long)accel_ignored,
+      (unsigned long)mag_ignored,
+      (unsigned long)accel_error_flag,
+      (unsigned long)mag_error_flag,
+      (unsigned long)accel_recovery,
+      (unsigned long)mag_recovery,
+      accel_error_sum / (double)state_count,
+      (double)accel_error_max,
+      mag_error_sum / (double)state_count,
+      (double)mag_error_max);
+  return true;
 }
 
 }  // namespace log_store

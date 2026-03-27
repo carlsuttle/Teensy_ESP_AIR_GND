@@ -13,6 +13,7 @@
 
 static float accelLsbPerG(uint8_t range);
 static float gyroLsbPerDps(uint8_t range);
+static int16_t parseAxis16(const uint8_t* data);
 
 BMI2_BMM1_Class::BMI2_BMM1_Class(TwoWire& wire)
 {
@@ -128,6 +129,10 @@ static float gyroLsbPerDps(uint8_t range) {
     case BMI2_GYR_RANGE_125:  return 262.144f;
     default:                  return 16.384f;
   }
+}
+
+static int16_t parseAxis16(const uint8_t* data) {
+  return (int16_t)(((uint16_t)data[1] << 8) | (uint16_t)data[0]);
 }
 
 void BMI2_BMM1_Class::delay_usec(uint32_t period_us, void *intf_ptr)
@@ -516,33 +521,66 @@ bool BMI2_BMM1_Class::setGyroConfig(uint8_t odr, uint8_t range, uint8_t bwp, uin
 }
 
 int BMI2_BMM1_Class::readGyroAccel(imu_data_t & imu_sensor_data, bool raw){ // Results are in G (earth gravity). // Results are in degrees/second.
-struct bmi2_sens_data sensor_data = { { 0 } };
+  const float acc_lsb_per_g = _acc_lsb_per_g;
+  const float gyr_lsb_per_dps = _gyr_lsb_per_dps;
 
-    int res = bmi2_get_sensor_data(&sensor_data, &bmi2);
-    const float acc_lsb_per_g = _acc_lsb_per_g;
-    const float gyr_lsb_per_dps = _gyr_lsb_per_dps;
+  if (raw) {
+    // Fast path for the fusion loop: read only the contiguous accel+gyro output
+    // registers and skip the generic Bosch helper's extra PWR_CTRL/AUX/sensortime
+    // transactions.
+    uint8_t data[BMI2_ACC_GYR_NUM_BYTES] = { 0 };
+    const int8_t res = bmi2_get_regs(BMI2_ACC_X_LSB_ADDR, data, BMI2_ACC_GYR_NUM_BYTES, &bmi2);
+    if (res != BMI2_OK) {
+      return res;
+    }
 
-   if(raw == false){
-   imu_sensor_data.acc.x = sensor_data.acc.x * 9.80665f / acc_lsb_per_g;
-    imu_sensor_data.acc.y  = sensor_data.acc.y * 9.80665f / acc_lsb_per_g;
-    imu_sensor_data.acc.z  = sensor_data.acc.z * 9.80665f / acc_lsb_per_g;
-    
-     imu_sensor_data.gyr.x  = sensor_data.gyr.x / gyr_lsb_per_dps;
-    imu_sensor_data.gyr.y = sensor_data.gyr.y / gyr_lsb_per_dps;
-    imu_sensor_data.gyr.z = sensor_data.gyr.z / gyr_lsb_per_dps;
-}
-else // raw true
-{
-    imu_sensor_data.acc.x = sensor_data.acc.x;
-    imu_sensor_data.acc.y  = sensor_data.acc.y;
-    imu_sensor_data.acc.z  = sensor_data.acc.z;
-    
-    imu_sensor_data.gyr.x  = sensor_data.gyr.x;
-    imu_sensor_data.gyr.y = sensor_data.gyr.y;
-    imu_sensor_data.gyr.z = sensor_data.gyr.z;
-}
+    imu_sensor_data.acc.x = parseAxis16(&data[0]);
+    imu_sensor_data.acc.y = parseAxis16(&data[2]);
+    imu_sensor_data.acc.z = parseAxis16(&data[4]);
+    imu_sensor_data.gyr.x = parseAxis16(&data[6]);
+    imu_sensor_data.gyr.y = parseAxis16(&data[8]);
+    imu_sensor_data.gyr.z = parseAxis16(&data[10]);
     return res;
-    
+  }
+
+  struct bmi2_sens_data sensor_data = { { 0 } };
+  const int res = bmi2_get_sensor_data(&sensor_data, &bmi2);
+
+  imu_sensor_data.acc.x = sensor_data.acc.x * 9.80665f / acc_lsb_per_g;
+  imu_sensor_data.acc.y = sensor_data.acc.y * 9.80665f / acc_lsb_per_g;
+  imu_sensor_data.acc.z = sensor_data.acc.z * 9.80665f / acc_lsb_per_g;
+
+  imu_sensor_data.gyr.x = sensor_data.gyr.x / gyr_lsb_per_dps;
+  imu_sensor_data.gyr.y = sensor_data.gyr.y / gyr_lsb_per_dps;
+  imu_sensor_data.gyr.z = sensor_data.gyr.z / gyr_lsb_per_dps;
+
+  return res;
+}
+
+int BMI2_BMM1_Class::readAccelerationRaw(int16_t& x, int16_t& y, int16_t& z) {
+  uint8_t data[BMI2_ACC_NUM_BYTES] = { 0 };
+  const int8_t res = bmi2_get_regs(BMI2_ACC_X_LSB_ADDR, data, BMI2_ACC_NUM_BYTES, &bmi2);
+  if (res != BMI2_OK) {
+    return res;
+  }
+
+  x = parseAxis16(&data[0]);
+  y = parseAxis16(&data[2]);
+  z = parseAxis16(&data[4]);
+  return res;
+}
+
+int BMI2_BMM1_Class::readGyroscopeRaw(int16_t& x, int16_t& y, int16_t& z) {
+  uint8_t data[BMI2_GYR_NUM_BYTES] = { 0 };
+  const int8_t res = bmi2_get_regs(BMI2_GYR_X_LSB_ADDR, data, BMI2_GYR_NUM_BYTES, &bmi2);
+  if (res != BMI2_OK) {
+    return res;
+  }
+
+  x = parseAxis16(&data[0]);
+  y = parseAxis16(&data[2]);
+  z = parseAxis16(&data[4]);
+  return res;
 }
 
 int BMI2_BMM1_Class::readAcceleration(float& x, float& y, float& z){ // Results are in G (earth gravity). // Results are in degrees/second.

@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <SD.h>
 #include <WiFi.h>
 #include <ctype.h>
 #include <esp_wifi.h>
@@ -7,9 +6,9 @@
 
 #include "config_store.h"
 #include "log_store.h"
+#include "sd_backend.h"
 #include "sd_capture_test.h"
-#include "sd_card_test.h"
-#include "uart_telem.h"
+#include "teensy_link.h"
 #include "radio_link.h"
 #include "spi_bridge.h"
 #include "replay_bridge.h"
@@ -26,6 +25,9 @@ uint32_t g_last_printed_ack_seq = 0;
 uint32_t g_last_stream_rate_tx_ms = 0;
 uint16_t g_last_stream_rate_ui_hz = 0;
 uint16_t g_last_stream_rate_log_hz = 0;
+uint32_t g_last_capture_rate_tx_ms = 0;
+uint16_t g_last_capture_rate_hz = 0;
+bool g_quiet_serial = false;
 bool g_radio_ready = false;
 bool g_link_ready = false;
 bool g_link_wait_printed = false;
@@ -35,6 +37,11 @@ bool g_gpio_pulse_active = false;
 uint8_t g_gpio_pulse_pin = 0U;
 uint32_t g_gpio_pulse_until_ms = 0U;
 bool g_sd_capture_was_active = false;
+bool g_sd_soak_active = false;
+uint16_t g_sd_soak_rate_hz = 0U;
+uint32_t g_sd_soak_seq = 0U;
+uint32_t g_sd_soak_period_us = 0U;
+uint32_t g_sd_soak_next_us = 0U;
 bool g_baseline_active = false;
 bool g_baseline_completed = false;
 uint32_t g_baseline_duration_ms = 0U;
@@ -47,6 +54,34 @@ struct ReplayCaptureRun {
   uint32_t session_id = 0U;
   uint32_t started_ms = 0U;
 } g_replay_capture = {};
+struct ReplayCompareRun {
+  bool active = false;
+  uint8_t base_factor = 1U;
+  uint8_t completed_runs = 0U;
+  uint32_t last_completion_ms = 0U;
+  uint32_t sessions[2] = {};
+  bool ok[2] = {};
+  uint32_t written[2] = {};
+  uint32_t dropped[2] = {};
+  uint16_t capture_rate_hz[2] = {};
+  String source_name;
+  String outputs[2];
+} g_replay_compare = {};
+enum class BenchSweepPhase : uint8_t {
+  Idle = 0,
+  WaitApply,
+  Logging,
+  WaitLogStop,
+};
+struct BenchSweepRun {
+  bool active = false;
+  uint32_t duration_ms = 0U;
+  uint8_t rate_index = 0U;
+  uint16_t current_rate_hz = 0U;
+  uint32_t session_id = 0U;
+  uint32_t phase_started_ms = 0U;
+  BenchSweepPhase phase = BenchSweepPhase::Idle;
+} g_bench_sweep = {};
 uint32_t g_last_radio_tx_packets = 0U;
 uint32_t g_last_radio_rx_packets = 0U;
 uint32_t g_last_source_seq_seen = 0U;
@@ -57,10 +92,15 @@ constexpr bool kEnableAirFileLogging = true;
 constexpr size_t kStateTxReserveSlots = 4U;
 constexpr uint32_t kRadioProgressTimeoutMs = 6000U;
 constexpr uint32_t kRadioRecoveryCooldownMs = 10000U;
+constexpr bool kEnableRadioWatchdogRestart = false;
+constexpr uint16_t kBenchCaptureRatesHz[] = {50U, 100U, 200U, 400U, 800U, 1600U};
+constexpr uint16_t kReplaySourceProfilesHz[] = {25U, 50U, 100U, 200U, 400U, 800U, 1600U};
+constexpr uint32_t kBenchApplySettleMs = 1000U;
+constexpr uint32_t kReplayCompareSettleMs = 1000U;
 
 struct CaptureBenchBaseline {
   radio_link::Stats radio = {};
-  uart_telem::RxStats uart = {};
+  teensy_link::RxStats teensy = {};
   uint32_t started_ms = 0U;
 };
 
@@ -70,12 +110,34 @@ void beginWifiStation();
 void restartWifiStation();
 void beginSdCaptureBenchmark(uint32_t duration_ms);
 void printSdCaptureImpactReport();
+bool beginSdSoakBenchmark(uint32_t duration_ms, uint16_t rate_hz);
+void stopSdSoakBenchmark();
+void serviceSdSoakBenchmark();
 void beginBaselineBenchmark(uint32_t duration_ms);
 void stopBaselineBenchmark();
 void printBaselineImpactReport();
 void printAirLogStatus();
 bool beginReplayCapture(const String* source_override = nullptr);
 void serviceReplayCapture();
+bool beginReplayCompare(uint8_t base_factor, const String* source_override = nullptr);
+void serviceReplayCompare();
+bool isStandaloneBench();
+bool sendConfiguredCaptureRateNow();
+void ensureConfiguredCaptureRate();
+bool setCaptureRateHz(uint16_t hz, bool persist_config);
+bool saveCaptureRateDefaults();
+bool beginBenchSweep(uint32_t duration_ms);
+void serviceBenchSweep();
+void printSdApiStatus(const char* tag = "SDSTATE");
+bool waitForLogStoreIdle(uint32_t timeout_ms);
+bool writeSdApiTestLog();
+uint16_t replayCaptureRateForFactor(uint8_t average_factor);
+bool getActiveFusionSettings(telem::CmdSetFusionSettingsV1& cmd);
+bool applyReplayRunControls(uint8_t average_factor, uint16_t* applied_capture_hz = nullptr);
+
+bool serialNoiseEnabled() {
+  return !g_quiet_serial;
+}
 
 String shortLogName(const String& path) {
   return path.startsWith("/logs/") ? path.substring(6) : path;
@@ -85,6 +147,10 @@ uint32_t nextConsoleLogSessionId() {
   g_console_log_session_id++;
   if (g_console_log_session_id == 0U) g_console_log_session_id = 1U;
   return g_console_log_session_id;
+}
+
+bool isStandaloneBench() {
+  return config_store::get().standalone_bench != 0U;
 }
 
 void stopGpioPulse() {
@@ -127,6 +193,7 @@ void resetWifiStatusFlags() {
 }
 
 void ensureConfiguredStreamRate() {
+  if (isStandaloneBench()) return;
   const AppConfig& cfg = config_store::get();
   const uint16_t target_stream_hz = cfg.source_rate_hz;
   const uint16_t target_log_hz = cfg.log_rate_hz;
@@ -139,7 +206,7 @@ void ensureConfiguredStreamRate() {
   telem::CmdSetStreamRateV1 cmd = {};
   cmd.ws_rate_hz = target_stream_hz;
   cmd.log_rate_hz = target_log_hz;
-  if (!uart_telem::sendSetStreamRate(cmd)) return;
+  if (!teensy_link::sendSetStreamRate(cmd)) return;
 
   g_last_stream_rate_ui_hz = target_stream_hz;
   g_last_stream_rate_log_hz = target_log_hz;
@@ -147,12 +214,30 @@ void ensureConfiguredStreamRate() {
   g_wait_stream_rate_ack = true;
 }
 
+void ensureConfiguredCaptureRate() {
+  if (!isStandaloneBench()) return;
+  if (log_store::active()) return;
+  const AppConfig& cfg = config_store::get();
+  const uint16_t target_hz = cfg.source_rate_hz;
+  const bool targetChanged = target_hz != g_last_capture_rate_hz;
+  const uint32_t now = millis();
+  if (!targetChanged && (uint32_t)(now - g_last_capture_rate_tx_ms) < 1000U) return;
+
+  telem::CmdSetCaptureSettingsV1 cmd = {};
+  cmd.source_rate_hz = target_hz;
+  if (!teensy_link::sendSetCaptureSettings(cmd)) return;
+
+  g_last_capture_rate_hz = target_hz;
+  g_last_capture_rate_tx_ms = now;
+}
+
 bool sendConfiguredStreamRateNow() {
+  if (isStandaloneBench()) return sendConfiguredCaptureRateNow();
   const AppConfig& cfg = config_store::get();
   telem::CmdSetStreamRateV1 cmd = {};
   cmd.ws_rate_hz = cfg.source_rate_hz;
   cmd.log_rate_hz = cfg.log_rate_hz;
-  const bool ok = uart_telem::sendSetStreamRate(cmd);
+  const bool ok = teensy_link::sendSetStreamRate(cmd);
   if (ok) {
     g_last_stream_rate_ui_hz = cmd.ws_rate_hz;
     g_last_stream_rate_log_hz = cmd.log_rate_hz;
@@ -162,20 +247,105 @@ bool sendConfiguredStreamRateNow() {
   return ok;
 }
 
+bool sendConfiguredCaptureRateNow() {
+  const AppConfig& cfg = config_store::get();
+  telem::CmdSetCaptureSettingsV1 cmd = {};
+  cmd.source_rate_hz = cfg.source_rate_hz;
+  const bool ok = teensy_link::sendSetCaptureSettings(cmd);
+  if (ok) {
+    g_last_capture_rate_hz = cmd.source_rate_hz;
+    g_last_capture_rate_tx_ms = millis();
+  }
+  return ok;
+}
+
+bool setCaptureRateHz(uint16_t hz, bool persist_config) {
+  AppConfig cfg = config_store::get();
+  cfg.source_rate_hz = hz;
+  if (persist_config) {
+    config_store::update(cfg);
+  }
+  const bool ok = teensy_link::sendSetCaptureSettings(telem::CmdSetCaptureSettingsV1{hz, 0U});
+  if (ok) {
+    g_last_capture_rate_hz = hz;
+    g_last_capture_rate_tx_ms = millis();
+  }
+  return ok;
+}
+
+bool saveCaptureRateDefaults() {
+  return teensy_link::sendSaveCaptureSettings();
+}
+
+uint16_t replayCaptureRateForFactor(uint8_t average_factor) {
+  const uint8_t divisor = average_factor ? average_factor : 1U;
+  // Replay ladder tests are intended to exercise the Teensy's tested source-rate
+  // profiles, not whatever live AIR config happened to be active before replay.
+  const uint32_t target_hz = 1600U / (uint32_t)divisor;
+  uint16_t selected_hz = kReplaySourceProfilesHz[0];
+  for (uint16_t hz : kReplaySourceProfilesHz) {
+    if ((uint32_t)hz > target_hz) break;
+    selected_hz = hz;
+  }
+  return selected_hz;
+}
+
+bool getActiveFusionSettings(telem::CmdSetFusionSettingsV1& cmd) {
+  const auto snap = teensy_link::snapshot();
+  if (snap.has_fusion_settings) {
+    cmd.gain = snap.fusion_settings.gain;
+    cmd.accelerationRejection = snap.fusion_settings.accelerationRejection;
+    cmd.magneticRejection = snap.fusion_settings.magneticRejection;
+    cmd.recoveryTriggerPeriod = snap.fusion_settings.recoveryTriggerPeriod;
+    cmd.reserved = 0U;
+    return true;
+  }
+  if (snap.has_state) {
+    cmd.gain = snap.state.fusion_gain;
+    cmd.accelerationRejection = snap.state.fusion_accel_rej;
+    cmd.magneticRejection = snap.state.fusion_mag_rej;
+    cmd.recoveryTriggerPeriod = snap.state.fusion_recovery_period;
+    cmd.reserved = 0U;
+    return true;
+  }
+  cmd = {};
+  return false;
+}
+
+bool applyReplayRunControls(uint8_t average_factor, uint16_t* applied_capture_hz) {
+  const uint16_t capture_hz = replayCaptureRateForFactor(average_factor);
+  const bool cap_ok = teensy_link::sendSetCaptureSettings(telem::CmdSetCaptureSettingsV1{capture_hz, 0U});
+  if (cap_ok) {
+    g_last_capture_rate_hz = capture_hz;
+    g_last_capture_rate_tx_ms = millis();
+  }
+
+  telem::CmdSetFusionSettingsV1 fusion = {};
+  bool fusion_ok = true;
+  if (getActiveFusionSettings(fusion)) {
+    fusion_ok = teensy_link::sendSetFusionSettings(fusion);
+  }
+
+  if (applied_capture_hz) *applied_capture_hz = capture_hz;
+  return cap_ok && fusion_ok;
+}
+
 void printConsoleHelp() {
   Serial.println("AIR COMMANDS:");
   Serial.println("  help / h      - show command list");
   Serial.println("  getfusion     - send CMD_GET_FUSION_SETTINGS to Teensy");
   Serial.println("  kickteensy    - resend current stream-rate command to Teensy");
   Serial.println("  resendrate    - same as kickteensy");
-  Serial.println("  sdprobe       - probe microSD card over SPI and print init/mount status");
-  Serial.println("  sdwrite       - run tiny binary create/write/delete test on microSD");
-  Serial.println("  base1m        - run 60-second radio/UART baseline with no SD capture");
+  Serial.println("  sdprobe       - probe SD API/backend and print current state");
+  Serial.println("  sdmount       - mount the SD card backend");
+  Serial.println("  sdeject       - eject the SD card backend when idle");
+  Serial.println("  sdstate       - print SD mount and backend state");
+  Serial.println("  sdwrite       - write one small managed test log through the SD API");
+  Serial.println("  sdrename a b  - rename one managed file through the SD API");
+  Serial.println("  sddelete <f>  - delete one managed file through the SD API");
+  Serial.println("  base1m        - run 60-second radio/Teensy-link baseline with no SD capture");
   Serial.println("  basestop      - stop active baseline run");
   Serial.println("  basestat      - print baseline status");
-  Serial.println("  sdcap1m       - capture every Teensy state to one SD binary file for 60 seconds");
-  Serial.println("  sdcapstop     - stop active SD capture benchmark");
-  Serial.println("  sdcapstat     - print SD capture benchmark status");
   Serial.println("  logstart      - start real AIR SD logging session");
   Serial.println("  logstartid <n> - start real AIR SD logging with an explicit session id");
   Serial.println("  logstop       - stop real AIR SD logging session");
@@ -183,14 +353,29 @@ void printConsoleHelp() {
   Serial.println("  latestlog     - print latest .tlog on SD");
   Serial.println("  largestlog    - print largest .tlog on SD");
   Serial.println("  latestlogsession <n> - print latest .tlog for a given session id");
+  Serial.println("  logfiles [name|size|date] [asc|desc] - print sorted managed file list");
+  Serial.println("  logprefix [prefix] - show or set the auto-record file prefix");
+  Serial.println("  csvfile <name.tlog> - convert a single binary log to CSV");
   Serial.println("  verifylog     - copy latest .tlog to *_copy.tlog and verify byte-exact match");
   Serial.println("  expandlogs    - expand every .tlog on SD into a sibling .csv file");
   Serial.println("  comparelogs a b - compare two .tlog files, ignoring fusion outputs");
+  Serial.println("  comparetimed a b [skip] - compare two .tlog files by nearest timestamp");
+  Serial.println("  logkinds <name> - count state/control/input record kinds in a .tlog");
+  Serial.println("  logfusion <name> - print fusion settings seen in a replay/log file");
+  Serial.println("  logflags <name> - print fusion flag/error counts seen in a replay/log file");
   Serial.println("  replaycapture - replay latest .tlog into Teensy while logging returned state");
   Serial.println("  replaycapfile <name> - replay a specific .tlog into Teensy while logging returned state");
   Serial.println("  replayfile <name> - replay a specific .tlog into Teensy without rerecording");
   Serial.println("  replaylargest - replay the largest .tlog into Teensy without rerecording");
   Serial.println("  replaycapstat - print replay-capture progress");
+  Serial.println("  replayavg <n> - average N replay samples into one replay input");
+  Serial.println("  replayavgstat - print current replay averaging factor");
+  Serial.println("  replaycmp <n> - replay latest .tlog twice, with N then N+1 averaging");
+  Serial.println("  replaycmpfile <n> <name> - same compare run for a specific .tlog");
+  Serial.println("  setcap <hz>   - set Teensy live capture/source rate over SPI/DMA");
+  Serial.println("  savecap       - save current Teensy capture settings to EEPROM");
+  Serial.println("  bench on/off/status - control standalone SPI/DMA bench mode");
+  Serial.println("  benchauto [ms] - log all supported capture rates automatically");
   Serial.println("  setpin <gpio> - drive a GPIO high for 5 seconds, then return it low");
   Serial.println("  tx1           - send current state once to GND");
   Serial.println("  linkclear     - clear AIR radio-link state and stop ESP-NOW");
@@ -200,18 +385,21 @@ void printConsoleHelp() {
   Serial.println("  relink        - restart AIR radio-link");
   Serial.println("  resetnet      - restart AIR Wi-Fi/ESP-NOW side");
   Serial.println("  setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
+  Serial.println("  quiet on/off/status - stop or resume unsolicited serial chatter");
   Serial.println("  stats         - start 1Hz STAT stream");
   Serial.println("  x             - stop active stream/mode");
 }
 
-void printStats(const uart_telem::Snapshot& snap) {
+void printStats(const teensy_link::Snapshot& snap) {
   const auto link = radio_link::stats();
   const auto cap = sd_capture_test::stats();
   const auto spi = spi_bridge::stats();
   Serial.printf(
       "STAT unit=AIR seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
-      "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu "
-      "link_tx=%lu link_rx=%lu link_drop=%lu spi_txn=%lu spi_fail=%lu spi_state=%lu spi_replay=%lu spi_crc=%lu spi_type=%lu spi_rxof=%lu spi_txof=%lu spi_hdr=%08lX/%u/%u/%u sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
+      "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu poll_ms=%lu poll_gap_max=%lu poll_runs=%lu state_drain=%lu raw_drain=%lu "
+      "link_tx=%lu link_rx=%lu link_drop=%lu link_state_tx=%lu link_unified_tx=%lu src_seen=%lu src_seen_seq=%lu src_seen_t_us=%lu src_seen_rx_ms=%lu "
+      "pub_try=%lu pub_ok=%lu pub_skip_ns=%lu pub_skip_np=%lu pub_skip_rate=%lu pub_skip_old=%lu link_last_seq=%lu link_last_t_us=%lu link_last_tx_ms=%lu pub_try_ms=%lu pub_age_ms=%lu "
+      "spi_txn=%lu spi_fail=%lu spi_state=%lu spi_last_ms=%lu spi_replay=%lu spi_crc=%lu spi_type=%lu spi_rxof=%lu spi_txof=%lu spi_hdr=%08lX/%u/%u/%u sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -226,12 +414,35 @@ void printStats(const uart_telem::Snapshot& snap) {
       (unsigned long)snap.stats.len_err,
       (unsigned long)snap.stats.unknown_msg,
       (unsigned long)snap.stats.drop,
+      (unsigned long)snap.stats.last_poll_ms,
+      (unsigned long)snap.stats.max_poll_gap_ms,
+      (unsigned long)snap.stats.poll_runs,
+      (unsigned long)snap.stats.state_records_drained,
+      (unsigned long)snap.stats.raw_records_drained,
       (unsigned long)link.tx_packets,
       (unsigned long)link.rx_packets,
       (unsigned long)link.tx_drop,
+      (unsigned long)link.tx_state_packets,
+      (unsigned long)link.tx_unified_packets,
+      (unsigned long)link.source_snapshots_seen,
+      (unsigned long)link.latest_source_seq_seen,
+      (unsigned long)link.latest_source_t_us_seen,
+      (unsigned long)link.latest_source_rx_ms_seen,
+      (unsigned long)link.publish_attempts,
+      (unsigned long)link.publish_ok,
+      (unsigned long)link.publish_skip_no_state,
+      (unsigned long)link.publish_skip_no_peer,
+      (unsigned long)link.publish_skip_rate,
+      (unsigned long)link.publish_skip_not_new,
+      (unsigned long)link.last_source_seq,
+      (unsigned long)link.last_source_t_us,
+      (unsigned long)link.last_tx_ms,
+      (unsigned long)link.last_publish_attempt_ms,
+      (unsigned long)link.last_publish_age_ms,
       (unsigned long)spi.transactions_completed,
       (unsigned long)spi.transaction_failures,
       (unsigned long)spi.state_records_received,
+      (unsigned long)spi.last_state_rx_ms,
       (unsigned long)spi.replay_records_sent,
       (unsigned long)spi.rx_crc_errors,
       (unsigned long)spi.rx_type_errors,
@@ -247,10 +458,11 @@ void printStats(const uart_telem::Snapshot& snap) {
 }
 
 void beginSdCaptureBenchmark(uint32_t duration_ms) {
+  stopSdSoakBenchmark();
   stopBaselineBenchmark();
-  const auto snap = uart_telem::snapshot();
+  const auto snap = teensy_link::snapshot();
   g_sd_capture_baseline.radio = radio_link::stats();
-  g_sd_capture_baseline.uart = snap.stats;
+  g_sd_capture_baseline.teensy = snap.stats;
   g_sd_capture_baseline.started_ms = millis();
   sd_capture_test::clearCompleted();
   const bool ok = sd_capture_test::start(duration_ms);
@@ -265,12 +477,62 @@ void beginSdCaptureBenchmark(uint32_t duration_ms) {
   }
 }
 
+bool beginSdSoakBenchmark(uint32_t duration_ms, uint16_t rate_hz) {
+  if (rate_hz == 0U) rate_hz = 400U;
+  if (rate_hz > 5000U) rate_hz = 5000U;
+  beginSdCaptureBenchmark(duration_ms);
+  const auto cap = sd_capture_test::stats();
+  if (!cap.active) return false;
+  g_sd_soak_active = true;
+  g_sd_soak_rate_hz = rate_hz;
+  g_sd_soak_seq = 0U;
+  g_sd_soak_period_us = 1000000UL / rate_hz;
+  if (g_sd_soak_period_us == 0U) g_sd_soak_period_us = 1U;
+  g_sd_soak_next_us = micros();
+  Serial.printf("SDSOAK START ok=1 duration_ms=%lu rate_hz=%u period_us=%lu\r\n",
+                (unsigned long)duration_ms,
+                (unsigned)g_sd_soak_rate_hz,
+                (unsigned long)g_sd_soak_period_us);
+  return true;
+}
+
+void stopSdSoakBenchmark() {
+  g_sd_soak_active = false;
+  g_sd_soak_rate_hz = 0U;
+  g_sd_soak_period_us = 0U;
+}
+
+void serviceSdSoakBenchmark() {
+  if (!g_sd_soak_active) return;
+  const auto cap = sd_capture_test::stats();
+  if (!cap.active) {
+    stopSdSoakBenchmark();
+    return;
+  }
+
+  telem::TelemetryFullStateV1 state = {};
+  const uint32_t now_us = micros();
+  uint8_t generated = 0U;
+  while ((int32_t)(now_us - g_sd_soak_next_us) >= 0 && generated < 32U) {
+    const uint32_t sample_t_us = g_sd_soak_next_us;
+    state.last_imu_ms = sample_t_us / 1000U;
+    state.flags = telem::kStateFlagFusionInitialising;
+    sd_capture_test::enqueueState(g_sd_soak_seq++, sample_t_us, state);
+    g_sd_soak_next_us += g_sd_soak_period_us;
+    generated++;
+  }
+  if (generated == 32U && (int32_t)(now_us - g_sd_soak_next_us) >= 0) {
+    g_sd_soak_next_us = now_us + g_sd_soak_period_us;
+  }
+}
+
 void beginBaselineBenchmark(uint32_t duration_ms) {
   sd_capture_test::stop(false);
+  stopSdSoakBenchmark();
   g_sd_capture_was_active = false;
-  const auto snap = uart_telem::snapshot();
+  const auto snap = teensy_link::snapshot();
   g_sd_capture_baseline.radio = radio_link::stats();
-  g_sd_capture_baseline.uart = snap.stats;
+  g_sd_capture_baseline.teensy = snap.stats;
   g_sd_capture_baseline.started_ms = millis();
   g_baseline_active = true;
   g_baseline_completed = false;
@@ -289,7 +551,7 @@ void stopBaselineBenchmark() {
 
 void printBaselineImpactReport() {
   const auto radio_now = radio_link::stats();
-  const auto snap = uart_telem::snapshot();
+  const auto snap = teensy_link::snapshot();
   const uint32_t elapsed_ms =
       (g_baseline_stopped_ms >= g_sd_capture_baseline.started_ms)
           ? (g_baseline_stopped_ms - g_sd_capture_baseline.started_ms)
@@ -298,22 +560,22 @@ void printBaselineImpactReport() {
                 (unsigned long)elapsed_ms,
                 (unsigned long)g_baseline_duration_ms);
   Serial.printf(
-      "BASELINE IMPACT radio_tx=%lu radio_rx=%lu radio_drop=%lu uart_ok=%lu uart_crc=%lu uart_cobs=%lu uart_len=%lu uart_unk=%lu uart_drop=%lu\r\n",
+      "BASELINE IMPACT radio_tx=%lu radio_rx=%lu radio_drop=%lu teensy_ok=%lu teensy_crc=%lu teensy_cobs=%lu teensy_len=%lu teensy_unk=%lu teensy_drop=%lu\r\n",
       (unsigned long)(radio_now.tx_packets - g_sd_capture_baseline.radio.tx_packets),
       (unsigned long)(radio_now.rx_packets - g_sd_capture_baseline.radio.rx_packets),
       (unsigned long)(radio_now.tx_drop - g_sd_capture_baseline.radio.tx_drop),
-      (unsigned long)(snap.stats.frames_ok - g_sd_capture_baseline.uart.frames_ok),
-      (unsigned long)(snap.stats.crc_err - g_sd_capture_baseline.uart.crc_err),
-      (unsigned long)(snap.stats.cobs_err - g_sd_capture_baseline.uart.cobs_err),
-      (unsigned long)(snap.stats.len_err - g_sd_capture_baseline.uart.len_err),
-      (unsigned long)(snap.stats.unknown_msg - g_sd_capture_baseline.uart.unknown_msg),
-      (unsigned long)(snap.stats.drop - g_sd_capture_baseline.uart.drop));
+      (unsigned long)(snap.stats.frames_ok - g_sd_capture_baseline.teensy.frames_ok),
+      (unsigned long)(snap.stats.crc_err - g_sd_capture_baseline.teensy.crc_err),
+      (unsigned long)(snap.stats.cobs_err - g_sd_capture_baseline.teensy.cobs_err),
+      (unsigned long)(snap.stats.len_err - g_sd_capture_baseline.teensy.len_err),
+      (unsigned long)(snap.stats.unknown_msg - g_sd_capture_baseline.teensy.unknown_msg),
+      (unsigned long)(snap.stats.drop - g_sd_capture_baseline.teensy.drop));
 }
 
 void printSdCaptureImpactReport() {
   const auto cap = sd_capture_test::stats();
   const auto radio_now = radio_link::stats();
-  const auto snap = uart_telem::snapshot();
+  const auto snap = teensy_link::snapshot();
   const uint32_t elapsed_ms =
       (cap.stopped_ms >= g_sd_capture_baseline.started_ms) ? (cap.stopped_ms - g_sd_capture_baseline.started_ms) : 0U;
 
@@ -327,16 +589,16 @@ void printSdCaptureImpactReport() {
       (unsigned long)cap.queue_max,
       (unsigned long)cap.dropped);
   Serial.printf(
-      "SDCAP IMPACT radio_tx=%lu radio_rx=%lu radio_drop=%lu uart_ok=%lu uart_crc=%lu uart_cobs=%lu uart_len=%lu uart_unk=%lu uart_drop=%lu\r\n",
+      "SDCAP IMPACT radio_tx=%lu radio_rx=%lu radio_drop=%lu teensy_ok=%lu teensy_crc=%lu teensy_cobs=%lu teensy_len=%lu teensy_unk=%lu teensy_drop=%lu\r\n",
       (unsigned long)(radio_now.tx_packets - g_sd_capture_baseline.radio.tx_packets),
       (unsigned long)(radio_now.rx_packets - g_sd_capture_baseline.radio.rx_packets),
       (unsigned long)(radio_now.tx_drop - g_sd_capture_baseline.radio.tx_drop),
-      (unsigned long)(snap.stats.frames_ok - g_sd_capture_baseline.uart.frames_ok),
-      (unsigned long)(snap.stats.crc_err - g_sd_capture_baseline.uart.crc_err),
-      (unsigned long)(snap.stats.cobs_err - g_sd_capture_baseline.uart.cobs_err),
-      (unsigned long)(snap.stats.len_err - g_sd_capture_baseline.uart.len_err),
-      (unsigned long)(snap.stats.unknown_msg - g_sd_capture_baseline.uart.unknown_msg),
-      (unsigned long)(snap.stats.drop - g_sd_capture_baseline.uart.drop));
+      (unsigned long)(snap.stats.frames_ok - g_sd_capture_baseline.teensy.frames_ok),
+      (unsigned long)(snap.stats.crc_err - g_sd_capture_baseline.teensy.crc_err),
+      (unsigned long)(snap.stats.cobs_err - g_sd_capture_baseline.teensy.cobs_err),
+      (unsigned long)(snap.stats.len_err - g_sd_capture_baseline.teensy.len_err),
+      (unsigned long)(snap.stats.unknown_msg - g_sd_capture_baseline.teensy.unknown_msg),
+      (unsigned long)(snap.stats.drop - g_sd_capture_baseline.teensy.drop));
   sd_capture_test::printReport(Serial, cap);
 }
 
@@ -372,6 +634,102 @@ void printAirLogStatus() {
                 (unsigned long)stats.max_write_bytes);
 }
 
+void printSdApiStatus(const char* tag) {
+  log_store::probeBackend();
+  sd_backend::Status backend = {};
+  const bool ready = sd_backend::refreshStatus(backend);
+  const auto recorder = log_store::recorderStatus();
+  Serial.printf("%s ready=%u mounted=%u media=%u state=%u init_hz=%lu total=%lu used=%lu free=%lu prefix=%s preview=%s\r\n",
+                tag ? tag : "SDSTATE",
+                ready ? 1U : 0U,
+                sd_backend::mounted() ? 1U : 0U,
+                sd_backend::mediaPresent() ? 1U : 0U,
+                (unsigned)sd_backend::mediaState(),
+                (unsigned long)backend.init_hz,
+                (unsigned long)backend.total_bytes,
+                (unsigned long)backend.used_bytes,
+                (unsigned long)recorder.free_bytes,
+                log_store::recordPrefix().c_str(),
+                shortLogName(log_store::previewLogName()).c_str());
+}
+
+bool waitForLogStoreIdle(uint32_t timeout_ms) {
+  const uint32_t started_ms = millis();
+  while (log_store::busy()) {
+    log_store::poll();
+    teensy_link::poll();
+    replay_bridge::poll();
+    delay(2);
+    if ((uint32_t)(millis() - started_ms) >= timeout_ms) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool writeSdApiTestLog() {
+  if (replay_bridge::active()) {
+    Serial.println("SDWRITE ok=0 reason=replay_busy");
+    return false;
+  }
+
+  sd_backend::Status backend = {};
+  if (!sd_backend::mounted() && !sd_backend::mount(&backend)) {
+    printSdApiStatus("SDWRITE");
+    Serial.println("SDWRITE ok=0 reason=mount_failed");
+    return false;
+  }
+
+  log_store::probeBackend();
+  if (!waitForLogStoreIdle(1000U)) {
+    Serial.println("SDWRITE ok=0 reason=logger_busy");
+    return false;
+  }
+
+  const uint32_t session_id = nextConsoleLogSessionId();
+  if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
+  if (!log_store::startSession(session_id)) {
+    Serial.printf("SDWRITE ok=0 reason=start_failed session=%lu\r\n", (unsigned long)session_id);
+    printAirLogStatus();
+    return false;
+  }
+
+  telem::TelemetryFullStateV1 state = {};
+  const auto snap = teensy_link::snapshot();
+  if (snap.has_state) {
+    state = snap.state;
+  } else {
+    state.roll_deg = 1.0f;
+    state.pitch_deg = 2.0f;
+    state.yaw_deg = 3.0f;
+    state.mag_heading_deg = 4.0f;
+    state.last_imu_ms = millis();
+  }
+  const uint32_t seq = snap.has_state && snap.seq != 0U ? snap.seq : 1U;
+  log_store::enqueueState(seq, micros(), state);
+  log_store::stopSession();
+
+  if (!waitForLogStoreIdle(4000U)) {
+    Serial.printf("SDWRITE ok=0 reason=close_timeout session=%lu\r\n", (unsigned long)session_id);
+    printAirLogStatus();
+    return false;
+  }
+
+  String latest_name;
+  const bool found_name = log_store::latestLogNameForSession(session_id, latest_name);
+  const auto recorder = log_store::recorderStatus();
+  const auto stats = log_store::stats();
+  Serial.printf("SDWRITE ok=%u session=%lu file=%s bytes=%lu records=%lu dropped=%lu\r\n",
+                found_name ? 1U : 0U,
+                (unsigned long)session_id,
+                found_name ? shortLogName(latest_name).c_str() : "(unknown)",
+                (unsigned long)recorder.bytes_written,
+                (unsigned long)stats.records_written,
+                (unsigned long)stats.dropped);
+  printSdApiStatus("SDWRITE");
+  return found_name;
+}
+
 bool beginReplayCapture(const String* source_override) {
   if (g_replay_capture.active) {
     Serial.println("AIRREPLAYCAP START ok=0 reason=already_active");
@@ -395,7 +753,7 @@ bool beginReplayCapture(const String* source_override) {
   }
 
   const uint32_t session_id = nextConsoleLogSessionId();
-  radio_link::setRecorderEnabled(true);
+  if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
   if (!log_store::startSession(session_id)) {
     Serial.printf("AIRREPLAYCAP START ok=0 reason=logstart_failed session=%lu\r\n",
                   (unsigned long)session_id);
@@ -403,6 +761,15 @@ bool beginReplayCapture(const String* source_override) {
   }
 
   const String capture_name = log_store::currentFileName();
+  uint16_t applied_capture_hz = 0U;
+  if (!applyReplayRunControls(replay_bridge::averageFactor(), &applied_capture_hz)) {
+    log_store::stopSession();
+    Serial.printf("AIRREPLAYCAP START ok=0 reason=control_apply_failed src=%s session=%lu avg_n=%u\r\n",
+                  shortLogName(source_name).c_str(),
+                  (unsigned long)session_id,
+                  (unsigned)replay_bridge::averageFactor());
+    return false;
+  }
   if (!replay_bridge::startFile(source_name)) {
     log_store::stopSession();
     Serial.printf("AIRREPLAYCAP START ok=0 reason=replay_start_failed src=%s session=%lu\r\n",
@@ -417,11 +784,13 @@ bool beginReplayCapture(const String* source_override) {
   g_replay_capture.started_ms = millis();
 
   const auto replay = replay_bridge::status();
-  Serial.printf("AIRREPLAYCAP START ok=1 src=%s dst=%s session=%lu records_total=%lu\r\n",
+  Serial.printf("AIRREPLAYCAP START ok=1 src=%s dst=%s session=%lu records_total=%lu avg_n=%u cap_hz=%u\r\n",
                 shortLogName(source_name).c_str(),
                 shortLogName(capture_name).c_str(),
                 (unsigned long)session_id,
-                (unsigned long)replay.records_total);
+                (unsigned long)replay.records_total,
+                (unsigned)replay_bridge::averageFactor(),
+                (unsigned)applied_capture_hz);
   return true;
 }
 
@@ -444,10 +813,34 @@ bool beginReplayDirect(const String& source_name) {
     return false;
   }
   const auto replay = replay_bridge::status();
-  Serial.printf("AIRREPLAY START ok=1 src=%s records_total=%lu\r\n",
+  Serial.printf("AIRREPLAY START ok=1 src=%s records_total=%lu avg_n=%u\r\n",
                 shortLogName(source_name).c_str(),
-                (unsigned long)replay.records_total);
+                (unsigned long)replay.records_total,
+                (unsigned)replay_bridge::averageFactor());
   return true;
+}
+
+void noteReplayCaptureComplete(const String& closed_name, uint32_t session_id, bool ok,
+                               uint32_t written, uint32_t dropped) {
+  if (!g_replay_compare.active) return;
+  const uint8_t index = g_replay_compare.completed_runs;
+  if (index >= 2U) return;
+  g_replay_compare.sessions[index] = session_id;
+  g_replay_compare.ok[index] = ok;
+  g_replay_compare.written[index] = written;
+  g_replay_compare.dropped[index] = dropped;
+  g_replay_compare.capture_rate_hz[index] =
+      replayCaptureRateForFactor((uint8_t)(g_replay_compare.base_factor + index));
+  g_replay_compare.outputs[index] = closed_name;
+  g_replay_compare.completed_runs = (uint8_t)(index + 1U);
+  g_replay_compare.last_completion_ms = millis();
+  Serial.printf("AIRREPLAYCMP PASS done avg_n=%u cap_hz=%u dst=%s written=%lu dropped=%lu ok=%u\r\n",
+                (unsigned)(g_replay_compare.base_factor + index),
+                (unsigned)g_replay_compare.capture_rate_hz[index],
+                shortLogName(closed_name).c_str(),
+                (unsigned long)written,
+                (unsigned long)dropped,
+                ok ? 1U : 0U);
 }
 
 void serviceReplayCapture() {
@@ -471,9 +864,10 @@ void serviceReplayCapture() {
   const uint32_t elapsed_ms = millis() - g_replay_capture.started_ms;
   String closed_name;
   (void)log_store::latestLogNameForSession(g_replay_capture.session_id, closed_name);
+  const bool ok = (replay.last_error == 0U);
   Serial.printf(
-      "AIRREPLAYCAP RESULT ok=%u elapsed_ms=%lu dst=%s session=%lu sent=%lu total=%lu bytes=%lu written=%lu dropped=%lu\r\n",
-      (replay.last_error == 0U) ? 1U : 0U,
+      "AIRREPLAYCAP RESULT ok=%u elapsed_ms=%lu dst=%s session=%lu sent=%lu total=%lu bytes=%lu written=%lu dropped=%lu avg_n=%u\r\n",
+      ok ? 1U : 0U,
       (unsigned long)elapsed_ms,
       shortLogName(closed_name).c_str(),
       (unsigned long)g_replay_capture.session_id,
@@ -481,8 +875,175 @@ void serviceReplayCapture() {
       (unsigned long)replay.records_total,
       (unsigned long)recorder.bytes_written,
       (unsigned long)stats.records_written,
-      (unsigned long)stats.dropped);
+      (unsigned long)stats.dropped,
+      (unsigned)replay_bridge::averageFactor());
+  noteReplayCaptureComplete(closed_name, g_replay_capture.session_id, ok,
+                            stats.records_written, stats.dropped);
   g_replay_capture = ReplayCaptureRun{};
+}
+
+bool beginReplayCompare(uint8_t base_factor, const String* source_override) {
+  if (g_replay_compare.active) {
+    Serial.println("AIRREPLAYCMP START ok=0 reason=already_active");
+    return false;
+  }
+  if (g_replay_capture.active || replay_bridge::active() || log_store::busy()) {
+    Serial.println("AIRREPLAYCMP START ok=0 reason=busy");
+    return false;
+  }
+
+  String source_name;
+  if (source_override && !source_override->isEmpty()) {
+    source_name = *source_override;
+  } else if (!log_store::latestLogName(source_name)) {
+    Serial.println("AIRREPLAYCMP START ok=0 reason=no_source_log");
+    return false;
+  }
+
+  g_replay_compare = {};
+  g_replay_compare.active = true;
+  g_replay_compare.source_name = source_name;
+  replay_bridge::setAverageFactor((uint8_t)constrain((unsigned)base_factor, 1U, 31U));
+  g_replay_compare.base_factor = replay_bridge::averageFactor();
+  if (!beginReplayCapture(&g_replay_compare.source_name)) {
+    g_replay_compare = {};
+    Serial.println("AIRREPLAYCMP START ok=0 reason=replaycap_failed");
+    return false;
+  }
+
+  Serial.printf("AIRREPLAYCMP START ok=1 src=%s n=%u n_next=%u\r\n",
+                shortLogName(g_replay_compare.source_name).c_str(),
+                (unsigned)g_replay_compare.base_factor,
+                (unsigned)(g_replay_compare.base_factor + 1U));
+  return true;
+}
+
+void serviceReplayCompare() {
+  if (!g_replay_compare.active) return;
+  if (g_replay_capture.active || replay_bridge::active() || log_store::busy()) return;
+
+  if (g_replay_compare.completed_runs >= 2U) {
+    Serial.printf("AIRREPLAYCMP RESULT ok=%u src=%s n=%u cap_n=%u cap_n1=%u file_n=%s file_n1=%s written_n=%lu written_n1=%lu dropped_n=%lu dropped_n1=%lu\r\n",
+                  (g_replay_compare.ok[0] && g_replay_compare.ok[1]) ? 1U : 0U,
+                  shortLogName(g_replay_compare.source_name).c_str(),
+                  (unsigned)g_replay_compare.base_factor,
+                  (unsigned)g_replay_compare.capture_rate_hz[0],
+                  (unsigned)g_replay_compare.capture_rate_hz[1],
+                  shortLogName(g_replay_compare.outputs[0]).c_str(),
+                  shortLogName(g_replay_compare.outputs[1]).c_str(),
+                  (unsigned long)g_replay_compare.written[0],
+                  (unsigned long)g_replay_compare.written[1],
+                  (unsigned long)g_replay_compare.dropped[0],
+                  (unsigned long)g_replay_compare.dropped[1]);
+    g_replay_compare = {};
+    return;
+  }
+
+  if (g_replay_compare.completed_runs == 1U &&
+      (uint32_t)(millis() - g_replay_compare.last_completion_ms) >= kReplayCompareSettleMs) {
+    replay_bridge::setAverageFactor((uint8_t)(g_replay_compare.base_factor + 1U));
+    if (!beginReplayCapture(&g_replay_compare.source_name)) {
+      Serial.println("AIRREPLAYCMP RESULT ok=0 reason=second_pass_start_failed");
+      g_replay_compare = {};
+    }
+  }
+}
+
+bool beginBenchSweep(uint32_t duration_ms) {
+  if (g_bench_sweep.active) {
+    Serial.println("AIRBENCH START ok=0 reason=already_active");
+    return false;
+  }
+  if (!isStandaloneBench()) {
+    Serial.println("AIRBENCH START ok=0 reason=standalone_required");
+    return false;
+  }
+  if (g_replay_capture.active || replay_bridge::active() || log_store::busy()) {
+    Serial.println("AIRBENCH START ok=0 reason=busy");
+    return false;
+  }
+  g_bench_sweep = {};
+  g_bench_sweep.active = true;
+  g_bench_sweep.duration_ms = duration_ms;
+  g_bench_sweep.rate_index = 0U;
+  g_bench_sweep.current_rate_hz = kBenchCaptureRatesHz[0];
+  g_bench_sweep.phase = BenchSweepPhase::WaitApply;
+  g_bench_sweep.phase_started_ms = millis();
+  if (!setCaptureRateHz(g_bench_sweep.current_rate_hz, true)) {
+    g_bench_sweep = {};
+    Serial.println("AIRBENCH START ok=0 reason=set_capture_failed");
+    return false;
+  }
+  Serial.printf("AIRBENCH START ok=1 duration_ms=%lu rates=%u\r\n",
+                (unsigned long)duration_ms,
+                (unsigned)(sizeof(kBenchCaptureRatesHz) / sizeof(kBenchCaptureRatesHz[0])));
+  return true;
+}
+
+void serviceBenchSweep() {
+  if (!g_bench_sweep.active) return;
+  const uint32_t now = millis();
+  switch (g_bench_sweep.phase) {
+    case BenchSweepPhase::WaitApply:
+      if ((uint32_t)(now - g_bench_sweep.phase_started_ms) < kBenchApplySettleMs) return;
+      g_bench_sweep.session_id = nextConsoleLogSessionId();
+      if (!log_store::startSession(g_bench_sweep.session_id)) {
+        Serial.printf("AIRBENCH RATE ok=0 rate=%u reason=logstart_failed\r\n",
+                      (unsigned)g_bench_sweep.current_rate_hz);
+        g_bench_sweep.active = false;
+        g_bench_sweep.phase = BenchSweepPhase::Idle;
+        return;
+      }
+      g_bench_sweep.phase = BenchSweepPhase::Logging;
+      g_bench_sweep.phase_started_ms = now;
+      Serial.printf("AIRBENCH RATE start rate=%u session=%lu\r\n",
+                    (unsigned)g_bench_sweep.current_rate_hz,
+                    (unsigned long)g_bench_sweep.session_id);
+      return;
+
+    case BenchSweepPhase::Logging:
+      if ((uint32_t)(now - g_bench_sweep.phase_started_ms) < g_bench_sweep.duration_ms) return;
+      log_store::stopSession();
+      g_bench_sweep.phase = BenchSweepPhase::WaitLogStop;
+      g_bench_sweep.phase_started_ms = now;
+      return;
+
+    case BenchSweepPhase::WaitLogStop:
+      if (log_store::busy()) return;
+      {
+        String closed_name;
+        (void)log_store::latestLogNameForSession(g_bench_sweep.session_id, closed_name);
+        const auto stats = log_store::stats();
+        Serial.printf("AIRBENCH RATE done rate=%u session=%lu file=%s records=%lu dropped=%lu\r\n",
+                      (unsigned)g_bench_sweep.current_rate_hz,
+                      (unsigned long)g_bench_sweep.session_id,
+                      shortLogName(closed_name).c_str(),
+                      (unsigned long)stats.records_written,
+                      (unsigned long)stats.dropped);
+      }
+      g_bench_sweep.rate_index++;
+      if (g_bench_sweep.rate_index >= (sizeof(kBenchCaptureRatesHz) / sizeof(kBenchCaptureRatesHz[0]))) {
+        g_bench_sweep.active = false;
+        g_bench_sweep.phase = BenchSweepPhase::Idle;
+        Serial.println("AIRBENCH RESULT ok=1");
+        return;
+      }
+      g_bench_sweep.current_rate_hz = kBenchCaptureRatesHz[g_bench_sweep.rate_index];
+      g_bench_sweep.phase = BenchSweepPhase::WaitApply;
+      g_bench_sweep.phase_started_ms = now;
+      if (!setCaptureRateHz(g_bench_sweep.current_rate_hz, true)) {
+        Serial.printf("AIRBENCH RATE ok=0 rate=%u reason=set_capture_failed\r\n",
+                      (unsigned)g_bench_sweep.current_rate_hz);
+        g_bench_sweep.active = false;
+        g_bench_sweep.phase = BenchSweepPhase::Idle;
+      }
+      return;
+
+    case BenchSweepPhase::Idle:
+    default:
+      g_bench_sweep.active = false;
+      return;
+  }
 }
 
 void handleConsoleCommands() {
@@ -499,14 +1060,46 @@ void handleConsoleCommands() {
 
       if (strcmp(g_console_line, "help") == 0 || strcmp(g_console_line, "h") == 0) {
         printConsoleHelp();
-      } else if (strcmp(g_console_line, "sdprobe") == 0 || strcmp(g_console_line, "sdcard") == 0) {
-        sd_card_test::Status status = {};
-        (void)sd_card_test::probe(status);
-        sd_card_test::printProbeReport(Serial, status);
-      } else if (strcmp(g_console_line, "sdwrite") == 0 || strcmp(g_console_line, "sdtest") == 0) {
-        sd_card_test::Status status = {};
-        (void)sd_card_test::writeProbe(status);
-        sd_card_test::printProbeReport(Serial, status);
+      } else if (strcmp(g_console_line, "sdprobe") == 0) {
+        printSdApiStatus("SDPROBE");
+      } else if (strcmp(g_console_line, "sdmount") == 0) {
+        sd_backend::Status backend = {};
+        const bool ok = sd_backend::mount(&backend);
+        Serial.printf("SDMOUNT ok=%u mounted=%u card_type=%u init_hz=%lu total=%lu used=%lu\r\n",
+                      ok ? 1U : 0U,
+                      sd_backend::mounted() ? 1U : 0U,
+                      (unsigned)backend.card_type,
+                      (unsigned long)backend.init_hz,
+                      (unsigned long)backend.total_bytes,
+                      (unsigned long)backend.used_bytes);
+      } else if (strcmp(g_console_line, "sdeject") == 0) {
+        if (log_store::busy() || replay_bridge::active()) {
+          Serial.println("SDEJECT ok=0 reason=busy");
+        } else {
+          const bool ok = sd_backend::eject();
+          Serial.printf("SDEJECT ok=%u mounted=%u\r\n", ok ? 1U : 0U, sd_backend::mounted() ? 1U : 0U);
+        }
+      } else if (strcmp(g_console_line, "sdstate") == 0) {
+        printSdApiStatus("SDSTATE");
+      } else if (strcmp(g_console_line, "sdwrite") == 0) {
+        (void)writeSdApiTestLog();
+      } else if (strncmp(g_console_line, "sdrename ", 9) == 0) {
+        char src_name[48] = {};
+        char dst_name[48] = {};
+        if (sscanf(g_console_line + 9, "%47s %47s", src_name, dst_name) == 2) {
+          const bool ok = log_store::renameFileByName(String(src_name), String(dst_name));
+          Serial.printf("SDRENAME ok=%u from=%s to=%s\r\n", ok ? 1U : 0U, src_name, dst_name);
+        } else {
+          Serial.println("SDRENAME usage: sdrename <from> <to>");
+        }
+      } else if (strncmp(g_console_line, "sddelete ", 9) == 0) {
+        char file_name[48] = {};
+        if (sscanf(g_console_line + 9, "%47s", file_name) == 1) {
+          const bool ok = log_store::deleteFileByName(String(file_name));
+          Serial.printf("SDDELETE ok=%u file=%s\r\n", ok ? 1U : 0U, file_name);
+        } else {
+          Serial.println("SDDELETE usage: sddelete <file>");
+        }
       } else if (strcmp(g_console_line, "base1m") == 0) {
         beginBaselineBenchmark(60000U);
       } else if (strcmp(g_console_line, "basestop") == 0) {
@@ -520,18 +1113,9 @@ void handleConsoleCommands() {
                       (unsigned long)g_baseline_duration_ms,
                       (unsigned long)g_baseline_started_ms,
                       (unsigned long)g_baseline_stopped_ms);
-      } else if (strcmp(g_console_line, "sdcap1m") == 0) {
-        beginSdCaptureBenchmark(60000U);
-      } else if (strcmp(g_console_line, "sdcapstop") == 0) {
-        sd_capture_test::stop(false);
-        printSdCaptureImpactReport();
-        sd_capture_test::clearCompleted();
-      } else if (strcmp(g_console_line, "sdcapstat") == 0) {
-        const auto cap = sd_capture_test::stats();
-        sd_capture_test::printReport(Serial, cap);
       } else if (strcmp(g_console_line, "logstart") == 0) {
         const uint32_t session_id = nextConsoleLogSessionId();
-        radio_link::setRecorderEnabled(true);
+        if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
         const bool ok = log_store::startSession(session_id);
         Serial.printf("AIRLOG START ok=%u session=%lu\r\n",
                       ok ? 1U : 0U,
@@ -541,7 +1125,7 @@ void handleConsoleCommands() {
         unsigned session_id = 0U;
         if (sscanf(g_console_line + 11, "%u", &session_id) == 1 && session_id != 0U) {
           g_console_log_session_id = (uint32_t)session_id;
-          radio_link::setRecorderEnabled(true);
+          if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
           const bool ok = log_store::startSession((uint32_t)session_id);
           Serial.printf("AIRLOG START ok=%u session=%u\r\n", ok ? 1U : 0U, session_id);
           printAirLogStatus();
@@ -560,6 +1144,30 @@ void handleConsoleCommands() {
         Serial.printf("AIRLOG latest_ok=%u file=%s\r\n",
                       ok ? 1U : 0U,
                       ok ? shortLogName(latest_name).c_str() : "(none)");
+      } else if (strncmp(g_console_line, "logfiles", 8) == 0) {
+        log_store::FileSortKey sort_key = log_store::FileSortKey::date;
+        log_store::FileSortDirection sort_dir = log_store::FileSortDirection::descending;
+        char key_buf[12] = {};
+        char dir_buf[12] = {};
+        if (sscanf(g_console_line + 8, "%11s %11s", key_buf, dir_buf) >= 1) {
+          if (strcmp(key_buf, "name") == 0) sort_key = log_store::FileSortKey::name;
+          else if (strcmp(key_buf, "size") == 0) sort_key = log_store::FileSortKey::size;
+          else if (strcmp(key_buf, "date") == 0) sort_key = log_store::FileSortKey::date;
+          if (strcmp(dir_buf, "asc") == 0) sort_dir = log_store::FileSortDirection::ascending;
+          else if (strcmp(dir_buf, "desc") == 0) sort_dir = log_store::FileSortDirection::descending;
+        }
+        Serial.println(log_store::filesJson(sort_key, sort_dir));
+      } else if (strncmp(g_console_line, "logprefix", 9) == 0) {
+        char prefix_buf[24] = {};
+        if (sscanf(g_console_line + 9, "%23s", prefix_buf) == 1) {
+          AppConfig cfg = config_store::get();
+          strlcpy(cfg.record_prefix, prefix_buf, sizeof(cfg.record_prefix));
+          config_store::update(cfg);
+          log_store::setConfig(config_store::get());
+        }
+        Serial.printf("AIRLOG prefix=%s preview=%s\r\n",
+                      log_store::recordPrefix().c_str(),
+                      shortLogName(log_store::previewLogName()).c_str());
       } else if (strcmp(g_console_line, "largestlog") == 0) {
         String largest_name;
         const bool ok = log_store::largestLogName(largest_name);
@@ -584,6 +1192,14 @@ void handleConsoleCommands() {
       } else if (strcmp(g_console_line, "expandlogs") == 0 || strcmp(g_console_line, "expandcsv") == 0) {
         const bool ok = log_store::exportAllLogsToCsv(Serial);
         Serial.printf("AIRCSV RESULT ok=%u\r\n", ok ? 1U : 0U);
+      } else if (strncmp(g_console_line, "csvfile ", 8) == 0) {
+        char file_name[48] = {};
+        if (sscanf(g_console_line + 8, "%47s", file_name) == 1) {
+          const bool ok = log_store::exportLogToCsvByName(String(file_name), &Serial);
+          Serial.printf("AIRCSV FILE ok=%u file=%s\r\n", ok ? 1U : 0U, file_name);
+        } else {
+          Serial.println("AIRCSV usage: csvfile <name.tlog>");
+        }
       } else if (strncmp(g_console_line, "comparelogs ", 12) == 0) {
         char src_name[48] = {};
         char dst_name[48] = {};
@@ -593,8 +1209,73 @@ void handleConsoleCommands() {
         } else {
           Serial.println("AIRCOMPARE usage: comparelogs <src.tlog> <dst.tlog>");
         }
+      } else if (strncmp(g_console_line, "comparetimed ", 13) == 0) {
+        char src_name[48] = {};
+        char dst_name[48] = {};
+        unsigned warmup_skip = 4U;
+        const int parsed = sscanf(g_console_line + 13, "%47s %47s %u", src_name, dst_name, &warmup_skip);
+        if (parsed >= 2) {
+          const bool ok = log_store::compareLogsTimed(Serial, String(src_name), String(dst_name), (uint16_t)warmup_skip);
+          Serial.printf("AIRCOMPARET RESULT ok=%u\r\n", ok ? 1U : 0U);
+        } else {
+          Serial.println("AIRCOMPARET usage: comparetimed <src.tlog> <dst.tlog> [warmup_skip]");
+        }
+      } else if (strncmp(g_console_line, "logkinds ", 9) == 0) {
+        String log_name = String(g_console_line + 9);
+        log_name.trim();
+        if (log_name.length() == 0U) {
+          Serial.println("AIRLOGKINDS usage: logkinds <file.tlog>");
+        } else {
+          const bool ok = log_store::printRecordKindSummary(Serial, log_name);
+          Serial.printf("AIRLOGKINDS RESULT ok=%u\r\n", ok ? 1U : 0U);
+        }
+      } else if (strncmp(g_console_line, "logfusion ", 10) == 0) {
+        String log_name = String(g_console_line + 10);
+        log_name.trim();
+        if (log_name.length() == 0U) {
+          Serial.println("AIRLOGFUSION usage: logfusion <file.tlog>");
+        } else {
+          const bool ok = log_store::printFusionSettingsSummary(Serial, log_name);
+          Serial.printf("AIRLOGFUSION RESULT ok=%u\r\n", ok ? 1U : 0U);
+        }
+      } else if (strncmp(g_console_line, "logflags ", 9) == 0) {
+        String log_name = String(g_console_line + 9);
+        log_name.trim();
+        if (log_name.length() == 0U) {
+          Serial.println("AIRLOGFLAGS usage: logflags <file.tlog>");
+        } else {
+          const bool ok = log_store::printFusionFlagSummary(Serial, log_name);
+          Serial.printf("AIRLOGFLAGS RESULT ok=%u\r\n", ok ? 1U : 0U);
+        }
       } else if (strcmp(g_console_line, "replaycapture") == 0 || strcmp(g_console_line, "replaycap") == 0) {
         (void)beginReplayCapture(nullptr);
+      } else if (strncmp(g_console_line, "replayavg ", 10) == 0) {
+        unsigned factor = 0U;
+        if (sscanf(g_console_line + 10, "%u", &factor) == 1) {
+          replay_bridge::setAverageFactor((uint8_t)factor);
+          Serial.printf("AIRREPLAYAVG n=%u\r\n", (unsigned)replay_bridge::averageFactor());
+        } else {
+          Serial.println("AIRREPLAYAVG usage: replayavg <n>");
+        }
+      } else if (strcmp(g_console_line, "replayavgstat") == 0) {
+        Serial.printf("AIRREPLAYAVG n=%u\r\n", (unsigned)replay_bridge::averageFactor());
+      } else if (strncmp(g_console_line, "replaycmpfile ", 14) == 0) {
+        unsigned factor = 0U;
+        char src_name[48] = {};
+        if (sscanf(g_console_line + 14, "%u %47s", &factor, src_name) == 2) {
+          String source_name = String(src_name);
+          source_name.trim();
+          (void)beginReplayCompare((uint8_t)factor, &source_name);
+        } else {
+          Serial.println("AIRREPLAYCMP usage: replaycmpfile <n> <file.tlog>");
+        }
+      } else if (strncmp(g_console_line, "replaycmp ", 10) == 0) {
+        unsigned factor = 0U;
+        if (sscanf(g_console_line + 10, "%u", &factor) == 1) {
+          (void)beginReplayCompare((uint8_t)factor, nullptr);
+        } else {
+          Serial.println("AIRREPLAYCMP usage: replaycmp <n>");
+        }
       } else if (strncmp(g_console_line, "replaycapfile ", 14) == 0) {
         String source_name = String(g_console_line + 14);
         source_name.trim();
@@ -620,13 +1301,16 @@ void handleConsoleCommands() {
         }
       } else if (strcmp(g_console_line, "replaycapstat") == 0) {
         const auto replay = replay_bridge::status();
-        Serial.printf("AIRREPLAYCAP active=%u stop_requested=%u session=%lu sent=%lu total=%lu last_error=%lu\r\n",
+        Serial.printf("AIRREPLAYCAP active=%u stop_requested=%u session=%lu sent=%lu total=%lu last_error=%lu avg_n=%u cmp_active=%u cmp_done=%u\r\n",
                       g_replay_capture.active ? 1U : 0U,
                       g_replay_capture.stop_requested ? 1U : 0U,
                       (unsigned long)g_replay_capture.session_id,
                       (unsigned long)replay.records_sent,
                       (unsigned long)replay.records_total,
-                      (unsigned long)replay.last_error);
+                      (unsigned long)replay.last_error,
+                      (unsigned)replay_bridge::averageFactor(),
+                      g_replay_compare.active ? 1U : 0U,
+                      (unsigned)g_replay_compare.completed_runs);
       } else if (strncmp(g_console_line, "setpin ", 7) == 0) {
         unsigned pin = 0U;
         if (sscanf(g_console_line + 7, "%u", &pin) == 1 && pin <= 48U) {
@@ -635,9 +1319,48 @@ void handleConsoleCommands() {
           Serial.println("SETPIN usage: setpin <gpio>");
         }
       } else if (strcmp(g_console_line, "getfusion") == 0 || strcmp(g_console_line, "get fusion") == 0) {
-        const bool ok = uart_telem::sendGetFusionSettings();
+        const bool ok = teensy_link::sendGetFusionSettings();
         Serial.printf("GETFUSION tx_ok=%u\n", ok ? 1U : 0U);
         g_wait_getfusion_ack = ok;
+      } else if (strncmp(g_console_line, "setcap ", 7) == 0) {
+        unsigned hz = 0U;
+        if (sscanf(g_console_line + 7, "%u", &hz) == 1) {
+          const bool ok = setCaptureRateHz((uint16_t)hz, true);
+          Serial.printf("SETCAP tx_ok=%u hz=%u\r\n", ok ? 1U : 0U, hz);
+        } else {
+          Serial.println("SETCAP usage: setcap <hz>");
+        }
+      } else if (strcmp(g_console_line, "savecap") == 0) {
+        const bool ok = saveCaptureRateDefaults();
+        Serial.printf("SAVECAP tx_ok=%u\r\n", ok ? 1U : 0U);
+      } else if (strcmp(g_console_line, "bench status") == 0 || strcmp(g_console_line, "benchstatus") == 0 ||
+                 strcmp(g_console_line, "benchstat") == 0) {
+        const AppConfig& cfg = config_store::get();
+        Serial.printf("BENCH status standalone=%u active=%u rate=%u idx=%u duration_ms=%lu\r\n",
+                      cfg.standalone_bench ? 1U : 0U,
+                      g_bench_sweep.active ? 1U : 0U,
+                      (unsigned)g_bench_sweep.current_rate_hz,
+                      (unsigned)g_bench_sweep.rate_index,
+                      (unsigned long)g_bench_sweep.duration_ms);
+      } else if (strcmp(g_console_line, "bench on") == 0 || strcmp(g_console_line, "benchon") == 0) {
+        AppConfig cfg = config_store::get();
+        cfg.standalone_bench = 1U;
+        config_store::update(cfg);
+        Serial.println("BENCH standalone=1");
+      } else if (strcmp(g_console_line, "bench off") == 0 || strcmp(g_console_line, "benchoff") == 0) {
+        AppConfig cfg = config_store::get();
+        cfg.standalone_bench = 0U;
+        config_store::update(cfg);
+        Serial.println("BENCH standalone=0 (restart AIR to re-enable radio path cleanly)");
+      } else if (strncmp(g_console_line, "benchauto ", 10) == 0) {
+        unsigned duration_ms = 0U;
+        if (sscanf(g_console_line + 10, "%u", &duration_ms) == 1 && duration_ms >= 1000U) {
+          (void)beginBenchSweep((uint32_t)duration_ms);
+        } else {
+          Serial.println("AIRBENCH usage: benchauto <duration_ms>");
+        }
+      } else if (strcmp(g_console_line, "benchauto") == 0) {
+        (void)beginBenchSweep(15000U);
       } else if (strcmp(g_console_line, "kickteensy") == 0 || strcmp(g_console_line, "kickstream") == 0 ||
                  strcmp(g_console_line, "resendrate") == 0) {
         const AppConfig& cfg = config_store::get();
@@ -647,7 +1370,11 @@ void handleConsoleCommands() {
                       (unsigned)cfg.source_rate_hz,
                       (unsigned)cfg.log_rate_hz);
       } else if (strcmp(g_console_line, "tx1") == 0 || strcmp(g_console_line, "sendstate") == 0) {
-        const auto snap = uart_telem::snapshot();
+        if (isStandaloneBench()) {
+          Serial.println("TX1 tx_ok=0 reason=bench_mode");
+          continue;
+        }
+        const auto snap = teensy_link::snapshot();
         if (!snap.has_state) {
           Serial.println("TX1 tx_ok=0 reason=no_state");
         } else {
@@ -658,25 +1385,45 @@ void handleConsoleCommands() {
                         (unsigned long)snap.t_us);
         }
       } else if (strcmp(g_console_line, "linkclear") == 0) {
+        if (isStandaloneBench()) {
+          Serial.println("LINKCLEAR skipped reason=bench_mode");
+          continue;
+        }
         radio_link::resetNetworkState();
         resetWifiStatusFlags();
         Serial.println("LINKCLEAR done state=cleared link=stopped");
       } else if (strcmp(g_console_line, "linkopen") == 0) {
+        if (isStandaloneBench()) {
+          Serial.println("LINKOPEN skipped reason=bench_mode");
+          continue;
+        }
         const AppConfig& cfg = config_store::get();
         radio_link::reconfigure(cfg);
         Serial.printf("LINKOPEN peer=%s channel=%u\n",
                       radio_link::peerMac().c_str(),
                       (unsigned)telem::kRadioChannel);
       } else if (strcmp(g_console_line, "wifidrop") == 0) {
+        if (isStandaloneBench()) {
+          Serial.println("WIFIDROP skipped reason=bench_mode");
+          continue;
+        }
         const AppConfig& cfg = config_store::get();
         radio_link::resetNetworkState();
         resetWifiStatusFlags();
         radio_link::reconfigure(cfg);
         Serial.println("WIFIDROP peer_state_cleared");
       } else if (strcmp(g_console_line, "wifioffon") == 0) {
+        if (isStandaloneBench()) {
+          Serial.println("WIFIOFFON skipped reason=bench_mode");
+          continue;
+        }
         restartWifiStation();
         Serial.println("WIFIOFFON radio_power_cycle");
       } else if (strcmp(g_console_line, "relink") == 0) {
+        if (isStandaloneBench()) {
+          Serial.println("RELINK skipped reason=bench_mode");
+          continue;
+        }
         const AppConfig& cfg = config_store::get();
         radio_link::resetNetworkState();
         radio_link::reconfigure(cfg);
@@ -685,6 +1432,10 @@ void handleConsoleCommands() {
                       radio_link::peerMac().c_str(),
                       (unsigned)telem::kRadioChannel);
       } else if (strcmp(g_console_line, "resetnet") == 0 || strcmp(g_console_line, "netreset") == 0) {
+        if (isStandaloneBench()) {
+          Serial.println("RESETNET skipped reason=bench_mode");
+          continue;
+        }
         restartWifiStation();
       } else if (strncmp(g_console_line, "setfusion ", 10) == 0) {
         float g = 0.0f, a = 0.0f, m = 0.0f;
@@ -696,8 +1447,8 @@ void handleConsoleCommands() {
           cmd.accelerationRejection = a;
           cmd.magneticRejection = m;
           cmd.recoveryTriggerPeriod = (uint16_t)r;
-          const bool ok = uart_telem::sendSetFusionSettings(cmd);
-          const bool ok_get = ok ? uart_telem::sendGetFusionSettings() : false;
+          const bool ok = teensy_link::sendSetFusionSettings(cmd);
+          const bool ok_get = ok ? teensy_link::sendGetFusionSettings() : false;
           if (ok_get) g_wait_getfusion_ack = true;
           Serial.printf("SETFUSION tx_ok=%u gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
                         ok ? 1U : 0U,
@@ -708,6 +1459,20 @@ void handleConsoleCommands() {
         } else {
           Serial.println("SETFUSION usage: setfusion <gain> <accelRej> <magRej> <recovery>");
         }
+      } else if (strcmp(g_console_line, "quiet on") == 0) {
+        g_quiet_serial = true;
+        g_stats_streaming = false;
+        radio_link::setVerbose(false);
+        Serial.println("QUIET on");
+      } else if (strcmp(g_console_line, "quiet off") == 0) {
+        g_quiet_serial = false;
+        radio_link::setVerbose(true);
+        Serial.println("QUIET off");
+      } else if (strcmp(g_console_line, "quiet status") == 0) {
+        Serial.printf("QUIET enabled=%u airtx=%u stats=%u\r\n",
+                      g_quiet_serial ? 1U : 0U,
+                      radio_link::verbose() ? 1U : 0U,
+                      g_stats_streaming ? 1U : 0U);
       } else if (strcmp(g_console_line, "stats") == 0) {
         g_stats_streaming = true;
         g_last_stat_ms = 0;
@@ -726,6 +1491,7 @@ void handleConsoleCommands() {
 }
 
 void beginWifiStation() {
+  if (isStandaloneBench()) return;
   const AppConfig& cfg = config_store::get();
 
   WiFi.mode(WIFI_STA);
@@ -743,6 +1509,7 @@ void beginWifiStation() {
 }
 
 void restartWifiStation() {
+  if (isStandaloneBench()) return;
   const AppConfig& cfg = config_store::get();
   Serial.println("AIR CMD reset_network");
   radio_link::resetNetworkState();
@@ -759,9 +1526,10 @@ void restartWifiStation() {
 }
 
 void updateWifiReadiness() {
+  if (isStandaloneBench()) return;
   if (!radio_link::radioReady()) {
     if (g_radio_ready) {
-      Serial.println("AIR WAIT radio");
+      if (serialNoiseEnabled()) Serial.println("AIR WAIT radio");
       g_radio_ready = false;
     }
     g_link_ready = false;
@@ -770,13 +1538,17 @@ void updateWifiReadiness() {
   }
 
   if (!g_radio_ready) {
-    Serial.printf("AIR READY radio channel=%u\n", (unsigned)telem::kRadioChannel);
+    if (serialNoiseEnabled()) {
+      Serial.printf("AIR READY radio channel=%u\n", (unsigned)telem::kRadioChannel);
+    }
     g_radio_ready = true;
   }
 
   if (radio_link::hasPeer()) {
     if (!g_link_ready) {
-      Serial.printf("AIR READY gnd_link peer=%s\n", radio_link::peerMac().c_str());
+      if (serialNoiseEnabled()) {
+        Serial.printf("AIR READY gnd_link peer=%s\n", radio_link::peerMac().c_str());
+      }
       g_link_ready = true;
       g_link_wait_printed = false;
     }
@@ -784,27 +1556,29 @@ void updateWifiReadiness() {
   }
 
   if (g_link_ready) {
-    Serial.println("AIR WAIT gnd_link peer=discovery");
+    if (serialNoiseEnabled()) Serial.println("AIR WAIT gnd_link peer=discovery");
     g_link_ready = false;
     g_link_wait_printed = true;
     return;
   }
 
-  if (!g_link_wait_printed) {
+  if (!g_link_wait_printed && serialNoiseEnabled()) {
     Serial.println("AIR WAIT gnd_link peer=discovery");
     g_link_wait_printed = true;
   }
 }
 
-void updateTeensyReadiness(const uart_telem::Snapshot& snap) {
+void updateTeensyReadiness(const teensy_link::Snapshot& snap) {
   const uint32_t now = millis();
   const bool fresh = snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U;
 
   if (fresh) {
     if (!g_teensy_ready) {
-      Serial.printf("AIR READY teensy_link seq=%lu t_us=%lu\n",
-                    (unsigned long)snap.seq,
-                    (unsigned long)snap.t_us);
+      if (serialNoiseEnabled()) {
+        Serial.printf("AIR READY teensy_link seq=%lu t_us=%lu\n",
+                      (unsigned long)snap.seq,
+                      (unsigned long)snap.t_us);
+      }
       g_teensy_ready = true;
       g_teensy_wait_printed = false;
     }
@@ -812,42 +1586,33 @@ void updateTeensyReadiness(const uart_telem::Snapshot& snap) {
   }
 
   if (g_teensy_ready) {
-    Serial.printf("AIR WAIT teensy telemetry timeout_ms=%lu\n",
-                  (unsigned long)(snap.stats.last_rx_ms ? (now - snap.stats.last_rx_ms) : 0U));
-    uart_telem::resync();
-    Serial.printf("AIR WARN teensy_uart_resync rx_bytes=%lu ok=%lu cobs=%lu len=%lu unk=%lu\n",
-                  (unsigned long)snap.stats.rx_bytes,
-                  (unsigned long)snap.stats.frames_ok,
-                  (unsigned long)snap.stats.cobs_err,
-                  (unsigned long)snap.stats.len_err,
-                  (unsigned long)snap.stats.unknown_msg);
+    if (serialNoiseEnabled()) {
+      Serial.printf("AIR WAIT teensy_link telemetry timeout_ms=%lu\n",
+                    (unsigned long)(snap.stats.last_rx_ms ? (now - snap.stats.last_rx_ms) : 0U));
+    }
+    teensy_link::resync();
+    if (serialNoiseEnabled()) {
+      Serial.printf("AIR WARN teensy_link_resync rx_bytes=%lu ok=%lu cobs=%lu len=%lu unk=%lu\n",
+                    (unsigned long)snap.stats.rx_bytes,
+                    (unsigned long)snap.stats.frames_ok,
+                    (unsigned long)snap.stats.cobs_err,
+                    (unsigned long)snap.stats.len_err,
+                    (unsigned long)snap.stats.unknown_msg);
+    }
     g_teensy_ready = false;
     g_wait_stream_rate_ack = true;
     g_last_stream_rate_tx_ms = 0;
     return;
   }
 
-  if (!g_teensy_wait_printed) {
-    Serial.println("AIR WAIT teensy telemetry");
+  if (!g_teensy_wait_printed && serialNoiseEnabled()) {
+    Serial.println("AIR WAIT teensy_link telemetry");
     g_teensy_wait_printed = true;
   }
 }
 
-void publishPendingTelemetry() {
-  if (!radio_link::stateOnlyMode()) {
-    uart_telem::clearPendingStates();
-    return;
-  }
-  if (!radio_link::hasPeer()) return;
-  uart_telem::PendingState pending = {};
-  while (radio_link::txQueueFree() > kStateTxReserveSlots && uart_telem::popPendingState(pending)) {
-    if (!radio_link::publishState(pending.state, pending.seq, pending.t_us)) {
-      break;
-    }
-  }
-}
-
-void maybeRecoverRadioLink(const uart_telem::Snapshot& snap) {
+void maybeRecoverRadioLink(const teensy_link::Snapshot& snap) {
+  if (isStandaloneBench()) return;
   const auto link = radio_link::stats();
   const uint32_t now = millis();
   if (link.tx_packets != g_last_radio_tx_packets || link.rx_packets != g_last_radio_rx_packets) {
@@ -866,13 +1631,21 @@ void maybeRecoverRadioLink(const uart_telem::Snapshot& snap) {
   if ((uint32_t)(now - g_last_radio_progress_ms) < kRadioProgressTimeoutMs) return;
   if ((uint32_t)(now - g_last_radio_recovery_ms) < kRadioRecoveryCooldownMs) return;
 
-  Serial.printf("AIR WARN radio_watchdog restart idle_ms=%lu tx=%lu rx=%lu peer=%s\n",
-                (unsigned long)(now - g_last_radio_progress_ms),
-                (unsigned long)link.tx_packets,
-                (unsigned long)link.rx_packets,
-                radio_link::peerMac().c_str());
+  if (serialNoiseEnabled()) {
+    Serial.printf("AIR WARN radio_watchdog restart idle_ms=%lu tx=%lu rx=%lu peer=%s\n",
+                  (unsigned long)(now - g_last_radio_progress_ms),
+                  (unsigned long)link.tx_packets,
+                  (unsigned long)link.rx_packets,
+                  radio_link::peerMac().c_str());
+  }
   g_last_radio_recovery_ms = now;
-  restartWifiStation();
+  if (kEnableRadioWatchdogRestart) {
+    restartWifiStation();
+  } else {
+    if (serialNoiseEnabled()) {
+      Serial.println("AIR INFO radio_watchdog auto_restart=disabled");
+    }
+  }
 }
 
 }  // namespace
@@ -883,7 +1656,7 @@ void setup() {
 
   config_store::begin();
   const AppConfig& cfg = config_store::get();
-  Serial.printf("UART port=%u rx=%u tx=%u baud=%lu\n",
+  Serial.printf("TEENSY LINK cfg(legacy_uart_fields) port=%u rx=%u tx=%u baud=%lu\n",
                 (unsigned)cfg.uart_port,
                 (unsigned)cfg.uart_rx_pin,
                 (unsigned)cfg.uart_tx_pin,
@@ -893,13 +1666,21 @@ void setup() {
 
   const bool air_file_logging_enabled = kEnableAirFileLogging;
 
-  uart_telem::begin(cfg);
-  radio_link::begin(cfg);
+  teensy_link::begin(cfg);
+  if (!isStandaloneBench()) {
+    radio_link::begin(cfg);
+  }
   replay_bridge::begin();
-  sd_capture_test::begin();
   log_store::begin(cfg, air_file_logging_enabled);
-  radio_link::setRecorderEnabled(air_file_logging_enabled);
+  g_console_log_session_id = log_store::highestLogSessionId();
+  if (!isStandaloneBench()) {
+    radio_link::setRecorderEnabled(air_file_logging_enabled);
+  }
   Serial.printf("AIR INFO recorder=%s\n", air_file_logging_enabled ? "on" : "off");
+  Serial.printf("AIR INFO next_session=%lu\n", (unsigned long)(g_console_log_session_id + 1U));
+  if (isStandaloneBench()) {
+    Serial.println("AIR INFO mode=standalone_bench spi_dma=1 radio=0");
+  }
   g_last_stream_rate_ui_hz = 0;
   g_last_stream_rate_log_hz = 0;
   g_last_stream_rate_tx_ms = 0;
@@ -911,22 +1692,25 @@ void setup() {
 void loop() {
   handleConsoleCommands();
   serviceGpioPulse();
-  sd_capture_test::poll();
+  serviceSdSoakBenchmark();
   log_store::poll();
   serviceReplayCapture();
+  serviceReplayCompare();
+  serviceBenchSweep();
   if (g_baseline_active &&
       (uint32_t)(millis() - g_baseline_started_ms) >= g_baseline_duration_ms) {
     stopBaselineBenchmark();
   }
-  if (radio_link::takeNetworkResetRequest()) {
+  if (!isStandaloneBench() && radio_link::takeNetworkResetRequest()) {
     restartWifiStation();
   }
-  uart_telem::poll();
-  radio_link::poll();
+  if (!isStandaloneBench()) {
+    radio_link::poll();
+  }
   replay_bridge::poll();
   updateWifiReadiness();
 
-  const auto snap = uart_telem::snapshot();
+  const auto snap = teensy_link::snapshot();
   updateTeensyReadiness(snap);
 
   if (g_wait_getfusion_ack && snap.has_ack && snap.ack_command == 101U &&
@@ -953,24 +1737,21 @@ void loop() {
     g_wait_stream_rate_ack = !snap.ack_ok;
   }
 
-  ensureConfiguredStreamRate();
-  publishPendingTelemetry();
-  radio_link::publish(snap);
+  if (isStandaloneBench()) {
+    ensureConfiguredCaptureRate();
+  } else {
+    ensureConfiguredStreamRate();
+    radio_link::publish(snap);
+  }
   maybeRecoverRadioLink(snap);
 
-  const auto cap = sd_capture_test::stats();
-  if (g_sd_capture_was_active && !cap.active && cap.completed) {
-    printSdCaptureImpactReport();
-    sd_capture_test::clearCompleted();
-  }
-  g_sd_capture_was_active = cap.active;
   if (!g_baseline_active && g_baseline_completed) {
     printBaselineImpactReport();
     g_baseline_completed = false;
   }
 
   const uint32_t now = millis();
-  if (g_stats_streaming && (uint32_t)(now - g_last_stat_ms) >= 1000U) {
+  if (!g_quiet_serial && g_stats_streaming && (uint32_t)(now - g_last_stat_ms) >= 1000U) {
     g_last_stat_ms = now;
     printStats(snap);
   }

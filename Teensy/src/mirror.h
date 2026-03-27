@@ -58,6 +58,26 @@ struct RxDebugStats {
   uint16_t lastMsgType;
 };
 
+struct ReplayPerfSnapshot {
+  uint32_t poll_rx_avg_us;
+  uint32_t poll_rx_max_us;
+  uint32_t apply_input_avg_us;
+  uint32_t apply_input_max_us;
+  uint32_t submit_sample_avg_us;
+  uint32_t submit_sample_max_us;
+  uint32_t queue_meta_avg_us;
+  uint32_t queue_meta_max_us;
+  uint32_t send_state_avg_us;
+  uint32_t send_state_max_us;
+  uint32_t push_state_avg_us;
+  uint32_t push_state_max_us;
+  uint32_t replay_inputs_per_poll_avg;
+  uint32_t replay_inputs_per_poll_max;
+  uint32_t replay_ctrls_per_poll_avg;
+  uint32_t replay_ctrls_per_poll_max;
+  uint32_t replay_output_queue_depth_max;
+};
+
 void begin();
 void pollRx(State& s);
 bool sendFastState(const State& s, uint32_t seq, uint32_t t_us,
@@ -70,5 +90,7 @@ uint16_t logRateHz();
 uint32_t streamPeriodUs();
 bool replayActive();
 bool takeReplayOutputMeta(ReplayOutputMeta& out);
+void getReplayPerfSnapshot(ReplayPerfSnapshot& out);
+void resetReplayPerf();
 
 }  // namespace mirror

@@ -31,6 +31,67 @@ uint8_t g_replayOutputHead = 0U;
 uint8_t g_replayOutputTail = 0U;
 uint8_t g_replayOutputCount = 0U;
 
+struct PerfCounter {
+  uint32_t calls = 0U;
+  uint64_t total_us = 0U;
+  uint32_t max_us = 0U;
+  void reset() {
+    calls = 0U;
+    total_us = 0U;
+    max_us = 0U;
+  }
+  void record(uint32_t elapsed_us) {
+    calls++;
+    total_us += elapsed_us;
+    if (elapsed_us > max_us) max_us = elapsed_us;
+  }
+  uint32_t avgUs() const {
+    return (calls > 0U) ? (uint32_t)(total_us / (uint64_t)calls) : 0U;
+  }
+};
+
+struct CountCounter {
+  uint32_t calls = 0U;
+  uint64_t total = 0U;
+  uint32_t max_value = 0U;
+  void reset() {
+    calls = 0U;
+    total = 0U;
+    max_value = 0U;
+  }
+  void record(uint32_t value) {
+    calls++;
+    total += value;
+    if (value > max_value) max_value = value;
+  }
+  uint32_t avg() const {
+    return (calls > 0U) ? (uint32_t)(total / (uint64_t)calls) : 0U;
+  }
+};
+
+struct ReplayPerfStats {
+  PerfCounter poll_rx;
+  PerfCounter apply_input;
+  PerfCounter submit_sample;
+  PerfCounter queue_meta;
+  PerfCounter send_state;
+  PerfCounter push_state;
+  CountCounter replay_inputs_per_poll;
+  CountCounter replay_ctrls_per_poll;
+  uint32_t replay_output_queue_depth_max = 0U;
+  void reset() {
+    poll_rx.reset();
+    apply_input.reset();
+    submit_sample.reset();
+    queue_meta.reset();
+    send_state.reset();
+    push_state.reset();
+    replay_inputs_per_poll.reset();
+    replay_ctrls_per_poll.reset();
+    replay_output_queue_depth_max = 0U;
+  }
+} g_replay_perf;
+
 int16_t quantizeSigned(float value, float scale) {
   if (!isfinite(value)) return 0;
   const float scaled = value * scale;
@@ -89,6 +150,23 @@ void handleReplayControl(const telem::ReplayControlRecord160& replay) {
     case telem::CMD_GET_FUSION_SETTINGS:
       g_dbg.cmdGetFusion++;
       return;
+    case telem::CMD_SET_CAPTURE_SETTINGS: {
+      if (replay.payload.payload_len < sizeof(telem::CmdSetCaptureSettingsV1)) {
+        g_dbg.lenErr++;
+        return;
+      }
+      telem::CmdSetCaptureSettingsV1 cmd = {};
+      memcpy(&cmd, payload, sizeof(cmd));
+      imu_fusion::CaptureSettings cfg = {};
+      cfg.sourceRateHz = cmd.source_rate_hz;
+      (void)imu_fusion::setCaptureSettings(cfg, nullptr);
+      return;
+    }
+    case telem::CMD_GET_CAPTURE_SETTINGS:
+      return;
+    case telem::CMD_SAVE_CAPTURE_SETTINGS:
+      (void)imu_fusion::savePersistedCaptureSettings();
+      return;
     case telem::CMD_SET_STREAM_RATE: {
       if (replay.payload.payload_len < sizeof(telem::CmdSetStreamRateV1)) {
         g_dbg.lenErr++;
@@ -118,6 +196,7 @@ void setReplayActive(bool active) {
 }
 
 void queueReplayOutputMeta(const ReplayOutputMeta& meta) {
+  const uint32_t start_us = micros();
   if (g_replayOutputCount >= kReplayOutputQueueDepth) {
     g_replayOutputTail = (uint8_t)((g_replayOutputTail + 1U) % kReplayOutputQueueDepth);
     g_replayOutputCount--;
@@ -125,9 +204,14 @@ void queueReplayOutputMeta(const ReplayOutputMeta& meta) {
   g_replayOutputQueue[g_replayOutputHead] = meta;
   g_replayOutputHead = (uint8_t)((g_replayOutputHead + 1U) % kReplayOutputQueueDepth);
   g_replayOutputCount++;
+  if (g_replayOutputCount > g_replay_perf.replay_output_queue_depth_max) {
+    g_replay_perf.replay_output_queue_depth_max = g_replayOutputCount;
+  }
+  g_replay_perf.queue_meta.record(micros() - start_us);
 }
 
 void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
+  const uint32_t start_us = micros();
   const telem::ReplayInputPayloadV1& p = replay.payload;
   ReplayInputMetaV1 meta = {};
   memcpy(&meta, p.reserved, sizeof(meta));
@@ -136,6 +220,7 @@ void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
   setReplayActive(true);
 
   if ((p.present_mask & (telem::kSensorPresentImu | telem::kSensorPresentMag)) != 0U) {
+    const uint32_t submit_start_us = micros();
     (void)imu_fusion::submitReplaySample(
         (float)p.accel_milli_mps2[0] * 0.001f,
         (float)p.accel_milli_mps2[1] * 0.001f,
@@ -147,6 +232,7 @@ void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
         (float)p.mag_milli_uT[1] * 0.001f,
         (float)p.mag_milli_uT[2] * 0.001f,
         replay.hdr.t_us);
+    g_replay_perf.submit_sample.record(micros() - submit_start_us);
   }
 
   if ((p.present_mask & telem::kSensorPresentGps) != 0U) {
@@ -202,6 +288,7 @@ void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
   out.baro_alt_m = (float)p.baro_alt_mm * 0.001f;
   out.baro_vsi_mps = (float)p.baro_vsi_milli_mps * 0.001f;
   queueReplayOutputMeta(out);
+  g_replay_perf.apply_input.record(micros() - start_us);
 }
 
 }  // namespace
@@ -212,6 +299,7 @@ void begin() {
   g_logRateHz = kDefaultLogRateHz;
   g_replayActive = false;
   g_lastReplayRxMs = 0U;
+  g_replay_perf.reset();
   spi_bridge::begin();
 }
 
@@ -240,6 +328,7 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us,
   (void)replay_meta;
   return false;
 #else
+  const uint32_t send_start_us = micros();
   (void)seq;
   (void)t_us;
   telem::TelemetryFullStateV1 payload = {};
@@ -310,8 +399,11 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us,
   if (fusionMagneticError) payload.flags |= telem::kStateFlagFusionMagneticError;
   if (fusionMagnetometerIgnored) payload.flags |= telem::kStateFlagFusionMagnetometerIgnored;
   packFusionReplayDiagnostics(payload, replay_diag);
-
-  return spi_bridge::pushStateRecord(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload));
+  const uint32_t push_start_us = micros();
+  const bool ok = spi_bridge::pushStateRecord(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload));
+  g_replay_perf.push_state.record(micros() - push_start_us);
+  g_replay_perf.send_state.record(micros() - send_start_us);
+  return ok;
 #endif
 }
 
@@ -320,6 +412,9 @@ void pollRx(State& s) {
   (void)s;
   return;
 #else
+  const uint32_t poll_start_us = micros();
+  uint32_t replay_inputs = 0U;
+  uint32_t replay_ctrls = 0U;
   spi_bridge::poll();
   uint8_t record[kRecordBytes] = {};
   while (spi_bridge::popReplayRecord(record, sizeof(record))) {
@@ -335,6 +430,7 @@ void pollRx(State& s) {
 
     if (hdr.kind == (uint8_t)telem::ReplayRecordKind::Input) {
       g_dbg.replayInputFrames++;
+      replay_inputs++;
       telem::ReplayInputRecord160 replay = {};
       memcpy(&replay, record, sizeof(replay));
       applyReplayInput(s, replay);
@@ -343,6 +439,7 @@ void pollRx(State& s) {
 
     if (hdr.kind == (uint8_t)telem::ReplayRecordKind::Control) {
       g_dbg.replayControlFrames++;
+      replay_ctrls++;
       telem::ReplayControlRecord160 replay = {};
       memcpy(&replay, record, sizeof(replay));
       handleReplayControl(replay);
@@ -356,6 +453,9 @@ void pollRx(State& s) {
     g_lastReplayRxMs = 0U;
     setReplayActive(false);
   }
+  g_replay_perf.replay_inputs_per_poll.record(replay_inputs);
+  g_replay_perf.replay_ctrls_per_poll.record(replay_ctrls);
+  g_replay_perf.poll_rx.record(micros() - poll_start_us);
 #endif
 }
 
@@ -386,6 +486,30 @@ bool takeReplayOutputMeta(ReplayOutputMeta& out) {
   g_replayOutputTail = (uint8_t)((g_replayOutputTail + 1U) % kReplayOutputQueueDepth);
   g_replayOutputCount--;
   return true;
+}
+
+void getReplayPerfSnapshot(ReplayPerfSnapshot& out) {
+  out.poll_rx_avg_us = g_replay_perf.poll_rx.avgUs();
+  out.poll_rx_max_us = g_replay_perf.poll_rx.max_us;
+  out.apply_input_avg_us = g_replay_perf.apply_input.avgUs();
+  out.apply_input_max_us = g_replay_perf.apply_input.max_us;
+  out.submit_sample_avg_us = g_replay_perf.submit_sample.avgUs();
+  out.submit_sample_max_us = g_replay_perf.submit_sample.max_us;
+  out.queue_meta_avg_us = g_replay_perf.queue_meta.avgUs();
+  out.queue_meta_max_us = g_replay_perf.queue_meta.max_us;
+  out.send_state_avg_us = g_replay_perf.send_state.avgUs();
+  out.send_state_max_us = g_replay_perf.send_state.max_us;
+  out.push_state_avg_us = g_replay_perf.push_state.avgUs();
+  out.push_state_max_us = g_replay_perf.push_state.max_us;
+  out.replay_inputs_per_poll_avg = g_replay_perf.replay_inputs_per_poll.avg();
+  out.replay_inputs_per_poll_max = g_replay_perf.replay_inputs_per_poll.max_value;
+  out.replay_ctrls_per_poll_avg = g_replay_perf.replay_ctrls_per_poll.avg();
+  out.replay_ctrls_per_poll_max = g_replay_perf.replay_ctrls_per_poll.max_value;
+  out.replay_output_queue_depth_max = g_replay_perf.replay_output_queue_depth_max;
+}
+
+void resetReplayPerf() {
+  g_replay_perf.reset();
 }
 
 }  // namespace mirror

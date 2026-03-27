@@ -1,14 +1,15 @@
-#include "uart_telem.h"
+#include "teensy_link.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <string.h>
 
 #include "config_store.h"
 #include "log_store.h"
 #include "replay_bridge.h"
-#include "sd_capture_test.h"
 #include "spi_bridge.h"
 
-namespace uart_telem {
+namespace teensy_link {
 namespace {
 
 uint32_t g_tx_seq = 1U;
@@ -29,6 +30,10 @@ uint32_t g_ack_rx_seq = 0U;
 uint16_t g_ack_command = 0U;
 bool g_ack_ok = false;
 uint32_t g_ack_code = 0U;
+TaskHandle_t g_service_task = nullptr;
+constexpr uint32_t kServicePeriodMs = 1U;
+constexpr uint32_t kServiceTaskStack = 4096U;
+constexpr UBaseType_t kServiceTaskPriority = 2U;
 constexpr uint16_t kPendingStateDepth = 128U;
 PendingState g_pending_states[kPendingStateDepth] = {};
 uint16_t g_pending_head = 0U;
@@ -90,6 +95,71 @@ void clearPendingStateQueueLocked() {
   g_pending_tail = 0U;
 }
 
+void servicePoll() {
+  const uint32_t poll_started_ms = millis();
+  uint32_t state_records_drained = 0U;
+  uint32_t raw_records_drained = 0U;
+
+  spi_bridge::poll();
+  const bool standalone_bench = config_store::get().standalone_bench != 0U;
+  uint8_t record[sizeof(telem::TelemetryFullStateV1)] = {};
+  while (spi_bridge::popStateRecord(record, sizeof(record))) {
+    telem::TelemetryFullStateV1 tmp = {};
+    memcpy(&tmp, record, sizeof(tmp));
+    uint32_t seq = 0U;
+    uint32_t t_us = 0U;
+    if (!replay_bridge::takeOutputSourceStamp(seq, t_us)) {
+      seq = ++g_local_state_seq;
+      t_us = micros();
+    }
+
+    portENTER_CRITICAL(&g_mux);
+    g_state = tmp;
+    g_has_state = true;
+    g_seq = seq;
+    g_t_us = t_us;
+    g_stats.rx_bytes += sizeof(tmp);
+    g_stats.frames_ok++;
+    g_stats.last_rx_ms = millis();
+    updateFusionFromStateLocked(tmp);
+    queuePendingStateLocked(tmp, seq, t_us);
+    portEXIT_CRITICAL(&g_mux);
+
+    if (!standalone_bench) {
+      log_store::enqueueState(seq, t_us, tmp);
+    }
+    state_records_drained++;
+  }
+
+  uint8_t raw_record[sizeof(telem::ReplayInputRecord160)] = {};
+  while (spi_bridge::popRawRecord(raw_record, sizeof(raw_record))) {
+    telem::ReplayInputRecord160 replay = {};
+    memcpy(&replay, raw_record, sizeof(replay));
+    log_store::enqueueReplayInput(replay.hdr.seq, replay.hdr.t_us, replay);
+    raw_records_drained++;
+  }
+
+  portENTER_CRITICAL(&g_mux);
+  const uint32_t last_poll_ms = g_stats.last_poll_ms;
+  if (last_poll_ms != 0U) {
+    const uint32_t gap_ms = poll_started_ms - last_poll_ms;
+    if (gap_ms > g_stats.max_poll_gap_ms) g_stats.max_poll_gap_ms = gap_ms;
+  }
+  g_stats.last_poll_ms = poll_started_ms;
+  g_stats.poll_runs++;
+  g_stats.state_records_drained += state_records_drained;
+  g_stats.raw_records_drained += raw_records_drained;
+  portEXIT_CRITICAL(&g_mux);
+}
+
+void serviceTask(void* param) {
+  (void)param;
+  for (;;) {
+    servicePoll();
+    vTaskDelay(pdMS_TO_TICKS(kServicePeriodMs));
+  }
+}
+
 }  // namespace
 
 void begin(const AppConfig& cfg) {
@@ -114,6 +184,10 @@ void begin(const AppConfig& cfg) {
   clearPendingStateQueueLocked();
   portEXIT_CRITICAL(&g_mux);
   spi_bridge::begin();
+  if (!g_service_task) {
+    xTaskCreatePinnedToCore(serviceTask, "teensy_link", kServiceTaskStack, nullptr,
+                            kServiceTaskPriority, &g_service_task, 1);
+  }
 }
 
 void reconfigure(const AppConfig& cfg) {
@@ -121,33 +195,7 @@ void reconfigure(const AppConfig& cfg) {
 }
 
 void poll() {
-  spi_bridge::poll();
-  uint8_t record[sizeof(telem::TelemetryFullStateV1)] = {};
-  while (spi_bridge::popStateRecord(record, sizeof(record))) {
-    telem::TelemetryFullStateV1 tmp = {};
-    memcpy(&tmp, record, sizeof(tmp));
-    uint32_t seq = 0U;
-    uint32_t t_us = 0U;
-    if (!replay_bridge::takeOutputSourceStamp(seq, t_us)) {
-      seq = ++g_local_state_seq;
-      t_us = micros();
-    }
-
-    portENTER_CRITICAL(&g_mux);
-    g_state = tmp;
-    g_has_state = true;
-    g_seq = seq;
-    g_t_us = t_us;
-    g_stats.rx_bytes += sizeof(tmp);
-    g_stats.frames_ok++;
-    g_stats.last_rx_ms = millis();
-    updateFusionFromStateLocked(tmp);
-    queuePendingStateLocked(tmp, seq, t_us);
-    portEXIT_CRITICAL(&g_mux);
-
-    log_store::enqueueState(seq, t_us, tmp);
-    sd_capture_test::enqueueState(seq, t_us, tmp);
-  }
+  servicePoll();
 }
 
 void resync(bool drain_input) {
@@ -231,6 +279,26 @@ bool sendGetFusionSettings() {
   return ok;
 }
 
+bool sendSetCaptureSettings(const telem::CmdSetCaptureSettingsV1& cmd) {
+  const bool ok = queueReplayControl(telem::CMD_SET_CAPTURE_SETTINGS, &cmd, sizeof(cmd));
+  if (ok) {
+    portENTER_CRITICAL(&g_mux);
+    setAckLocked(telem::CMD_SET_CAPTURE_SETTINGS, true, 0U);
+    portEXIT_CRITICAL(&g_mux);
+  }
+  return ok;
+}
+
+bool sendSaveCaptureSettings() {
+  const bool ok = queueReplayControl(telem::CMD_SAVE_CAPTURE_SETTINGS, nullptr, 0U);
+  if (ok) {
+    portENTER_CRITICAL(&g_mux);
+    setAckLocked(telem::CMD_SAVE_CAPTURE_SETTINGS, true, 0U);
+    portEXIT_CRITICAL(&g_mux);
+  }
+  return ok;
+}
+
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd) {
   const bool ok = queueReplayControl(telem::CMD_SET_STREAM_RATE, &cmd, sizeof(cmd));
   if (ok) {
@@ -257,4 +325,4 @@ bool probeRxPin(uint8_t rx_pin, uint32_t baud, uint32_t dwell_ms, uint32_t& out_
   return false;
 }
 
-}  // namespace uart_telem
+}  // namespace teensy_link

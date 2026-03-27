@@ -4,7 +4,7 @@
 #include "config_store.h"
 #include "types_shared.h"
 
-namespace uart_telem {
+namespace teensy_link {
 
 struct RxStats {
   uint32_t rx_bytes;
@@ -15,6 +15,11 @@ struct RxStats {
   uint32_t unknown_msg;
   uint32_t drop;
   uint32_t last_rx_ms;
+  uint32_t last_poll_ms;
+  uint32_t max_poll_gap_ms;
+  uint32_t poll_runs;
+  uint32_t state_records_drained;
+  uint32_t raw_records_drained;
 };
 
 struct Snapshot {
@@ -59,10 +64,12 @@ bool popPendingState(PendingState& out);
 void clearPendingStates();
 LoopbackResult runLoopbackTest(uint32_t timeout_ms = 120U);
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd);
+bool sendSetCaptureSettings(const telem::CmdSetCaptureSettingsV1& cmd);
+bool sendSaveCaptureSettings();
 bool sendGetFusionSettings();
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd);
 bool sendReplayInputRecord(const telem::ReplayInputRecord160& record);
 bool sendReplayControlRecord(const telem::ReplayControlRecord160& record);
 bool probeRxPin(uint8_t rx_pin, uint32_t baud, uint32_t dwell_ms, uint32_t& out_bytes);
 
-}  // namespace uart_telem
+}  // namespace teensy_link
