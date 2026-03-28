@@ -57,6 +57,11 @@ struct RecorderStatus {
 void begin(const AppConfig& cfg, bool enabled = true);
 void setConfig(const AppConfig& cfg);
 void setEnabled(bool enabled);
+void setIdleMediaChecksEnabled(bool enabled);
+void setNextSessionMetadata(const String& source_name, uint16_t replay_average_factor,
+                            uint16_t applied_capture_rate_hz, uint16_t override_mask = 0U,
+                            uint16_t flags = 0U);
+void clearNextSessionMetadata();
 bool startSession(uint32_t session_id);
 void stopSession();
 void poll();

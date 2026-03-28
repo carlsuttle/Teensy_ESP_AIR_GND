@@ -19,7 +19,7 @@ constexpr char LOG_DIR[] = "/logs";
 constexpr char kBinaryExt[] = ".tlog";
 constexpr char kSessionMetaPath[] = "/logs/session.meta";
 constexpr size_t kBlockBytes = 10000U;
-constexpr size_t kBlockCount = 4U;
+constexpr size_t kBlockCount = 64U;
 constexpr size_t kBenchRingDepth = 512U;
 constexpr uint32_t kMaxReportableFreeBytes = telem::kLogBytesUnknown - 1U;
 constexpr uint32_t kLogMagic = 0x4C4F4731UL;  // "LOG1"
@@ -111,7 +111,7 @@ QueueHandle_t g_free_block_queue = nullptr;
 QueueHandle_t g_full_block_queue = nullptr;
 Stats g_stats = {};
 RecorderStatus g_recorder = {};
-Block g_blocks[kBlockCount] = {};
+Block* g_blocks = nullptr;
 BinaryLogRecordV2* g_bench_ring = nullptr;
 uint8_t* g_bench_write_buffer = nullptr;
 int g_active_block_index = -1;
@@ -124,10 +124,22 @@ uint32_t g_bench_last_write_ms = 0U;
 uint32_t g_last_status_refresh_ms = 0U;
 uint32_t g_last_probe_attempt_ms = 0U;
 uint32_t g_last_idle_media_check_ms = 0U;
+bool g_idle_media_checks_enabled = true;
 uint16_t g_bench_ring_head = 0U;
 uint16_t g_bench_ring_tail = 0U;
+struct PendingLogMetadata {
+  bool valid = false;
+  uint16_t replay_average_factor = 1U;
+  uint16_t applied_capture_rate_hz = 0U;
+  uint16_t override_mask = 0U;
+  uint16_t flags = 0U;
+  String source_name;
+};
+PendingLogMetadata g_next_log_metadata = {};
 portMUX_TYPE g_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_bench_ring_mux = portMUX_INITIALIZER_UNLOCKED;
+
+constexpr uint32_t kLogMetadataSchemaVersion = 1U;
 
 void defaultSessionMeta(SessionMetaRecord& meta) {
   memset(&meta, 0, sizeof(meta));
@@ -264,6 +276,8 @@ String makeSiblingName(const String& log_path, const char* suffix, const char* e
   return stem;
 }
 
+bool writeCurrentFileBytes(const uint8_t* data, size_t len, uint32_t& elapsed_ms);
+
 void appendCsvSep(String& line) {
   if (!line.isEmpty()) line += ',';
 }
@@ -344,6 +358,7 @@ const char* recordKindName(uint16_t kind) {
     case telem::LogRecordKind::State160: return "state160";
     case telem::LogRecordKind::ReplayControl160: return "replay_control160";
     case telem::LogRecordKind::ReplayInput160: return "replay_input160";
+    case telem::LogRecordKind::Metadata160: return "metadata160";
     default: return "unknown";
   }
 }
@@ -624,6 +639,9 @@ bool exportSingleLogToCsv(File& src, File& csv, uint32_t& rows, uint32_t& unsupp
 
     bool ok = false;
     switch ((telem::LogRecordKind)record.record_kind) {
+      case telem::LogRecordKind::Metadata160:
+        ok = writeUnknownCsvRow(csv, record);
+        break;
       case telem::LogRecordKind::State160:
         ok = writeStateCsvRow(csv, record);
         break;
@@ -723,6 +741,7 @@ bool stateCoreMatches(const telem::TelemetryFullStateV1& a, const telem::Telemet
 void resetBlockQueues() {
   g_active_block_index = -1;
   g_close_pending = false;
+  if (!g_blocks) return;
   if (g_free_block_queue) xQueueReset(g_free_block_queue);
   if (g_full_block_queue) xQueueReset(g_full_block_queue);
   for (int i = 0; i < (int)kBlockCount; ++i) {
@@ -748,7 +767,64 @@ bool openCurrentLog() {
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
-  return (bool)g_file;
+  if (!g_file) {
+    g_next_log_metadata = {};
+    return false;
+  }
+
+  telem::LogMetadataPayloadV1 metadata = {};
+  metadata.schema_version = kLogMetadataSchemaVersion;
+  metadata.file_session_id = g_recorder.session_id;
+  metadata.replay_average_factor = g_next_log_metadata.valid ? g_next_log_metadata.replay_average_factor : 1U;
+  metadata.applied_capture_rate_hz = g_next_log_metadata.valid ? g_next_log_metadata.applied_capture_rate_hz
+                                                               : config_store::get().source_rate_hz;
+  metadata.override_mask = g_next_log_metadata.valid ? g_next_log_metadata.override_mask : 0U;
+  metadata.flags = g_next_log_metadata.valid ? g_next_log_metadata.flags : 0U;
+
+  if (g_next_log_metadata.valid) {
+    uint32_t parent_session_id = 0U;
+    uint32_t parent_stamp = 0U;
+    const String normalized_source = normalizeLogPath(g_next_log_metadata.source_name);
+    if (parseLogNameParts(normalized_source, parent_session_id, parent_stamp)) {
+      metadata.parent_session_id = parent_session_id;
+    }
+    const String short_source_name = g_next_log_metadata.source_name.startsWith("/logs/")
+                                         ? g_next_log_metadata.source_name.substring(6)
+                                         : g_next_log_metadata.source_name;
+    short_source_name.substring(0, sizeof(metadata.source_name) - 1U)
+        .toCharArray(metadata.source_name, sizeof(metadata.source_name));
+  }
+
+  const String short_current_name = g_current_name.startsWith("/logs/") ? g_current_name.substring(6) : g_current_name;
+  short_current_name.substring(0, sizeof(metadata.file_name) - 1U)
+      .toCharArray(metadata.file_name, sizeof(metadata.file_name));
+
+  BinaryLogRecordV2 record = {};
+  record.magic = kLogMagic;
+  record.version = kLogVersion;
+  record.record_size = (uint16_t)sizeof(record);
+  record.record_kind = (uint16_t)telem::LogRecordKind::Metadata160;
+  memcpy(record.payload, &metadata, sizeof(metadata));
+
+  uint32_t elapsed_ms = 0U;
+  const bool wrote_metadata = writeCurrentFileBytes((const uint8_t*)&record, sizeof(record), elapsed_ms);
+  portENTER_CRITICAL(&g_stats_mux);
+  recordDuration(elapsed_ms, g_stats.fs_write_last_ms, g_stats.fs_write_max_ms);
+  if (wrote_metadata) {
+    g_stats.records_written++;
+    g_stats.bytes_written += sizeof(record);
+    if (sizeof(record) > g_stats.max_write_bytes) g_stats.max_write_bytes = sizeof(record);
+  }
+  portEXIT_CRITICAL(&g_stats_mux);
+  if (wrote_metadata) g_recorder.bytes_written = g_stats.bytes_written;
+  g_next_log_metadata = {};
+  if (!wrote_metadata) {
+    g_file.close();
+    g_file = File();
+    g_current_name = "";
+    return false;
+  }
+  return true;
 }
 
 bool recoverCurrentLogAfterWriteFailure() {
@@ -874,6 +950,7 @@ void abortSessionNoMedia() {
 }
 
 bool acquireFreeBlock(int& block_index) {
+  if (!g_blocks) return false;
   if (!g_free_block_queue) return false;
   if (xQueueReceive(g_free_block_queue, &block_index, 0) != pdTRUE) {
     portENTER_CRITICAL(&g_stats_mux);
@@ -888,6 +965,7 @@ bool acquireFreeBlock(int& block_index) {
 }
 
 void releaseBlock(int block_index) {
+  if (!g_blocks) return;
   if (block_index < 0 || block_index >= (int)kBlockCount) return;
   g_blocks[block_index].used_bytes = 0U;
   g_blocks[block_index].record_count = 0U;
@@ -898,6 +976,7 @@ void releaseBlock(int block_index) {
 }
 
 bool queueBlockForWrite(int block_index) {
+  if (!g_blocks) return false;
   if (block_index < 0 || block_index >= (int)kBlockCount || !g_full_block_queue) return false;
   if (xQueueSend(g_full_block_queue, &block_index, 0) != pdTRUE) {
     portENTER_CRITICAL(&g_stats_mux);
@@ -915,6 +994,7 @@ bool queueBlockForWrite(int block_index) {
 bool enqueueRecord(const BinaryLogRecordV2& record) {
   LockGuard lock(g_state_mutex);
   if (!g_recorder.active) return false;
+  if (!g_blocks) return false;
 
   if (g_active_block_index < 0) {
     if (!acquireFreeBlock(g_active_block_index)) {
@@ -1137,6 +1217,15 @@ void begin(const AppConfig& cfg, bool enabled) {
   if (!g_state_mutex) g_state_mutex = xSemaphoreCreateMutex();
   if (!g_free_block_queue) g_free_block_queue = xQueueCreate(kBlockCount, sizeof(int));
   if (!g_full_block_queue) g_full_block_queue = xQueueCreate(kBlockCount, sizeof(int));
+  if (!g_blocks) {
+    g_blocks = (Block*)heap_caps_malloc(sizeof(Block) * kBlockCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_blocks) {
+      g_blocks = (Block*)heap_caps_malloc(sizeof(Block) * kBlockCount, MALLOC_CAP_8BIT);
+    }
+    if (g_blocks) {
+      memset(g_blocks, 0, sizeof(Block) * kBlockCount);
+    }
+  }
   if (!g_bench_ring) {
     g_bench_ring = (BinaryLogRecordV2*)heap_caps_malloc(sizeof(BinaryLogRecordV2) * kBenchRingDepth,
                                                         MALLOC_CAP_8BIT);
@@ -1164,6 +1253,31 @@ void setEnabled(bool enabled) {
   refreshBackendStatus(true);
 }
 
+void setIdleMediaChecksEnabled(bool enabled) {
+  LockGuard lock(g_state_mutex);
+  g_idle_media_checks_enabled = enabled;
+  if (enabled) {
+    g_last_idle_media_check_ms = 0U;
+  }
+}
+
+void setNextSessionMetadata(const String& source_name, uint16_t replay_average_factor,
+                            uint16_t applied_capture_rate_hz, uint16_t override_mask,
+                            uint16_t flags) {
+  LockGuard lock(g_state_mutex);
+  g_next_log_metadata.valid = true;
+  g_next_log_metadata.source_name = source_name;
+  g_next_log_metadata.replay_average_factor = replay_average_factor ? replay_average_factor : 1U;
+  g_next_log_metadata.applied_capture_rate_hz = applied_capture_rate_hz;
+  g_next_log_metadata.override_mask = override_mask;
+  g_next_log_metadata.flags = flags;
+}
+
+void clearNextSessionMetadata() {
+  LockGuard lock(g_state_mutex);
+  g_next_log_metadata = {};
+}
+
 bool startSession(uint32_t session_id) {
   LockGuard lock(g_state_mutex);
   if (!g_recorder.feature_enabled) {
@@ -1184,6 +1298,7 @@ bool startSession(uint32_t session_id) {
   g_last_seq = 0U;
   g_last_replay_input_seq = 0U;
   if (!openCurrentLog()) {
+    g_next_log_metadata = {};
     refreshBackendStatus(true);
     return false;
   }
@@ -1239,7 +1354,9 @@ void poll() {
     g_recorder.media_present = false;
     g_recorder.free_bytes = telem::kLogBytesUnknown;
     g_recorder.init_hz = 0U;
-  } else if (sd_backend::mounted() && (uint32_t)(now - g_last_idle_media_check_ms) >= kIdleMediaCheckMs) {
+  } else if (g_idle_media_checks_enabled &&
+             sd_backend::mounted() &&
+             (uint32_t)(now - g_last_idle_media_check_ms) >= kIdleMediaCheckMs) {
     g_last_idle_media_check_ms = now;
     if (!sd_backend::mediaPresent()) {
       g_recorder.backend_ready = false;
@@ -1277,69 +1394,19 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1
 }
 
 void enqueueReplayInput(uint32_t seq, uint32_t t_us, const telem::ReplayInputRecord160& replay) {
-  if (!g_recorder.feature_enabled || !g_recorder.active) return;
-  if (seq == g_last_replay_input_seq) return;
-  g_last_replay_input_seq = seq;
-
-  BinaryLogRecordV2 record = {};
-  record.magic = kLogMagic;
-  record.version = kLogVersion;
-  record.record_size = (uint16_t)sizeof(record);
-  record.record_kind = (uint16_t)telem::LogRecordKind::ReplayInput160;
-  record.seq = seq;
-  record.t_us = t_us;
-  memcpy(record.payload, &replay, sizeof(replay));
-  if (useSimpleBenchWriter()) {
-    uint32_t q_now = 0U;
-    if (benchRingPush(record, q_now)) {
-      portENTER_CRITICAL(&g_stats_mux);
-      g_stats.enqueued++;
-      g_stats.queue_cur = q_now;
-      if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
-      portEXIT_CRITICAL(&g_stats_mux);
-      if (g_writer_task) xTaskNotifyGive(g_writer_task);
-    } else {
-      portENTER_CRITICAL(&g_stats_mux);
-      g_stats.dropped++;
-      g_stats.queue_cur = q_now;
-      if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
-      portEXIT_CRITICAL(&g_stats_mux);
-    }
-    return;
-  }
-  (void)enqueueRecord(record);
+  (void)seq;
+  (void)t_us;
+  (void)replay;
 }
 
 void enqueueReplayControl(uint16_t command_id, uint32_t seq, uint32_t t_us,
                           const void* payload, uint16_t payload_len, uint32_t apply_flags) {
-  if (!g_recorder.feature_enabled || !g_recorder.active) return;
-
-  telem::ReplayControlRecord160 replay = {};
-  replay.hdr.magic = telem::kReplayMagic;
-  replay.hdr.version = telem::kReplayVersion;
-  replay.hdr.kind = (uint8_t)telem::ReplayRecordKind::Control;
-  replay.hdr.flags = 0U;
-  replay.hdr.seq = seq;
-  replay.hdr.t_us = t_us;
-  replay.payload.command_id = command_id;
-  replay.payload.payload_len =
-      (payload_len > sizeof(replay.payload.payload)) ? (uint16_t)sizeof(replay.payload.payload) : payload_len;
-  replay.payload.command_seq = seq;
-  replay.payload.received_t_us = t_us;
-  replay.payload.apply_flags = apply_flags;
-  if (replay.payload.payload_len > 0U && payload) {
-    memcpy(replay.payload.payload, payload, replay.payload.payload_len);
-  }
-
-  BinaryLogRecordV2 record = {};
-  record.magic = kLogMagic;
-  record.version = kLogVersion;
-  record.record_size = (uint16_t)sizeof(record);
-  record.record_kind = (uint16_t)telem::LogRecordKind::ReplayControl160;
-  record.seq = seq;
-  record.t_us = t_us;
-  memcpy(record.payload, &replay, sizeof(replay));
-  (void)enqueueRecord(record);
+  (void)command_id;
+  (void)seq;
+  (void)t_us;
+  (void)payload;
+  (void)payload_len;
+  (void)apply_flags;
 }
 
 bool active() {
@@ -2356,6 +2423,16 @@ bool compareLogsTimed(Stream& out, const String& src_name, const String& dst_nam
   uint32_t gps_mismatch = 0U;
   uint32_t baro_mismatch = 0U;
   uint32_t mask_mismatch = 0U;
+  bool have_first_gps_mismatch = false;
+  bool have_first_baro_mismatch = false;
+  BinaryLogRecordV2 first_gps_src_record = {};
+  BinaryLogRecordV2 first_gps_dst_record = {};
+  BinaryLogRecordV2 first_baro_src_record = {};
+  BinaryLogRecordV2 first_baro_dst_record = {};
+  telem::TelemetryFullStateV1 first_gps_src_state = {};
+  telem::TelemetryFullStateV1 first_gps_dst_state = {};
+  telem::TelemetryFullStateV1 first_baro_src_state = {};
+  telem::TelemetryFullStateV1 first_baro_dst_state = {};
   uint32_t max_abs_delta_us = 0U;
   double roll_abs_sum = 0.0;
   double pitch_abs_sum = 0.0;
@@ -2447,8 +2524,26 @@ bool compareLogsTimed(Stream& out, const String& src_name, const String& dst_nam
       if (gyro_diff[i] > gyro_abs_max[i]) gyro_abs_max[i] = gyro_diff[i];
     }
 
-    if (!gpsMatches(*match_core_state, dst_state)) gps_mismatch++;
-    if (!baroMatches(*match_core_state, dst_state)) baro_mismatch++;
+    if (!gpsMatches(*match_core_state, dst_state)) {
+      gps_mismatch++;
+      if (!have_first_gps_mismatch) {
+        have_first_gps_mismatch = true;
+        first_gps_src_record = *match_core_record;
+        first_gps_dst_record = dst_record;
+        first_gps_src_state = *match_core_state;
+        first_gps_dst_state = dst_state;
+      }
+    }
+    if (!baroMatches(*match_core_state, dst_state)) {
+      baro_mismatch++;
+      if (!have_first_baro_mismatch) {
+        have_first_baro_mismatch = true;
+        first_baro_src_record = *match_core_record;
+        first_baro_dst_record = dst_record;
+        first_baro_src_state = *match_core_state;
+        first_baro_dst_state = dst_state;
+      }
+    }
     if (match_core_state->raw_present_mask != dst_state.raw_present_mask) mask_mismatch++;
   }
 
@@ -2503,6 +2598,48 @@ bool compareLogsTimed(Stream& out, const String& src_name, const String& dst_nam
       (double)gyro_abs_max[0],
       (double)gyro_abs_max[1],
       (double)gyro_abs_max[2]);
+  if (have_first_gps_mismatch) {
+    out.printf(
+        "AIRCOMPARET first_gps_mismatch src_t_us=%lu dst_t_us=%lu src_iTOW=%lu dst_iTOW=%lu src_fix=%u dst_fix=%u src_numSV=%u dst_numSV=%u src_lat=%ld dst_lat=%ld src_lon=%ld dst_lon=%ld src_hMSL=%ld dst_hMSL=%ld src_gSpeed=%ld dst_gSpeed=%ld src_headMot=%ld dst_headMot=%ld src_hAcc=%lu dst_hAcc=%lu src_sAcc=%lu dst_sAcc=%lu\r\n",
+        (unsigned long)first_gps_src_record.t_us,
+        (unsigned long)first_gps_dst_record.t_us,
+        (unsigned long)first_gps_src_state.iTOW_ms,
+        (unsigned long)first_gps_dst_state.iTOW_ms,
+        (unsigned)first_gps_src_state.fixType,
+        (unsigned)first_gps_dst_state.fixType,
+        (unsigned)first_gps_src_state.numSV,
+        (unsigned)first_gps_dst_state.numSV,
+        (long)first_gps_src_state.lat_1e7,
+        (long)first_gps_dst_state.lat_1e7,
+        (long)first_gps_src_state.lon_1e7,
+        (long)first_gps_dst_state.lon_1e7,
+        (long)first_gps_src_state.hMSL_mm,
+        (long)first_gps_dst_state.hMSL_mm,
+        (long)first_gps_src_state.gSpeed_mms,
+        (long)first_gps_dst_state.gSpeed_mms,
+        (long)first_gps_src_state.headMot_1e5deg,
+        (long)first_gps_dst_state.headMot_1e5deg,
+        (unsigned long)first_gps_src_state.hAcc_mm,
+        (unsigned long)first_gps_dst_state.hAcc_mm,
+        (unsigned long)first_gps_src_state.sAcc_mms,
+        (unsigned long)first_gps_dst_state.sAcc_mms);
+  }
+  if (have_first_baro_mismatch) {
+    out.printf(
+        "AIRCOMPARET first_baro_mismatch src_t_us=%lu dst_t_us=%lu src_temp=%.6f dst_temp=%.6f src_press=%.6f dst_press=%.6f src_alt=%.6f dst_alt=%.6f src_vsi=%.6f dst_vsi=%.6f src_mask=%u dst_mask=%u\r\n",
+        (unsigned long)first_baro_src_record.t_us,
+        (unsigned long)first_baro_dst_record.t_us,
+        (double)first_baro_src_state.baro_temp_c,
+        (double)first_baro_dst_state.baro_temp_c,
+        (double)first_baro_src_state.baro_press_hpa,
+        (double)first_baro_dst_state.baro_press_hpa,
+        (double)first_baro_src_state.baro_alt_m,
+        (double)first_baro_dst_state.baro_alt_m,
+        (double)first_baro_src_state.baro_vsi_mps,
+        (double)first_baro_dst_state.baro_vsi_mps,
+        (unsigned)first_baro_src_state.raw_present_mask,
+        (unsigned)first_baro_dst_state.raw_present_mask);
+  }
   return true;
 }
 
@@ -2529,6 +2666,7 @@ bool printRecordKindSummary(Stream& out, const String& log_name) {
   BinaryLogRecordV2 record = {};
   uint32_t total = 0U;
   uint32_t state_count = 0U;
+  uint32_t metadata_count = 0U;
   uint32_t replay_control_count = 0U;
   uint32_t replay_input_count = 0U;
   uint32_t unknown_count = 0U;
@@ -2552,6 +2690,9 @@ bool printRecordKindSummary(Stream& out, const String& log_name) {
       case telem::LogRecordKind::State160:
         state_count++;
         break;
+      case telem::LogRecordKind::Metadata160:
+        metadata_count++;
+        break;
       case telem::LogRecordKind::ReplayControl160:
         replay_control_count++;
         break;
@@ -2566,10 +2707,11 @@ bool printRecordKindSummary(Stream& out, const String& log_name) {
 
   file.close();
   out.printf(
-      "AIRLOGKINDS ok=1 file=%s total=%lu state160=%lu replay_control160=%lu replay_input160=%lu unknown=%lu\r\n",
+      "AIRLOGKINDS ok=1 file=%s total=%lu state160=%lu metadata160=%lu replay_control160=%lu replay_input160=%lu unknown=%lu\r\n",
       path.c_str(),
       (unsigned long)total,
       (unsigned long)state_count,
+      (unsigned long)metadata_count,
       (unsigned long)replay_control_count,
       (unsigned long)replay_input_count,
       (unsigned long)unknown_count);

@@ -13,6 +13,7 @@ constexpr uint8_t kSdMisoPin = 8;
 constexpr uint8_t kSdMosiPin = 9;
 
 constexpr uint32_t kInitFrequenciesHz[] = {
+    40000000UL,
     26000000UL,
     20000000UL,
 };

@@ -68,23 +68,15 @@ portMUX_TYPE g_output_source_mux = portMUX_INITIALIZER_UNLOCKED;
 struct StateWindow {
   uint8_t count = 0U;
   uint32_t seq = 0U;
-  uint32_t first_t_us = 0U;
   uint32_t t_us = 0U;
   telem::TelemetryFullStateV1 latest = {};
-  float accel_sum[3] = {};
-  float gyro_sum[3] = {};
-  float mag_sum[3] = {};
 };
 
 struct ReplayInputWindow {
   uint8_t count = 0U;
   uint32_t seq = 0U;
-  uint32_t first_t_us = 0U;
   uint32_t t_us = 0U;
   telem::ReplayInputRecord160 latest = {};
-  int64_t accel_sum[3] = {};
-  int64_t gyro_sum[3] = {};
-  int64_t mag_sum[3] = {};
 };
 
 uint8_t clampAverageFactor(uint8_t factor) {
@@ -224,15 +216,20 @@ bool openLogByName(const String& requested_name, String& out_name) {
 bool loadNextRecord() {
   if (!g_file) return false;
   BinaryLogRecordV2 record = {};
-  const size_t got = g_file.read((uint8_t*)&record, sizeof(record));
-  if (got == 0U) {
+  size_t total = 0U;
+  while (total < sizeof(record)) {
+    const size_t got = g_file.read(((uint8_t*)&record) + total, sizeof(record) - total);
+    if (got == 0U) break;
+    total += got;
+  }
+  if (total == 0U) {
     g_status.flags |= telem::kReplayStatusFlagAtEof;
     g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
     g_status.flags &= (uint8_t)~telem::kReplayStatusFlagPaused;
     markStatusChanged();
     return false;
   }
-  if (got != sizeof(record)) {
+  if (total != sizeof(record)) {
     g_status.last_error = kReplayErrorShortRead;
     g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
     markStatusChanged();
@@ -258,6 +255,8 @@ bool preferReplayInputSource() {
     switch ((telem::LogRecordKind)record.record_kind) {
       case telem::LogRecordKind::State160:
         state_count++;
+        break;
+      case telem::LogRecordKind::Metadata160:
         break;
       case telem::LogRecordKind::ReplayInput160:
         replay_input_count++;
@@ -307,23 +306,17 @@ bool decodeReplayInputRecord(const BinaryLogRecordV2& record, telem::ReplayInput
   return true;
 }
 
+bool isSkippableRecordKind(telem::LogRecordKind kind) {
+  return kind == telem::LogRecordKind::Metadata160;
+}
+
 void beginStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
                       const telem::TelemetryFullStateV1& state) {
   window = {};
   window.count = 1U;
   window.seq = record.seq;
-  window.first_t_us = record.t_us;
   window.t_us = record.t_us;
   window.latest = state;
-  window.accel_sum[0] = state.accel_x_mps2;
-  window.accel_sum[1] = state.accel_y_mps2;
-  window.accel_sum[2] = state.accel_z_mps2;
-  window.gyro_sum[0] = state.gyro_x_dps;
-  window.gyro_sum[1] = state.gyro_y_dps;
-  window.gyro_sum[2] = state.gyro_z_dps;
-  window.mag_sum[0] = state.mag_x_uT;
-  window.mag_sum[1] = state.mag_y_uT;
-  window.mag_sum[2] = state.mag_z_uT;
 }
 
 void extendStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
@@ -332,15 +325,6 @@ void extendStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
   window.seq = record.seq;
   window.t_us = record.t_us;
   window.latest = state;
-  window.accel_sum[0] += state.accel_x_mps2;
-  window.accel_sum[1] += state.accel_y_mps2;
-  window.accel_sum[2] += state.accel_z_mps2;
-  window.gyro_sum[0] += state.gyro_x_dps;
-  window.gyro_sum[1] += state.gyro_y_dps;
-  window.gyro_sum[2] += state.gyro_z_dps;
-  window.mag_sum[0] += state.mag_x_uT;
-  window.mag_sum[1] += state.mag_y_uT;
-  window.mag_sum[2] += state.mag_z_uT;
 }
 
 bool fillReplayInputFromState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us,
@@ -391,22 +375,7 @@ bool fillReplayInputFromState(const telem::TelemetryFullStateV1& state, uint32_t
 
 bool fillReplayInputFromWindow(const StateWindow& window, telem::ReplayInputRecord160& replay) {
   if (window.count == 0U) return false;
-  telem::TelemetryFullStateV1 state = window.latest;
-  const float inv_count = 1.0f / (float)window.count;
-  state.accel_x_mps2 = window.accel_sum[0] * inv_count;
-  state.accel_y_mps2 = window.accel_sum[1] * inv_count;
-  state.accel_z_mps2 = window.accel_sum[2] * inv_count;
-  state.gyro_x_dps = window.gyro_sum[0] * inv_count;
-  state.gyro_y_dps = window.gyro_sum[1] * inv_count;
-  state.gyro_z_dps = window.gyro_sum[2] * inv_count;
-  state.mag_x_uT = window.mag_sum[0] * inv_count;
-  state.mag_y_uT = window.mag_sum[1] * inv_count;
-  state.mag_z_uT = window.mag_sum[2] * inv_count;
-  uint32_t replay_t_us = window.t_us;
-  if (window.t_us >= window.first_t_us) {
-    replay_t_us = window.first_t_us + ((window.t_us - window.first_t_us) / 2U);
-  }
-  return fillReplayInputFromState(state, window.seq, replay_t_us, replay);
+  return fillReplayInputFromState(window.latest, window.seq, window.t_us, replay);
 }
 
 void beginReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& record,
@@ -414,14 +383,8 @@ void beginReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& 
   window = {};
   window.count = 1U;
   window.seq = record.seq;
-  window.first_t_us = record.t_us;
   window.t_us = record.t_us;
   window.latest = replay;
-  for (uint8_t i = 0U; i < 3U; ++i) {
-    window.accel_sum[i] = replay.payload.accel_milli_mps2[i];
-    window.gyro_sum[i] = replay.payload.gyro_milli_dps[i];
-    window.mag_sum[i] = replay.payload.mag_milli_uT[i];
-  }
 }
 
 void extendReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& record,
@@ -430,11 +393,6 @@ void extendReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2&
   window.seq = record.seq;
   window.t_us = record.t_us;
   window.latest = replay;
-  for (uint8_t i = 0U; i < 3U; ++i) {
-    window.accel_sum[i] += replay.payload.accel_milli_mps2[i];
-    window.gyro_sum[i] += replay.payload.gyro_milli_dps[i];
-    window.mag_sum[i] += replay.payload.mag_milli_uT[i];
-  }
 }
 
 bool fillReplayInputFromWindow(const ReplayInputWindow& window, telem::ReplayInputRecord160& replay) {
@@ -442,14 +400,6 @@ bool fillReplayInputFromWindow(const ReplayInputWindow& window, telem::ReplayInp
   replay = window.latest;
   replay.hdr.seq = window.seq;
   replay.hdr.t_us = window.t_us;
-  if (window.t_us >= window.first_t_us) {
-    replay.hdr.t_us = window.first_t_us + ((window.t_us - window.first_t_us) / 2U);
-  }
-  for (uint8_t i = 0U; i < 3U; ++i) {
-    replay.payload.accel_milli_mps2[i] = (int32_t)(window.accel_sum[i] / (int64_t)window.count);
-    replay.payload.gyro_milli_dps[i] = (int32_t)(window.gyro_sum[i] / (int64_t)window.count);
-    replay.payload.mag_milli_uT[i] = (int32_t)(window.mag_sum[i] / (int64_t)window.count);
-  }
   replay.payload.imu_seq = window.seq;
   return true;
 }
@@ -467,6 +417,12 @@ void finishSentRecord(uint32_t t_us) {
 
 bool sendPendingRecord() {
   if (!g_have_pending) return true;
+
+  while (g_have_pending && isSkippableRecordKind((telem::LogRecordKind)g_pending.record_kind)) {
+    g_have_pending = false;
+    g_status.records_sent++;
+    if (!loadNextRecord()) return true;
+  }
 
   while (g_have_pending && g_prefer_replay_input &&
          (telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State160) {
@@ -489,6 +445,11 @@ bool sendPendingRecord() {
       const uint8_t average_factor = clampAverageFactor(g_average_factor);
       while (window.count < average_factor) {
         if (!loadNextRecord()) break;
+        if (isSkippableRecordKind((telem::LogRecordKind)g_pending.record_kind)) {
+          g_have_pending = false;
+          g_status.records_sent++;
+          continue;
+        }
         if ((telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State160 && g_prefer_replay_input) {
           g_have_pending = false;
           g_status.records_sent++;
@@ -539,6 +500,11 @@ bool sendPendingRecord() {
       const uint8_t average_factor = clampAverageFactor(g_average_factor);
       while (window.count < average_factor) {
         if (!loadNextRecord()) break;
+        if (isSkippableRecordKind((telem::LogRecordKind)g_pending.record_kind)) {
+          g_have_pending = false;
+          g_status.records_sent++;
+          continue;
+        }
         if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::State160) {
           break;
         }
