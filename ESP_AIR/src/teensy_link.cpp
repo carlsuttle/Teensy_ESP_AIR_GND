@@ -106,11 +106,13 @@ void servicePoll() {
   while (spi_bridge::popStateRecord(record, sizeof(record))) {
     telem::TelemetryFullStateV1 tmp = {};
     memcpy(&tmp, record, sizeof(tmp));
-    uint32_t seq = 0U;
-    uint32_t t_us = 0U;
-    if (!replay_bridge::takeOutputSourceStamp(seq, t_us)) {
-      seq = ++g_local_state_seq;
-      t_us = micros();
+    const bool replay_output = (tmp.flags & telem::kStateFlagReplayOutput) != 0U;
+    uint32_t seq = ++g_local_state_seq;
+    uint32_t t_us = micros();
+    bool have_replay_stamp = false;
+    if (replay_output) {
+      telem::decodeReplaySourceStamp(tmp, seq, t_us);
+      have_replay_stamp = (seq != 0U) || (t_us != 0U);
     }
 
     portENTER_CRITICAL(&g_mux);
@@ -125,7 +127,7 @@ void servicePoll() {
     queuePendingStateLocked(tmp, seq, t_us);
     portEXIT_CRITICAL(&g_mux);
 
-    if (!standalone_bench) {
+    if (!standalone_bench && (!replay_output || have_replay_stamp)) {
       log_store::enqueueState(seq, t_us, tmp);
     }
     state_records_drained++;

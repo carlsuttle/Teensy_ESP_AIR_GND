@@ -130,6 +130,13 @@ class RecordRing {
     return v;
   }
 
+  void resetPerf() {
+    noInterrupts();
+    const uint16_t occ = (uint16_t)((head_ - tail_) & (kTxRingDepth - 1U));
+    max_occupancy_ = occ;
+    interrupts();
+  }
+
   bool empty() const {
     noInterrupts();
     const bool empty = head_ == tail_;
@@ -479,7 +486,23 @@ uint16_t replayFreeSlots() {
 }
 
 Stats stats() {
-  return g_stats;
+  Stats out = g_stats;
+  out.state_tx_max_occupancy = g_state_tx_ring.maxOccupancy();
+  out.raw_tx_max_occupancy = g_raw_tx_ring.maxOccupancy();
+  out.replay_rx_max_occupancy = g_replay_rx_ring.maxOccupancy();
+  out.state_tx_free_min = (uint32_t)((kTxRingDepth - 1U) - out.state_tx_max_occupancy);
+  out.raw_tx_free_min = (uint32_t)((kTxRingDepth - 1U) - out.raw_tx_max_occupancy);
+  out.replay_rx_free_min = (uint32_t)((kRxRingDepth - 1U) - out.replay_rx_max_occupancy);
+  return out;
+}
+
+void resetStats() {
+  noInterrupts();
+  g_stats = {};
+  interrupts();
+  g_state_tx_ring.resetPerf();
+  g_raw_tx_ring.resetPerf();
+  g_replay_rx_ring.resetPerf();
 }
 
 }  // namespace spi_bridge

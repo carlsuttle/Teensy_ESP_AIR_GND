@@ -65,7 +65,7 @@ CommandMode g_mode = CommandMode::Idle;
 uint32_t g_mode_start_ms = 0;
 uint32_t g_mode_last_print_ms = 0;
 bool g_stats_streaming = false;
-bool g_quiet_serial = false;
+bool g_quiet_serial = true;
 uint32_t g_spdtest_next_us = 0;
 uint32_t g_spdtest_sent = 0;
 uint32_t g_spdtest_drop = 0;
@@ -817,6 +817,7 @@ void printSourceRateConfig() {
   imu_fusion::SourcePerfSnapshot perf = {};
   imu_fusion::SourceFlowSnapshot flow = {};
   mirror::ReplayPerfSnapshot replay_perf = {};
+  const auto spi_stats = spi_bridge::stats();
   imu_fusion::getSourcePerfSnapshot(perf);
   imu_fusion::getSourceFlowSnapshot(flow);
   mirror::getReplayPerfSnapshot(replay_perf);
@@ -869,6 +870,21 @@ void printSourceRateConfig() {
       (unsigned long)replay_perf.replay_ctrls_per_poll_avg,
       (unsigned long)replay_perf.replay_ctrls_per_poll_max,
       (unsigned long)replay_perf.replay_output_queue_depth_max);
+  Serial.printf(
+      "SPI PERF tx_records=%lu tx_overflows=%lu rx_records=%lu rx_overflows=%lu crc_err=%lu type_err=%lu state_tx_occ_max=%lu state_tx_free_min=%lu raw_tx_occ_max=%lu raw_tx_free_min=%lu replay_rx_occ_max=%lu replay_rx_free_min=%lu ready=%u\r\n",
+      (unsigned long)spi_stats.tx_records,
+      (unsigned long)spi_stats.tx_overflows,
+      (unsigned long)spi_stats.rx_records,
+      (unsigned long)spi_stats.rx_overflows,
+      (unsigned long)spi_stats.rx_crc_errors,
+      (unsigned long)spi_stats.rx_type_errors,
+      (unsigned long)spi_stats.state_tx_max_occupancy,
+      (unsigned long)spi_stats.state_tx_free_min,
+      (unsigned long)spi_stats.raw_tx_max_occupancy,
+      (unsigned long)spi_stats.raw_tx_free_min,
+      (unsigned long)spi_stats.replay_rx_max_occupancy,
+      (unsigned long)spi_stats.replay_rx_free_min,
+      spi_stats.ready_high ? 1U : 0U);
   printLoopPerf();
 }
 
@@ -1160,6 +1176,7 @@ void processCommand(const char* cmd) {
   } else if (strcmp(cmd, "resetloopperf") == 0) {
     resetLoopPerf();
     mirror::resetReplayPerf();
+    spi_bridge::resetStats();
     Serial.println("loop perf reset");
   } else if (startsWith(cmd, "benchgyro")) {
     uint32_t iterations = 10000U;

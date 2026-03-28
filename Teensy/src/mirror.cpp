@@ -107,27 +107,6 @@ uint16_t quantizeUnsigned(float value, float scale) {
   return (uint16_t)lroundf(scaled);
 }
 
-void packFusionReplayDiagnostics(telem::TelemetryFullStateV1& payload,
-                                 const imu_fusion::FusionReplayDebug* dbg_ptr) {
-  imu_fusion::FusionReplayDebug dbg{};
-  if (dbg_ptr) {
-    dbg = *dbg_ptr;
-  } else {
-    imu_fusion::getFusionReplayDebug(dbg);
-  }
-  payload.reserved0 = quantizeUnsigned(dbg.magneticErrorDeg, 100.0f);
-
-  int16_t packed[7] = {};
-  packed[0] = quantizeSigned(dbg.accelBodyX, 1000.0f);
-  packed[1] = quantizeSigned(dbg.accelBodyY, 1000.0f);
-  packed[2] = quantizeSigned(dbg.accelBodyZ, 1000.0f);
-  packed[3] = quantizeSigned(dbg.magFusionX, 100.0f);
-  packed[4] = quantizeSigned(dbg.magFusionY, 100.0f);
-  packed[5] = quantizeSigned(dbg.magFusionZ, 100.0f);
-  packed[6] = (int16_t)quantizeUnsigned(dbg.accelerationErrorDeg, 100.0f);
-  memcpy(payload.reserved1, packed, sizeof(packed));
-}
-
 void applyFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
   g_dbg.cmdSetFusion++;
   (void)imu_fusion::setFusionSettings(
@@ -172,10 +151,13 @@ void handleReplayControl(const telem::ReplayControlRecord160& replay) {
         g_dbg.lenErr++;
         return;
       }
-      // Replay logs may contain historical stream-rate commands from the source
-      // session. Applying them here would leak replay-time metadata back into
-      // the live mirror cadence after replay ends.
+      telem::CmdSetStreamRateV1 cmd = {};
+      memcpy(&cmd, payload, sizeof(cmd));
       g_dbg.cmdSetStreamRate++;
+      if (!g_replayActive) {
+        g_streamRateHz = cmd.ws_rate_hz ? cmd.ws_rate_hz : kDefaultStreamRateHz;
+        g_logRateHz = cmd.log_rate_hz ? cmd.log_rate_hz : g_streamRateHz;
+      }
       return;
     }
     default:
@@ -346,8 +328,11 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us,
   payload.headMot_1e5deg = replay_meta ? replay_meta->headMot_1e5deg : s.headMot;
   payload.hAcc_mm = replay_meta ? replay_meta->hAcc_mm : s.hAcc;
   payload.sAcc_mms = replay_meta ? replay_meta->sAcc_mms : s.sAcc;
-  payload.gps_parse_errors = s.gps_parse_errors;
-  payload.mirror_tx_ok = s.mirror_tx_ok;
+  // Keep only the drop counter as an operational transport-health indicator.
+  // The success counter and parser diagnostics are per-run debug noise, not
+  // useful per-record state for the operational logs.
+  payload.gps_parse_errors = 0U;
+  payload.mirror_tx_ok = 0U;
   payload.mirror_drop_count = s.mirror_drop_count;
   payload.last_gps_ms = replay_meta ? replay_meta->last_gps_ms : s.last_gps_ms;
   payload.last_imu_ms = replay_meta ? replay_meta->last_imu_ms : s.last_imu_ms;
@@ -398,7 +383,10 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us,
   if (fusionAccelerometerIgnored) payload.flags |= telem::kStateFlagFusionAccelerometerIgnored;
   if (fusionMagneticError) payload.flags |= telem::kStateFlagFusionMagneticError;
   if (fusionMagnetometerIgnored) payload.flags |= telem::kStateFlagFusionMagnetometerIgnored;
-  packFusionReplayDiagnostics(payload, replay_diag);
+  if (replay_meta) {
+    payload.flags |= telem::kStateFlagReplayOutput;
+    telem::encodeReplaySourceStamp(payload, replay_meta->seq, replay_meta->t_us);
+  }
   const uint32_t push_start_us = micros();
   const bool ok = spi_bridge::pushStateRecord(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload));
   g_replay_perf.push_state.record(micros() - push_start_us);

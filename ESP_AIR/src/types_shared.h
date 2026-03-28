@@ -19,6 +19,7 @@ static constexpr uint16_t kStateFlagFusionAccelerationError = 1U << 5;
 static constexpr uint16_t kStateFlagFusionAccelerometerIgnored = 1U << 6;
 static constexpr uint16_t kStateFlagFusionMagneticError = 1U << 7;
 static constexpr uint16_t kStateFlagFusionMagnetometerIgnored = 1U << 8;
+static constexpr uint16_t kStateFlagReplayOutput = 1U << 9;
 static constexpr uint8_t kLinkMetaFlagPeerKnown = 1U << 0;
 static constexpr uint8_t kLinkMetaFlagRadioReady = 1U << 1;
 static constexpr uint8_t kLinkMetaFlagRecorderOn = 1U << 2;
@@ -56,6 +57,7 @@ enum class LogRecordKind : uint16_t {
   State160 = 1,
   ReplayControl160 = 2,
   ReplayInput160 = 3,
+  Metadata160 = 4,
 };
 
 enum MsgType : uint16_t {
@@ -161,6 +163,16 @@ struct TelemetryFullStateV1 {
   uint16_t reserved0;
   uint8_t reserved1[14];
 };
+
+inline void encodeReplaySourceStamp(TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
+  memcpy(state.reserved1 + 0, &seq, sizeof(seq));
+  memcpy(state.reserved1 + 4, &t_us, sizeof(t_us));
+}
+
+inline void decodeReplaySourceStamp(const TelemetryFullStateV1& state, uint32_t& seq, uint32_t& t_us) {
+  memcpy(&seq, state.reserved1 + 0, sizeof(seq));
+  memcpy(&t_us, state.reserved1 + 4, sizeof(t_us));
+}
 
 static constexpr uint8_t kUnifiedDownlinkFlagHasGps = 1U << 0;
 static constexpr uint8_t kUnifiedDownlinkFlagHasControl = 1U << 1;
@@ -408,6 +420,19 @@ struct ReplayControlRecord160 {
   ReplayControlPayloadV1 payload;
 };
 
+struct LogMetadataPayloadV1 {
+  uint32_t schema_version;
+  uint32_t file_session_id;
+  uint32_t parent_session_id;
+  uint16_t replay_average_factor;
+  uint16_t applied_capture_rate_hz;
+  uint16_t override_mask;
+  uint16_t flags;
+  char file_name[48];
+  char source_name[48];
+  uint8_t reserved[44];
+};
+
 struct WsStateHeaderV1 {
   uint32_t magic;
   uint16_t version;
@@ -434,5 +459,6 @@ static_assert(sizeof(ReplayInputPayloadV1) == 144U, "ReplayInputPayloadV1 must b
 static_assert(sizeof(ReplayInputRecord160) == kReplayRecordBytes, "ReplayInputRecord160 must be 160 bytes");
 static_assert(sizeof(ReplayControlPayloadV1) == 144U, "ReplayControlPayloadV1 must be 144 bytes");
 static_assert(sizeof(ReplayControlRecord160) == kReplayRecordBytes, "ReplayControlRecord160 must be 160 bytes");
+static_assert(sizeof(LogMetadataPayloadV1) == kReplayRecordBytes, "LogMetadataPayloadV1 must be 160 bytes");
 
 }  // namespace telem

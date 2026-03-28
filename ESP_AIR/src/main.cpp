@@ -6,8 +6,10 @@
 
 #include "config_store.h"
 #include "log_store.h"
+#include "sd_api.h"
 #include "sd_backend.h"
 #include "sd_capture_test.h"
+#include "teensy_api.h"
 #include "teensy_link.h"
 #include "radio_link.h"
 #include "spi_bridge.h"
@@ -48,6 +50,39 @@ uint32_t g_baseline_duration_ms = 0U;
 uint32_t g_baseline_started_ms = 0U;
 uint32_t g_baseline_stopped_ms = 0U;
 uint32_t g_console_log_session_id = 0U;
+struct SdReadWriteSoakRun {
+  bool active = false;
+  bool ok = false;
+  uint32_t started_ms = 0U;
+  uint32_t duration_ms = 0U;
+  uint32_t bytes_read = 0U;
+  uint32_t bytes_written = 0U;
+  uint32_t wraps = 0U;
+  uint32_t read_failures = 0U;
+  uint32_t write_failures = 0U;
+  uint32_t max_read_us = 0U;
+  uint32_t max_write_us = 0U;
+  uint32_t iterations = 0U;
+  String source_name;
+  String dest_name;
+  sd_api::File source_file;
+  sd_api::File dest_file;
+} g_sd_rw_soak = {};
+struct SdReadWriteLogSoakRun {
+  bool active = false;
+  bool stop_requested = false;
+  bool ok = false;
+  uint32_t started_ms = 0U;
+  uint32_t duration_ms = 0U;
+  uint32_t bytes_read = 0U;
+  uint32_t records_read = 0U;
+  uint32_t wraps = 0U;
+  uint32_t read_failures = 0U;
+  uint32_t unsupported_records = 0U;
+  uint32_t session_id = 0U;
+  String source_name;
+  sd_api::File source_file;
+} g_sd_rw_log_soak = {};
 struct ReplayCaptureRun {
   bool active = false;
   bool stop_requested = false;
@@ -97,6 +132,23 @@ constexpr uint16_t kBenchCaptureRatesHz[] = {50U, 100U, 200U, 400U, 800U, 1600U}
 constexpr uint16_t kReplaySourceProfilesHz[] = {25U, 50U, 100U, 200U, 400U, 800U, 1600U};
 constexpr uint32_t kBenchApplySettleMs = 1000U;
 constexpr uint32_t kReplayCompareSettleMs = 1000U;
+constexpr size_t kSdRwSoakChunkBytes = 65536U;
+
+#pragma pack(push, 1)
+struct SoakBinaryLogRecordV2 {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t record_size;
+  uint16_t record_kind;
+  uint16_t reserved;
+  uint32_t seq;
+  uint32_t t_us;
+  uint8_t payload[telem::kReplayRecordBytes];
+};
+#pragma pack(pop)
+
+constexpr uint32_t kSoakLogMagic = 0x4C4F4731UL;
+constexpr uint16_t kSoakLogVersion = 2U;
 
 struct CaptureBenchBaseline {
   radio_link::Stats radio = {};
@@ -116,6 +168,13 @@ void serviceSdSoakBenchmark();
 void beginBaselineBenchmark(uint32_t duration_ms);
 void stopBaselineBenchmark();
 void printBaselineImpactReport();
+bool beginSdReadWriteSoak(uint32_t duration_ms, const String* source_override = nullptr);
+void serviceSdReadWriteSoak();
+void stopSdReadWriteSoak(bool ok, const char* reason = nullptr);
+bool beginSdReadWriteLogSoak(uint32_t duration_ms, const String* source_override = nullptr);
+void serviceSdReadWriteLogSoak();
+void stopSdReadWriteLogSoak(bool ok, const char* reason = nullptr);
+bool handleTeensyApiConsoleCommand(const char* line);
 void printAirLogStatus();
 bool beginReplayCapture(const String* source_override = nullptr);
 void serviceReplayCapture();
@@ -141,6 +200,20 @@ bool serialNoiseEnabled() {
 
 String shortLogName(const String& path) {
   return path.startsWith("/logs/") ? path.substring(6) : path;
+}
+
+String nextSdRwSoakName() {
+  return String("/logs/rwsoak_") + String(millis()) + ".bin";
+}
+
+bool readExactFile(sd_api::File& file, uint8_t* dst, size_t wanted) {
+  size_t total = 0U;
+  while (total < wanted) {
+    const size_t got = file.read(dst + total, wanted - total);
+    if (got == 0U) break;
+    total += got;
+  }
+  return total == wanted;
 }
 
 uint32_t nextConsoleLogSessionId() {
@@ -262,19 +335,24 @@ bool sendConfiguredCaptureRateNow() {
 bool setCaptureRateHz(uint16_t hz, bool persist_config) {
   AppConfig cfg = config_store::get();
   cfg.source_rate_hz = hz;
+  cfg.log_rate_hz = hz;
   if (persist_config) {
     config_store::update(cfg);
   }
-  const bool ok = teensy_link::sendSetCaptureSettings(telem::CmdSetCaptureSettingsV1{hz, 0U});
+  bool ok = teensy_link::sendSetCaptureSettings(telem::CmdSetCaptureSettingsV1{hz, 0U});
   if (ok) {
     g_last_capture_rate_hz = hz;
     g_last_capture_rate_tx_ms = millis();
+  }
+  if (ok && !isStandaloneBench()) {
+    ok = sendConfiguredStreamRateNow();
   }
   return ok;
 }
 
 bool saveCaptureRateDefaults() {
-  return teensy_link::sendSaveCaptureSettings();
+  teensy_api::CommandAckResult result = {};
+  return teensy_api::saveCaptureSettings(result);
 }
 
 uint16_t replayCaptureRateForFactor(uint8_t average_factor) {
@@ -363,12 +441,21 @@ void printConsoleHelp() {
   Serial.println("  logkinds <name> - count state/control/input record kinds in a .tlog");
   Serial.println("  logfusion <name> - print fusion settings seen in a replay/log file");
   Serial.println("  logflags <name> - print fusion flag/error counts seen in a replay/log file");
+  Serial.println("  sdrwsoak <seconds> [file] - mixed sequential SD read/write soak with both files held open");
+  Serial.println("  sdrwsoakstat - print current mixed read/write soak state");
+  Serial.println("  sdrwsoakstop - stop active mixed read/write soak");
+  Serial.println("  sdrwlogsoak <seconds> [file] - mixed SD read with production log_store write path");
+  Serial.println("  sdrwlogsoakstat - print current mixed SD read/log write soak state");
+  Serial.println("  sdrwlogsoakstop - stop active mixed SD read/log write soak");
+  Serial.println("  carrysig [count] - send synthetic replay records and verify exact carry-through on AIR");
+  Serial.println("  carrysigcsv [ms] [window] - burst synthetic replay records and print CSV rows by returned seq");
+  Serial.println("  tapi ...      - stable Teensy API proof surface (help/status/getfusion/setcap/setstream/setfusion/carry/carrycsv/replaybench/selftest)");
   Serial.println("  replaycapture - replay latest .tlog into Teensy while logging returned state");
   Serial.println("  replaycapfile <name> - replay a specific .tlog into Teensy while logging returned state");
   Serial.println("  replayfile <name> - replay a specific .tlog into Teensy without rerecording");
   Serial.println("  replaylargest - replay the largest .tlog into Teensy without rerecording");
   Serial.println("  replaycapstat - print replay-capture progress");
-  Serial.println("  replayavg <n> - average N replay samples into one replay input");
+  Serial.println("  replayavg <n> - select one replay sample out of each N-source-record window");
   Serial.println("  replayavgstat - print current replay averaging factor");
   Serial.println("  replaycmp <n> - replay latest .tlog twice, with N then N+1 averaging");
   Serial.println("  replaycmpfile <n> <name> - same compare run for a specific .tlog");
@@ -475,6 +562,192 @@ void beginSdCaptureBenchmark(uint32_t duration_ms) {
   if (!ok) {
     sd_capture_test::printReport(Serial, cap);
   }
+}
+
+bool handleTeensyApiConsoleCommand(const char* line) {
+  if (strncmp(line, "tapi", 4) != 0) return false;
+
+  const char* args = line + 4;
+  while (*args == ' ') args++;
+
+  if (*args == '\0' || strcmp(args, "help") == 0) {
+    Serial.println("TAPI commands:");
+    Serial.println("  tapi status");
+    Serial.println("  tapi getfusion");
+    Serial.println("  tapi setcap <hz>");
+    Serial.println("  tapi setstream <ws_hz> [log_hz]");
+    Serial.println("  tapi setfusion <gain> <accelRej> <magRej> <recovery>");
+    Serial.println("  tapi carry [count]");
+    Serial.println("  tapi carrycsv [ms] [window]");
+    Serial.println("  tapi replaybench [ms] [batch_hz] [records_per_batch]");
+    Serial.println("  tapi selftest [hz] [count]");
+    return true;
+  }
+
+  if (strcmp(args, "status") == 0) {
+    teensy_api::printStatus(Serial);
+    return true;
+  }
+
+  if (strcmp(args, "getfusion") == 0) {
+    teensy_api::CommandAckResult result = {};
+    const bool ok = teensy_api::getFusionSettings(result);
+    Serial.printf("TAPI GETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu seq=%lu t_us=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
+                  result.tx_ok ? 1U : 0U,
+                  result.ack_seen ? 1U : 0U,
+                  result.ack_ok ? 1U : 0U,
+                  (unsigned long)result.ack_code,
+                  (unsigned long)result.snapshot.seq,
+                  (unsigned long)result.snapshot.t_us,
+                  result.snapshot.has_state ? (double)result.snapshot.state.fusion_gain : 0.0,
+                  result.snapshot.has_state ? (double)result.snapshot.state.fusion_accel_rej : 0.0,
+                  result.snapshot.has_state ? (double)result.snapshot.state.fusion_mag_rej : 0.0,
+                  result.snapshot.has_state ? (unsigned)result.snapshot.state.fusion_recovery_period : 0U);
+    Serial.printf("TAPI GETFUSION RESULT ok=%u\r\n", (ok && result.ack_ok) ? 1U : 0U);
+    return true;
+  }
+
+  if (strncmp(args, "setcap ", 7) == 0) {
+    unsigned hz = 0U;
+    if (sscanf(args + 7, "%u", &hz) == 1 && hz > 0U) {
+      teensy_api::CommandAckResult result = {};
+      const bool ok = teensy_api::setCaptureSettings((uint16_t)hz, result);
+      Serial.printf("TAPI SETCAP tx_ok=%u ack_seen=%u ack_ok=%u code=%lu hz=%u\r\n",
+                    result.tx_ok ? 1U : 0U,
+                    result.ack_seen ? 1U : 0U,
+                    result.ack_ok ? 1U : 0U,
+                    (unsigned long)result.ack_code,
+                    hz);
+      Serial.printf("TAPI SETCAP RESULT ok=%u\r\n", (ok && result.ack_ok) ? 1U : 0U);
+    } else {
+      Serial.println("TAPI SETCAP usage: tapi setcap <hz>");
+    }
+    return true;
+  }
+
+  if (strncmp(args, "setstream ", 10) == 0) {
+    unsigned ws_hz = 0U;
+    unsigned log_hz = 0U;
+    const int parsed = sscanf(args + 10, "%u %u", &ws_hz, &log_hz);
+    if (parsed >= 1 && ws_hz > 0U) {
+      if (parsed < 2 || log_hz == 0U) log_hz = ws_hz;
+      teensy_api::CommandAckResult result = {};
+      const bool ok = teensy_api::setStreamRate((uint16_t)ws_hz, (uint16_t)log_hz, result);
+      Serial.printf("TAPI SETSTREAM tx_ok=%u ack_seen=%u ack_ok=%u code=%lu ws_hz=%u log_hz=%u\r\n",
+                    result.tx_ok ? 1U : 0U,
+                    result.ack_seen ? 1U : 0U,
+                    result.ack_ok ? 1U : 0U,
+                    (unsigned long)result.ack_code,
+                    ws_hz,
+                    log_hz);
+      Serial.printf("TAPI SETSTREAM RESULT ok=%u\r\n", (ok && result.ack_ok) ? 1U : 0U);
+    } else {
+      Serial.println("TAPI SETSTREAM usage: tapi setstream <ws_hz> [log_hz]");
+    }
+    return true;
+  }
+
+  if (strncmp(args, "setfusion ", 10) == 0) {
+    float g = 0.0f, a = 0.0f, m = 0.0f;
+    unsigned r = 0U;
+    if (sscanf(args + 10, "%f %f %f %u", &g, &a, &m, &r) == 4) {
+      telem::CmdSetFusionSettingsV1 cmd = {};
+      cmd.gain = g;
+      cmd.accelerationRejection = a;
+      cmd.magneticRejection = m;
+      cmd.recoveryTriggerPeriod = (uint16_t)r;
+      teensy_api::CommandAckResult result = {};
+      const bool ok = teensy_api::setFusionSettings(cmd, result);
+      Serial.printf("TAPI SETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
+                    result.tx_ok ? 1U : 0U,
+                    result.ack_seen ? 1U : 0U,
+                    result.ack_ok ? 1U : 0U,
+                    (unsigned long)result.ack_code,
+                    (double)cmd.gain,
+                    (double)cmd.accelerationRejection,
+                    (double)cmd.magneticRejection,
+                    (unsigned)cmd.recoveryTriggerPeriod);
+      Serial.printf("TAPI SETFUSION RESULT ok=%u\r\n", (ok && result.ack_ok) ? 1U : 0U);
+    } else {
+      Serial.println("TAPI SETFUSION usage: tapi setfusion <gain> <accelRej> <magRej> <recovery>");
+    }
+    return true;
+  }
+
+  if (strncmp(args, "carrycsv", 8) == 0) {
+    uint32_t duration_ms = 2000U;
+    unsigned window = 16U;
+    if (args[8] == '\0') {
+      teensy_api::runCarrySequenceCsvTest(Serial, duration_ms, (uint8_t)window);
+    } else if (args[8] == ' ') {
+      const int matched = sscanf(args + 9, "%lu %u", &duration_ms, &window);
+      if (matched >= 1 && duration_ms > 0U) {
+        if (window == 0U) window = 16U;
+        if (window > 255U) window = 255U;
+        teensy_api::runCarrySequenceCsvTest(Serial, duration_ms, (uint8_t)window);
+      } else {
+        Serial.println("TAPI CARRYCSV usage: tapi carrycsv [ms] [window]");
+      }
+    } else {
+      Serial.println("TAPI CARRYCSV usage: tapi carrycsv [ms] [window]");
+    }
+    return true;
+  }
+
+  if (strncmp(args, "carry", 5) == 0) {
+    unsigned count = 8U;
+    (void)sscanf(args + 5, "%u", &count);
+    if (count == 0U) count = 8U;
+    if (count > 255U) count = 255U;
+    (void)teensy_api::runCarrySignatureTest(Serial, (uint8_t)count);
+    return true;
+  }
+
+  if (strncmp(args, "replaybench", 11) == 0) {
+    uint32_t duration_ms = 5000U;
+    unsigned batch_hz = 100U;
+    unsigned records_per_batch = 16U;
+    if (args[11] == '\0') {
+      (void)teensy_api::runReplayBatchBenchmark(Serial, duration_ms, (uint16_t)batch_hz, (uint16_t)records_per_batch);
+    } else if (args[11] == ' ') {
+      const int matched = sscanf(args + 12, "%lu %u %u", &duration_ms, &batch_hz, &records_per_batch);
+      if (matched >= 1 && duration_ms > 0U && batch_hz > 0U && records_per_batch > 0U) {
+        if (batch_hz > 1000U) batch_hz = 1000U;
+        if (records_per_batch > 255U) records_per_batch = 255U;
+        (void)teensy_api::runReplayBatchBenchmark(Serial, duration_ms, (uint16_t)batch_hz, (uint16_t)records_per_batch);
+      } else {
+        Serial.println("TAPI REPLAYBENCH usage: tapi replaybench [ms] [batch_hz] [records_per_batch]");
+      }
+    } else {
+      Serial.println("TAPI REPLAYBENCH usage: tapi replaybench [ms] [batch_hz] [records_per_batch]");
+    }
+    return true;
+  }
+
+  if (strncmp(args, "selftest", 8) == 0) {
+    unsigned hz = 1600U;
+    unsigned count = 8U;
+    (void)sscanf(args + 8, "%u %u", &hz, &count);
+    if (count == 0U) count = 8U;
+    teensy_api::CommandAckResult fusion = {};
+    teensy_api::CommandAckResult cap = {};
+    const bool get_ok = teensy_api::getFusionSettings(fusion);
+    const bool cap_ok = teensy_api::setCaptureSettings((uint16_t)hz, cap);
+    const auto carry = teensy_api::runCarrySignatureTest(Serial, (uint8_t)count);
+    Serial.printf("TAPI SELFTEST RESULT ok=%u getfusion=%u setcap=%u carry_fail=%lu carry_timeout=%lu hz=%u count=%u\r\n",
+                  (get_ok && fusion.ack_ok && cap_ok && cap.ack_ok && carry.fail == 0U && carry.timeout == 0U) ? 1U : 0U,
+                  (get_ok && fusion.ack_ok) ? 1U : 0U,
+                  (cap_ok && cap.ack_ok) ? 1U : 0U,
+                  (unsigned long)carry.fail,
+                  (unsigned long)carry.timeout,
+                  hz,
+                  count);
+    return true;
+  }
+
+  Serial.print("TAPI unknown cmd: ");
+  Serial.println(args);
+  return true;
 }
 
 bool beginSdSoakBenchmark(uint32_t duration_ms, uint16_t rate_hz) {
@@ -730,6 +1003,335 @@ bool writeSdApiTestLog() {
   return found_name;
 }
 
+bool beginSdReadWriteSoak(uint32_t duration_ms, const String* source_override) {
+  if (g_sd_rw_soak.active) {
+    Serial.println("SDRWSOAK START ok=0 reason=already_active");
+    return false;
+  }
+  if (log_store::busy()) {
+    Serial.println("SDRWSOAK START ok=0 reason=logger_busy");
+    return false;
+  }
+  if (g_replay_capture.active || replay_bridge::active()) {
+    Serial.println("SDRWSOAK START ok=0 reason=replay_busy");
+    return false;
+  }
+  if (!sd_backend::mounted()) {
+    sd_backend::Status backend = {};
+    if (!sd_backend::begin(&backend)) {
+      Serial.println("SDRWSOAK START ok=0 reason=sd_mount_failed");
+      return false;
+    }
+  }
+
+  String source_name;
+  if (source_override && !source_override->isEmpty()) {
+    source_name = *source_override;
+  } else if (!log_store::largestLogName(source_name)) {
+    Serial.println("SDRWSOAK START ok=0 reason=no_source_log");
+    return false;
+  }
+  if (!source_name.startsWith("/")) source_name = String("/logs/") + source_name;
+
+  sd_api::File source_file = sd_api::open(source_name, sd_api::OpenMode::read);
+  if (!source_file) {
+    Serial.printf("SDRWSOAK START ok=0 reason=open_source_failed src=%s\r\n",
+                  shortLogName(source_name).c_str());
+    return false;
+  }
+
+  const String dest_name = nextSdRwSoakName();
+  sd_api::File dest_file = sd_api::open(dest_name, sd_api::OpenMode::write);
+  if (!dest_file) {
+    source_file.close();
+    Serial.printf("SDRWSOAK START ok=0 reason=open_dest_failed dst=%s\r\n",
+                  shortLogName(dest_name).c_str());
+    return false;
+  }
+
+  g_sd_rw_soak = {};
+  g_sd_rw_soak.active = true;
+  g_sd_rw_soak.ok = true;
+  g_sd_rw_soak.started_ms = millis();
+  g_sd_rw_soak.duration_ms = duration_ms;
+  g_sd_rw_soak.source_name = source_name;
+  g_sd_rw_soak.dest_name = dest_name;
+  g_sd_rw_soak.source_file = source_file;
+  g_sd_rw_soak.dest_file = dest_file;
+  Serial.printf("SDRWSOAK START ok=1 duration_ms=%lu src=%s dst=%s chunk=%u\r\n",
+                (unsigned long)duration_ms,
+                shortLogName(source_name).c_str(),
+                shortLogName(dest_name).c_str(),
+                (unsigned)kSdRwSoakChunkBytes);
+  return true;
+}
+
+void stopSdReadWriteSoak(bool ok, const char* reason) {
+  if (!g_sd_rw_soak.active) return;
+  if (g_sd_rw_soak.dest_file) {
+    g_sd_rw_soak.dest_file.flush();
+    g_sd_rw_soak.dest_file.close();
+  }
+  if (g_sd_rw_soak.source_file) {
+    g_sd_rw_soak.source_file.close();
+  }
+  const uint32_t elapsed_ms = millis() - g_sd_rw_soak.started_ms;
+  Serial.printf(
+      "SDRWSOAK RESULT ok=%u elapsed_ms=%lu src=%s dst=%s bytes_read=%lu bytes_written=%lu wraps=%lu read_fail=%lu write_fail=%lu max_read_us=%lu max_write_us=%lu iterations=%lu",
+      ok ? 1U : 0U,
+      (unsigned long)elapsed_ms,
+      shortLogName(g_sd_rw_soak.source_name).c_str(),
+      shortLogName(g_sd_rw_soak.dest_name).c_str(),
+      (unsigned long)g_sd_rw_soak.bytes_read,
+      (unsigned long)g_sd_rw_soak.bytes_written,
+      (unsigned long)g_sd_rw_soak.wraps,
+      (unsigned long)g_sd_rw_soak.read_failures,
+      (unsigned long)g_sd_rw_soak.write_failures,
+      (unsigned long)g_sd_rw_soak.max_read_us,
+      (unsigned long)g_sd_rw_soak.max_write_us,
+      (unsigned long)g_sd_rw_soak.iterations);
+  if (reason && reason[0] != '\0') {
+    Serial.printf(" reason=%s", reason);
+  }
+  Serial.print("\r\n");
+  g_sd_rw_soak = {};
+}
+
+void serviceSdReadWriteSoak() {
+  if (!g_sd_rw_soak.active) return;
+
+  static uint8_t* s_buffer = nullptr;
+  if (!s_buffer) {
+    s_buffer = (uint8_t*)malloc(kSdRwSoakChunkBytes);
+    if (!s_buffer) {
+      g_sd_rw_soak.ok = false;
+      stopSdReadWriteSoak(false, "alloc_failed");
+      return;
+    }
+  }
+
+  if ((uint32_t)(millis() - g_sd_rw_soak.started_ms) >= g_sd_rw_soak.duration_ms) {
+    stopSdReadWriteSoak(g_sd_rw_soak.ok, nullptr);
+    return;
+  }
+
+  uint32_t total_read_us = 0U;
+  size_t got = 0U;
+  while (got < kSdRwSoakChunkBytes) {
+    const uint32_t t0 = micros();
+    const size_t chunk = g_sd_rw_soak.source_file.read(s_buffer + got, kSdRwSoakChunkBytes - got);
+    total_read_us += micros() - t0;
+    if (chunk == 0U) {
+      if (!g_sd_rw_soak.source_file.seek(0U)) {
+        g_sd_rw_soak.read_failures++;
+        g_sd_rw_soak.ok = false;
+        stopSdReadWriteSoak(false, "source_seek_failed");
+        return;
+      }
+      g_sd_rw_soak.wraps++;
+      continue;
+    }
+    got += chunk;
+  }
+  if (total_read_us > g_sd_rw_soak.max_read_us) g_sd_rw_soak.max_read_us = total_read_us;
+
+  if (got == 0U) {
+    g_sd_rw_soak.read_failures++;
+    g_sd_rw_soak.ok = false;
+    stopSdReadWriteSoak(false, "source_read_failed");
+    return;
+  }
+
+  uint32_t t0 = micros();
+  const size_t wrote = g_sd_rw_soak.dest_file.write(s_buffer, got);
+  const uint32_t write_us = micros() - t0;
+  if (write_us > g_sd_rw_soak.max_write_us) g_sd_rw_soak.max_write_us = write_us;
+  if (wrote != got) {
+    g_sd_rw_soak.write_failures++;
+    g_sd_rw_soak.ok = false;
+    stopSdReadWriteSoak(false, "dest_write_failed");
+    return;
+  }
+
+  g_sd_rw_soak.bytes_read += (uint32_t)got;
+  g_sd_rw_soak.bytes_written += (uint32_t)wrote;
+  g_sd_rw_soak.iterations++;
+}
+
+bool beginSdReadWriteLogSoak(uint32_t duration_ms, const String* source_override) {
+  if (g_sd_rw_log_soak.active) {
+    Serial.println("SDRWLOGSOAK START ok=0 reason=already_active");
+    return false;
+  }
+  if (g_sd_rw_soak.active) {
+    Serial.println("SDRWLOGSOAK START ok=0 reason=raw_soak_active");
+    return false;
+  }
+  if (log_store::busy()) {
+    Serial.println("SDRWLOGSOAK START ok=0 reason=logger_busy");
+    return false;
+  }
+  if (g_replay_capture.active || replay_bridge::active()) {
+    Serial.println("SDRWLOGSOAK START ok=0 reason=replay_busy");
+    return false;
+  }
+  if (!sd_backend::mounted()) {
+    sd_backend::Status backend = {};
+    if (!sd_backend::begin(&backend)) {
+      Serial.println("SDRWLOGSOAK START ok=0 reason=sd_mount_failed");
+      return false;
+    }
+  }
+
+  String source_name;
+  if (source_override && !source_override->isEmpty()) {
+    source_name = *source_override;
+  } else if (!log_store::largestLogName(source_name)) {
+    Serial.println("SDRWLOGSOAK START ok=0 reason=no_source_log");
+    return false;
+  }
+  if (!source_name.startsWith("/")) source_name = String("/logs/") + source_name;
+
+  sd_api::File source_file = sd_api::open(source_name, sd_api::OpenMode::read);
+  if (!source_file) {
+    Serial.printf("SDRWLOGSOAK START ok=0 reason=open_source_failed src=%s\r\n",
+                  shortLogName(source_name).c_str());
+    return false;
+  }
+
+  const uint32_t session_id = nextConsoleLogSessionId();
+  if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
+  if (!log_store::startSession(session_id)) {
+    source_file.close();
+    Serial.printf("SDRWLOGSOAK START ok=0 reason=logstart_failed session=%lu\r\n",
+                  (unsigned long)session_id);
+    return false;
+  }
+
+  g_sd_rw_log_soak = {};
+  g_sd_rw_log_soak.active = true;
+  g_sd_rw_log_soak.ok = true;
+  g_sd_rw_log_soak.started_ms = millis();
+  g_sd_rw_log_soak.duration_ms = duration_ms;
+  g_sd_rw_log_soak.session_id = session_id;
+  g_sd_rw_log_soak.source_name = source_name;
+  g_sd_rw_log_soak.source_file = source_file;
+  Serial.printf("SDRWLOGSOAK START ok=1 duration_ms=%lu src=%s session=%lu\r\n",
+                (unsigned long)duration_ms,
+                shortLogName(source_name).c_str(),
+                (unsigned long)session_id);
+  return true;
+}
+
+void stopSdReadWriteLogSoak(bool ok, const char* reason) {
+  if (!g_sd_rw_log_soak.active) return;
+  if (!g_sd_rw_log_soak.stop_requested) {
+    g_sd_rw_log_soak.stop_requested = true;
+    g_sd_rw_log_soak.ok = g_sd_rw_log_soak.ok && ok;
+    if (g_sd_rw_log_soak.source_file) {
+      g_sd_rw_log_soak.source_file.close();
+    }
+    log_store::stopSession();
+  }
+  if (log_store::busy()) return;
+
+  const auto stats = log_store::stats();
+  const auto recorder = log_store::recorderStatus();
+  String closed_name;
+  (void)log_store::latestLogNameForSession(g_sd_rw_log_soak.session_id, closed_name);
+  const uint32_t elapsed_ms = millis() - g_sd_rw_log_soak.started_ms;
+  Serial.printf(
+      "SDRWLOGSOAK RESULT ok=%u elapsed_ms=%lu src=%s dst=%s session=%lu bytes_read=%lu records_read=%lu wraps=%lu read_fail=%lu unsupported=%lu logged_bytes=%lu written=%lu dropped=%lu",
+      (g_sd_rw_log_soak.ok && ok) ? 1U : 0U,
+      (unsigned long)elapsed_ms,
+      shortLogName(g_sd_rw_log_soak.source_name).c_str(),
+      shortLogName(closed_name).c_str(),
+      (unsigned long)g_sd_rw_log_soak.session_id,
+      (unsigned long)g_sd_rw_log_soak.bytes_read,
+      (unsigned long)g_sd_rw_log_soak.records_read,
+      (unsigned long)g_sd_rw_log_soak.wraps,
+      (unsigned long)g_sd_rw_log_soak.read_failures,
+      (unsigned long)g_sd_rw_log_soak.unsupported_records,
+      (unsigned long)recorder.bytes_written,
+      (unsigned long)stats.records_written,
+      (unsigned long)stats.dropped);
+  if (reason && reason[0] != '\0') {
+    Serial.printf(" reason=%s", reason);
+  }
+  Serial.print("\r\n");
+  g_sd_rw_log_soak = {};
+}
+
+void serviceSdReadWriteLogSoak() {
+  if (!g_sd_rw_log_soak.active) return;
+  if (g_sd_rw_log_soak.stop_requested) {
+    stopSdReadWriteLogSoak(g_sd_rw_log_soak.ok, nullptr);
+    return;
+  }
+  if ((uint32_t)(millis() - g_sd_rw_log_soak.started_ms) >= g_sd_rw_log_soak.duration_ms) {
+    stopSdReadWriteLogSoak(g_sd_rw_log_soak.ok, nullptr);
+    return;
+  }
+
+  SoakBinaryLogRecordV2 record = {};
+  if (!readExactFile(g_sd_rw_log_soak.source_file, (uint8_t*)&record, sizeof(record))) {
+    if (!g_sd_rw_log_soak.source_file.seek(0U)) {
+      g_sd_rw_log_soak.read_failures++;
+      g_sd_rw_log_soak.ok = false;
+      stopSdReadWriteLogSoak(false, "source_seek_failed");
+      return;
+    }
+    g_sd_rw_log_soak.wraps++;
+    if (!readExactFile(g_sd_rw_log_soak.source_file, (uint8_t*)&record, sizeof(record))) {
+      g_sd_rw_log_soak.read_failures++;
+      g_sd_rw_log_soak.ok = false;
+      stopSdReadWriteLogSoak(false, "source_read_failed");
+      return;
+    }
+  }
+
+  if (record.magic != kSoakLogMagic || record.version != kSoakLogVersion ||
+      record.record_size != sizeof(record)) {
+    g_sd_rw_log_soak.read_failures++;
+    g_sd_rw_log_soak.ok = false;
+    stopSdReadWriteLogSoak(false, "bad_record");
+    return;
+  }
+
+  switch ((telem::LogRecordKind)record.record_kind) {
+    case telem::LogRecordKind::State160: {
+      telem::TelemetryFullStateV1 state = {};
+      memcpy(&state, record.payload, sizeof(state));
+      log_store::enqueueState(record.seq, record.t_us, state);
+      break;
+    }
+    case telem::LogRecordKind::ReplayInput160: {
+      telem::ReplayInputRecord160 replay = {};
+      memcpy(&replay, record.payload, sizeof(replay));
+      log_store::enqueueReplayInput(record.seq, record.t_us, replay);
+      break;
+    }
+    case telem::LogRecordKind::ReplayControl160: {
+      telem::ReplayControlRecord160 replay = {};
+      memcpy(&replay, record.payload, sizeof(replay));
+      log_store::enqueueReplayControl(
+          replay.payload.command_id,
+          record.seq,
+          record.t_us,
+          replay.payload.payload,
+          replay.payload.payload_len,
+          replay.payload.apply_flags);
+      break;
+    }
+    default:
+      g_sd_rw_log_soak.unsupported_records++;
+      break;
+  }
+
+  g_sd_rw_log_soak.bytes_read += (uint32_t)sizeof(record);
+  g_sd_rw_log_soak.records_read++;
+}
+
 bool beginReplayCapture(const String* source_override) {
   if (g_replay_capture.active) {
     Serial.println("AIRREPLAYCAP START ok=0 reason=already_active");
@@ -753,6 +1355,18 @@ bool beginReplayCapture(const String* source_override) {
   }
 
   const uint32_t session_id = nextConsoleLogSessionId();
+  uint16_t applied_capture_hz = 0U;
+  if (!applyReplayRunControls(replay_bridge::averageFactor(), &applied_capture_hz)) {
+    Serial.printf("AIRREPLAYCAP START ok=0 reason=control_apply_failed src=%s session=%lu avg_n=%u\r\n",
+                  shortLogName(source_name).c_str(),
+                  (unsigned long)session_id,
+                  (unsigned)replay_bridge::averageFactor());
+    return false;
+  }
+
+  log_store::setNextSessionMetadata(source_name,
+                                    replay_bridge::averageFactor(),
+                                    applied_capture_hz);
   if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
   if (!log_store::startSession(session_id)) {
     Serial.printf("AIRREPLAYCAP START ok=0 reason=logstart_failed session=%lu\r\n",
@@ -761,15 +1375,6 @@ bool beginReplayCapture(const String* source_override) {
   }
 
   const String capture_name = log_store::currentFileName();
-  uint16_t applied_capture_hz = 0U;
-  if (!applyReplayRunControls(replay_bridge::averageFactor(), &applied_capture_hz)) {
-    log_store::stopSession();
-    Serial.printf("AIRREPLAYCAP START ok=0 reason=control_apply_failed src=%s session=%lu avg_n=%u\r\n",
-                  shortLogName(source_name).c_str(),
-                  (unsigned long)session_id,
-                  (unsigned)replay_bridge::averageFactor());
-    return false;
-  }
   if (!replay_bridge::startFile(source_name)) {
     log_store::stopSession();
     Serial.printf("AIRREPLAYCAP START ok=0 reason=replay_start_failed src=%s session=%lu\r\n",
@@ -1058,7 +1663,9 @@ void handleConsoleCommands() {
         g_console_line[i] = (char)tolower((unsigned char)g_console_line[i]);
       }
 
-      if (strcmp(g_console_line, "help") == 0 || strcmp(g_console_line, "h") == 0) {
+      if (handleTeensyApiConsoleCommand(g_console_line)) {
+        continue;
+      } else if (strcmp(g_console_line, "help") == 0 || strcmp(g_console_line, "h") == 0) {
         printConsoleHelp();
       } else if (strcmp(g_console_line, "sdprobe") == 0) {
         printSdApiStatus("SDPROBE");
@@ -1081,6 +1688,97 @@ void handleConsoleCommands() {
         }
       } else if (strcmp(g_console_line, "sdstate") == 0) {
         printSdApiStatus("SDSTATE");
+      } else if (strcmp(g_console_line, "sdrwsoakstat") == 0) {
+        Serial.printf("SDRWSOAK active=%u src=%s dst=%s bytes_read=%lu bytes_written=%lu wraps=%lu read_fail=%lu write_fail=%lu max_read_us=%lu max_write_us=%lu iterations=%lu\r\n",
+                      g_sd_rw_soak.active ? 1U : 0U,
+                      shortLogName(g_sd_rw_soak.source_name).c_str(),
+                      shortLogName(g_sd_rw_soak.dest_name).c_str(),
+                      (unsigned long)g_sd_rw_soak.bytes_read,
+                      (unsigned long)g_sd_rw_soak.bytes_written,
+                      (unsigned long)g_sd_rw_soak.wraps,
+                      (unsigned long)g_sd_rw_soak.read_failures,
+                      (unsigned long)g_sd_rw_soak.write_failures,
+                      (unsigned long)g_sd_rw_soak.max_read_us,
+                      (unsigned long)g_sd_rw_soak.max_write_us,
+                      (unsigned long)g_sd_rw_soak.iterations);
+      } else if (strcmp(g_console_line, "sdrwsoakstop") == 0) {
+        if (g_sd_rw_soak.active) {
+          stopSdReadWriteSoak(g_sd_rw_soak.ok, "stopped");
+        } else {
+          Serial.println("SDRWSOAK active=0");
+        }
+      } else if (strncmp(g_console_line, "sdrwsoak ", 9) == 0) {
+        unsigned duration_s = 0U;
+        char src_name[64] = {};
+        const int n = sscanf(g_console_line + 9, "%u %63s", &duration_s, src_name);
+        if (n >= 1 && duration_s > 0U) {
+          String source_name;
+          String* source_override = nullptr;
+          if (n >= 2) {
+            source_name = String(src_name);
+            source_name.trim();
+            source_override = &source_name;
+          }
+          (void)beginSdReadWriteSoak((uint32_t)duration_s * 1000U, source_override);
+        } else {
+          Serial.println("SDRWSOAK usage: sdrwsoak <seconds> [file]");
+        }
+      } else if (strcmp(g_console_line, "sdrwlogsoakstat") == 0) {
+        Serial.printf("SDRWLOGSOAK active=%u stop=%u src=%s session=%lu bytes_read=%lu records_read=%lu wraps=%lu read_fail=%lu unsupported=%lu\r\n",
+                      g_sd_rw_log_soak.active ? 1U : 0U,
+                      g_sd_rw_log_soak.stop_requested ? 1U : 0U,
+                      shortLogName(g_sd_rw_log_soak.source_name).c_str(),
+                      (unsigned long)g_sd_rw_log_soak.session_id,
+                      (unsigned long)g_sd_rw_log_soak.bytes_read,
+                      (unsigned long)g_sd_rw_log_soak.records_read,
+                      (unsigned long)g_sd_rw_log_soak.wraps,
+                      (unsigned long)g_sd_rw_log_soak.read_failures,
+                      (unsigned long)g_sd_rw_log_soak.unsupported_records);
+      } else if (strcmp(g_console_line, "sdrwlogsoakstop") == 0) {
+        if (g_sd_rw_log_soak.active) {
+          stopSdReadWriteLogSoak(g_sd_rw_log_soak.ok, "stopped");
+        } else {
+          Serial.println("SDRWLOGSOAK active=0");
+        }
+      } else if (strncmp(g_console_line, "sdrwlogsoak ", 12) == 0) {
+        unsigned duration_s = 0U;
+        char src_name[64] = {};
+        const int n = sscanf(g_console_line + 12, "%u %63s", &duration_s, src_name);
+        if (n >= 1 && duration_s > 0U) {
+          String source_name;
+          String* source_override = nullptr;
+          if (n >= 2) {
+            source_name = String(src_name);
+            source_name.trim();
+            source_override = &source_name;
+          }
+          (void)beginSdReadWriteLogSoak((uint32_t)duration_s * 1000U, source_override);
+        } else {
+          Serial.println("SDRWLOGSOAK usage: sdrwlogsoak <seconds> [file]");
+        }
+      } else if (strncmp(g_console_line, "carrysigcsv", 11) == 0) {
+        uint32_t duration_ms = 2000U;
+        unsigned window = 16U;
+        if (g_console_line[11] == '\0') {
+          (void)teensy_api::runCarrySequenceCsvTest(Serial, duration_ms, (uint8_t)window);
+        } else if (g_console_line[11] == ' ') {
+          const int matched = sscanf(g_console_line + 12, "%lu %u", &duration_ms, &window);
+          if (matched >= 1 && duration_ms > 0U) {
+            if (window == 0U) window = 16U;
+            if (window > 255U) window = 255U;
+            (void)teensy_api::runCarrySequenceCsvTest(Serial, duration_ms, (uint8_t)window);
+          } else {
+            Serial.println("CARRYSIGCSV usage: carrysigcsv [ms] [window]");
+          }
+        } else {
+          Serial.println("CARRYSIGCSV usage: carrysigcsv [ms] [window]");
+        }
+      } else if (strncmp(g_console_line, "carrysig", 8) == 0) {
+        unsigned count = 8U;
+        (void)sscanf(g_console_line + 8, "%u", &count);
+        if (count == 0U) count = 8U;
+        if (count > 255U) count = 255U;
+        (void)teensy_api::runCarrySignatureTest(Serial, (uint8_t)count);
       } else if (strcmp(g_console_line, "sdwrite") == 0) {
         (void)writeSdApiTestLog();
       } else if (strncmp(g_console_line, "sdrename ", 9) == 0) {
@@ -1115,6 +1813,7 @@ void handleConsoleCommands() {
                       (unsigned long)g_baseline_stopped_ms);
       } else if (strcmp(g_console_line, "logstart") == 0) {
         const uint32_t session_id = nextConsoleLogSessionId();
+        log_store::setNextSessionMetadata(String(), 1U, config_store::get().source_rate_hz);
         if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
         const bool ok = log_store::startSession(session_id);
         Serial.printf("AIRLOG START ok=%u session=%lu\r\n",
@@ -1125,6 +1824,7 @@ void handleConsoleCommands() {
         unsigned session_id = 0U;
         if (sscanf(g_console_line + 11, "%u", &session_id) == 1 && session_id != 0U) {
           g_console_log_session_id = (uint32_t)session_id;
+          log_store::setNextSessionMetadata(String(), 1U, config_store::get().source_rate_hz);
           if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
           const bool ok = log_store::startSession((uint32_t)session_id);
           Serial.printf("AIRLOG START ok=%u session=%u\r\n", ok ? 1U : 0U, session_id);
@@ -1135,6 +1835,8 @@ void handleConsoleCommands() {
       } else if (strcmp(g_console_line, "logstop") == 0) {
         log_store::stopSession();
         Serial.println("AIRLOG STOP requested=1");
+        const bool stopped_ok = waitForLogStoreIdle(10000U);
+        Serial.printf("AIRLOG STOP ok=%u\r\n", stopped_ok ? 1U : 0U);
         printAirLogStatus();
       } else if (strcmp(g_console_line, "logstat") == 0) {
         printAirLogStatus();
@@ -1319,9 +2021,13 @@ void handleConsoleCommands() {
           Serial.println("SETPIN usage: setpin <gpio>");
         }
       } else if (strcmp(g_console_line, "getfusion") == 0 || strcmp(g_console_line, "get fusion") == 0) {
-        const bool ok = teensy_link::sendGetFusionSettings();
-        Serial.printf("GETFUSION tx_ok=%u\n", ok ? 1U : 0U);
-        g_wait_getfusion_ack = ok;
+        teensy_api::CommandAckResult result = {};
+        (void)teensy_api::getFusionSettings(result);
+        Serial.printf("GETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu\r\n",
+                      result.tx_ok ? 1U : 0U,
+                      result.ack_seen ? 1U : 0U,
+                      result.ack_ok ? 1U : 0U,
+                      (unsigned long)result.ack_code);
       } else if (strncmp(g_console_line, "setcap ", 7) == 0) {
         unsigned hz = 0U;
         if (sscanf(g_console_line + 7, "%u", &hz) == 1) {
@@ -1331,8 +2037,13 @@ void handleConsoleCommands() {
           Serial.println("SETCAP usage: setcap <hz>");
         }
       } else if (strcmp(g_console_line, "savecap") == 0) {
-        const bool ok = saveCaptureRateDefaults();
-        Serial.printf("SAVECAP tx_ok=%u\r\n", ok ? 1U : 0U);
+        teensy_api::CommandAckResult result = {};
+        (void)teensy_api::saveCaptureSettings(result);
+        Serial.printf("SAVECAP tx_ok=%u ack_seen=%u ack_ok=%u code=%lu\r\n",
+                      result.tx_ok ? 1U : 0U,
+                      result.ack_seen ? 1U : 0U,
+                      result.ack_ok ? 1U : 0U,
+                      (unsigned long)result.ack_code);
       } else if (strcmp(g_console_line, "bench status") == 0 || strcmp(g_console_line, "benchstatus") == 0 ||
                  strcmp(g_console_line, "benchstat") == 0) {
         const AppConfig& cfg = config_store::get();
@@ -1346,12 +2057,19 @@ void handleConsoleCommands() {
         AppConfig cfg = config_store::get();
         cfg.standalone_bench = 1U;
         config_store::update(cfg);
-        Serial.println("BENCH standalone=1");
+        radio_link::resetNetworkState();
+        resetWifiStatusFlags();
+        WiFi.mode(WIFI_OFF);
+        radio_link::setVerbose(false);
+        Serial.println("BENCH standalone=1 radio=0 wifi=off");
       } else if (strcmp(g_console_line, "bench off") == 0 || strcmp(g_console_line, "benchoff") == 0) {
         AppConfig cfg = config_store::get();
         cfg.standalone_bench = 0U;
         config_store::update(cfg);
-        Serial.println("BENCH standalone=0 (restart AIR to re-enable radio path cleanly)");
+        restartWifiStation();
+        radio_link::reconfigure(config_store::get());
+        radio_link::setVerbose(!g_quiet_serial);
+        Serial.println("BENCH standalone=0 radio=1 wifi=restart");
       } else if (strncmp(g_console_line, "benchauto ", 10) == 0) {
         unsigned duration_ms = 0U;
         if (sscanf(g_console_line + 10, "%u", &duration_ms) == 1 && duration_ms >= 1000U) {
@@ -1447,11 +2165,13 @@ void handleConsoleCommands() {
           cmd.accelerationRejection = a;
           cmd.magneticRejection = m;
           cmd.recoveryTriggerPeriod = (uint16_t)r;
-          const bool ok = teensy_link::sendSetFusionSettings(cmd);
-          const bool ok_get = ok ? teensy_link::sendGetFusionSettings() : false;
-          if (ok_get) g_wait_getfusion_ack = true;
-          Serial.printf("SETFUSION tx_ok=%u gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
-                        ok ? 1U : 0U,
+          teensy_api::CommandAckResult result = {};
+          (void)teensy_api::setFusionSettings(cmd, result);
+          Serial.printf("SETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
+                        result.tx_ok ? 1U : 0U,
+                        result.ack_seen ? 1U : 0U,
+                        result.ack_ok ? 1U : 0U,
+                        (unsigned long)result.ack_code,
                         (double)cmd.gain,
                         (double)cmd.accelerationRejection,
                         (double)cmd.magneticRejection,
@@ -1693,6 +2413,16 @@ void loop() {
   handleConsoleCommands();
   serviceGpioPulse();
   serviceSdSoakBenchmark();
+  serviceSdReadWriteSoak();
+  serviceSdReadWriteLogSoak();
+  static bool s_idle_media_checks_enabled = true;
+  const bool mixed_sd_io_active =
+      g_replay_capture.active || replay_bridge::active() || g_sd_rw_soak.active || g_sd_rw_log_soak.active;
+  const bool idle_media_checks_enabled = !mixed_sd_io_active;
+  if (idle_media_checks_enabled != s_idle_media_checks_enabled) {
+    log_store::setIdleMediaChecksEnabled(idle_media_checks_enabled);
+    s_idle_media_checks_enabled = idle_media_checks_enabled;
+  }
   log_store::poll();
   serviceReplayCapture();
   serviceReplayCompare();

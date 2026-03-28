@@ -161,6 +161,16 @@ struct TelemetryFullStateV1 {
   uint8_t reserved1[14];
 };
 
+inline void encodeReplaySourceStamp(TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
+  memcpy(state.reserved1 + 0, &seq, sizeof(seq));
+  memcpy(state.reserved1 + 4, &t_us, sizeof(t_us));
+}
+
+inline void decodeReplaySourceStamp(const TelemetryFullStateV1& state, uint32_t& seq, uint32_t& t_us) {
+  memcpy(&seq, state.reserved1 + 0, sizeof(seq));
+  memcpy(&t_us, state.reserved1 + 4, sizeof(t_us));
+}
+
 static constexpr uint8_t kUnifiedDownlinkFlagHasGps = 1U << 0;
 static constexpr uint8_t kUnifiedDownlinkFlagHasControl = 1U << 1;
 
