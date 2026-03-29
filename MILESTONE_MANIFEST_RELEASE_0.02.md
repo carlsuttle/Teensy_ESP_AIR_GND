@@ -32,6 +32,7 @@ Relevant files:
 - [ESP_AIR/src/replay_bridge.cpp](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\ESP_AIR\src\replay_bridge.cpp)
 - [ESP_AIR/src/sd_backend.cpp](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\ESP_AIR\src\sd_backend.cpp)
 - [ESP_AIR_TEENSY_API_LIBRARY_AND_TEST_RESULTS_2026-03-28.md](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\ESP_AIR_TEENSY_API_LIBRARY_AND_TEST_RESULTS_2026-03-28.md)
+- [AI_AVIONICS_PROJECT_RECORD.md](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\AI_AVIONICS_PROJECT_RECORD.md)
 - [scripts/run_teensy_api_exerciser.ps1](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\scripts\run_teensy_api_exerciser.ps1)
 - [scripts/run_teensy_api_mode_sweep.ps1](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\scripts\run_teensy_api_mode_sweep.ps1)
 - [scripts/run_teensy_api_replay_benchmark.ps1](C:\Users\dell\Platformio\esp32_crsf_telemetry\Teensy_ESP_AIR_GND\scripts\run_teensy_api_replay_benchmark.ps1)
@@ -46,6 +47,10 @@ State captured in release `0.02`:
 - replay skips metadata records cleanly
 - AIR now tries `40 MHz` SD mount first
 - Teensy API proof surface is documented and scriptable through `tapi ...`
+- baseline-lock protocol added to project record as required AI behavior:
+  - run API gate scripts before transport/schema edits
+  - stop on first regression and revert to baseline
+  - require before/after proof logs for accepted fixes
 
 How to reproduce this state:
 

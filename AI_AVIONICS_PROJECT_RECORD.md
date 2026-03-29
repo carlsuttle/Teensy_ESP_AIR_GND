@@ -131,6 +131,32 @@ As implementation becomes easier, the difficult areas shift toward:
 - human factors
 - interpretation of physical behavior
 
+### Baseline-Lock Protocol (Required AI Behavior)
+
+This protocol is mandatory for all AI-assisted coding sessions on this project.
+It exists to prevent regressions caused by speculative fixes.
+
+Required behavior:
+
+1. Start from a known-good baseline tag/commit before transport or schema work.
+2. Run the gate scripts before making any code changes:
+   `scripts/run_teensy_api_exerciser.ps1`,
+   `scripts/run_teensy_api_mode_sweep.ps1`,
+   `scripts/run_teensy_api_replay_benchmark.ps1`.
+3. Do not modify SPI/UART transport, replay bridge, or record schema unless a
+   gate fails first on baseline and the failure is captured in logs.
+4. Make one bounded hypothesis change at a time; do not mix unrelated fixes.
+5. Re-run the same gate scripts after each change.
+6. On first new regression, stop immediately and revert to baseline.
+7. Do not accept a fix without a before/after proof log pair.
+8. Keep diagnostic-only scripts and probes separate from production behavior.
+
+Enforcement intent:
+
+- If baseline passes, preserve behavior and avoid transport refactors.
+- If baseline fails, fix only the proven failing path.
+- Prefer rollback over cascading debug edits.
+
 ---
 
 ## 5. Current System Architecture
