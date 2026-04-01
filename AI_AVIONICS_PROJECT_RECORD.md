@@ -1203,3 +1203,38 @@ Practical decision:
   bounded, understandable, and far less risky than reintroducing aggressive
   background remount/reprobe behavior that previously destabilized the live
   telemetry path
+
+## 20. Codex Control Spec Added (2026-04-01)
+
+Purpose:
+
+A persistent Codex instruction layer is now required for this repository
+because the project has crossed from simple feature work into
+architecture-sensitive refactoring.
+
+Decision:
+
+Repo-root `AGENTS.md` is now the authoritative machine-readable instruction
+source for Codex.
+
+Reason:
+
+The project depends on preserving system-level invariants across Teensy,
+ESP_AIR, ESP_GND, logging, transport, and replay. These constraints must
+survive across separate Codex sessions and must not rely on prompt memory.
+
+Key rules now enforced through `AGENTS.md`:
+
+- logging/capture integrity takes priority over convenience telemetry
+- replay is a first-class deterministic engineering function
+- transport must not depend on hard-coded schema size
+- schema/version/record metadata must be centralized
+- refactors must preserve validated `0.02` behavior before extension
+- no partial schema edits that leave logging/replay/tests inconsistent
+
+Current use:
+
+Codex should read `AGENTS.md` before any architecture, schema, transport,
+logging, or replay task. Future project-specific instructions can be layered
+under subdirectories if needed, but repo-root guidance remains the primary
+architectural contract.
