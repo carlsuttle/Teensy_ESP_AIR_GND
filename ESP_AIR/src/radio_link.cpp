@@ -7,9 +7,12 @@
 #include <string.h>
 
 #include "config_store.h"
+#include "control_plane.h"
 #include "log_store.h"
 #include "replay_bridge.h"
+#include "sd_file_api.h"
 #include "sd_backend.h"
+#include "time_service.h"
 #include "types_shared.h"
 
 namespace radio_link {
@@ -29,6 +32,7 @@ constexpr uint8_t kSendFailThreshold = 24U;
 constexpr size_t kTxQueueCapacity = 24U;
 constexpr uint32_t kSendRetryBackoffMs = 2U;
 constexpr uint32_t kSendCompleteTimeoutMs = 200U;
+constexpr uint32_t kFileListChunkQueueWaitMs = 5000U;
 
 struct RxFrame {
   uint8_t mac[6] = {};
@@ -75,6 +79,9 @@ bool g_log_requested = false;
 bool g_log_backend_ready = false;
 bool g_log_media_present = false;
 bool g_rssi_valid = false;
+bool g_file_list_transfer_active = false;
+sd_file_api::FileListPage g_file_list_page = {};
+telem::StorageStatusPayloadV1 g_storage_status_payload = {};
 bool g_control_has_ack = false;
 bool g_control_ack_ok = false;
 bool g_radio_lr_mode = true;
@@ -168,8 +175,58 @@ bool initEspNow();
 void clearPeerState();
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us);
 void sendReplayStatusFrame();
-void sendLogFileListFrames();
+void sendLogFileListFrames(uint16_t offset = 0U, uint16_t limit = 32U);
 void sendStorageStatusFrame();
+void drainAsyncEvents();
+void pumpTx();
+
+struct FileListStreamContext {
+  telem::LogFileListChunkPayloadV1 page = {};
+  uint16_t page_count = 0U;
+  uint16_t page_offset = 0U;
+  uint16_t total_files = 0U;
+  bool has_more = false;
+  bool failed = false;
+};
+
+bool flushFileListPage(FileListStreamContext& ctx, bool complete) {
+  ctx.page.offset = ctx.page_offset;
+  ctx.page.total_files = complete ? ctx.total_files : 0U;
+  ctx.page.flags = complete ? telem::kLogFileListFlagComplete : 0U;
+  if (ctx.has_more) ctx.page.flags |= telem::kLogFileListFlagTruncated;
+  ctx.page.entries_in_chunk = ctx.page_count;
+  const uint32_t wait_started_ms = millis();
+  while (!sendFrame(telem::TELEM_LOG_FILE_LIST, &ctx.page, sizeof(ctx.page), 0U, micros())) {
+    drainAsyncEvents();
+    pumpTx();
+    delay(2);
+    if ((uint32_t)(millis() - wait_started_ms) >= kFileListChunkQueueWaitMs) {
+      ctx.failed = true;
+      return false;
+    }
+  }
+  ctx.page_offset = (uint16_t)(ctx.page_offset + ctx.page_count);
+  ctx.page_count = 0U;
+  ctx.page.offset = 0U;
+  ctx.page.total_files = 0U;
+  ctx.page.flags = 0U;
+  ctx.page.entries_in_chunk = 0U;
+  memset(ctx.page.entries, 0, sizeof(ctx.page.entries));
+  return true;
+}
+
+bool appendFileListEntry(const telem::LogFileInfoV1& entry, uint16_t index, void* ctx_ptr) {
+  FileListStreamContext& ctx = *reinterpret_cast<FileListStreamContext*>(ctx_ptr);
+  ctx.total_files = (uint16_t)(index + 1U);
+  if (ctx.page_count < telem::kLogFileChunkEntries) {
+    ctx.page.entries[ctx.page_count] = entry;
+    ctx.page_count++;
+  }
+  if (ctx.page_count >= telem::kLogFileChunkEntries) {
+    return flushFileListPage(ctx, false);
+  }
+  return true;
+}
 
 uint8_t desiredProtocol() {
   const uint8_t kNormalMask = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -617,26 +674,11 @@ telem::LinkMetaPayloadV1 currentLinkMeta() {
 }
 
 uint8_t currentLogFlags() {
-  const log_store::RecorderStatus recorder = log_store::recorderStatus();
-  uint8_t flags = 0U;
-  if (recorder.active) flags |= telem::kLogStatusFlagActive;
-  if (g_log_requested) flags |= telem::kLogStatusFlagRequested;
-  if (recorder.backend_ready) flags |= telem::kLogStatusFlagBackendReady;
-  if (recorder.media_present) flags |= telem::kLogStatusFlagMediaPresent;
-  if (!recorder.active && log_store::busy()) flags |= telem::kLogStatusFlagBusy;
-  return flags;
+  return control_plane::currentLogStatusPayload(millis()).flags;
 }
 
 telem::LogStatusPayloadV1 currentLogStatus() {
-  const log_store::RecorderStatus recorder = log_store::recorderStatus();
-  telem::LogStatusPayloadV1 status = {};
-  status.flags = currentLogFlags();
-  status.last_command = g_log_last_command;
-  status.session_id = recorder.session_id ? recorder.session_id : g_log_session_id;
-  status.bytes_written = recorder.bytes_written;
-  status.free_bytes = recorder.free_bytes;
-  status.last_change_ms = g_log_last_change_ms ? (uint32_t)(millis() - g_log_last_change_ms) : 0xFFFFFFFFUL;
-  return status;
+  return control_plane::currentLogStatusPayload(millis());
 }
 
 void markLogStatusDirty() {
@@ -690,38 +732,16 @@ void captureSnapshotAck(const teensy_link::Snapshot& snap) {
   g_control_ack_ok = snap.ack_ok;
 }
 
-void fillControlStatus(const teensy_link::Snapshot& snap, telem::ControlStatusPayloadV1& control) {
-  control = {};
-  control.control_rate_hz = g_radio_control_rate_hz;
-
-  if (g_control_has_ack) {
-    control.flags |= telem::kControlStatusFlagHasAck;
-    if (g_control_ack_ok) control.flags |= telem::kControlStatusFlagAckOk;
-    control.ack_command = g_control_ack_command;
-    control.ack_code = g_control_ack_code;
-  }
-
-  if (snap.has_fusion_settings) {
-    control.flags |= telem::kControlStatusFlagHasFusion;
-    control.fusion = snap.fusion_settings;
-  } else if (snap.has_state) {
-    control.flags |= telem::kControlStatusFlagHasFusion;
-    control.fusion.gain = snap.state.fusion_gain;
-    control.fusion.accelerationRejection = snap.state.fusion_accel_rej;
-    control.fusion.magneticRejection = snap.state.fusion_mag_rej;
-    control.fusion.recoveryTriggerPeriod = snap.state.fusion_recovery_period;
-  }
-
-  control.flags |= telem::kControlStatusFlagHasLinkMeta;
-  control.link_meta = currentLinkMeta();
-
-  control.flags |= telem::kControlStatusFlagHasLogStatus;
-  control.log_status = currentLogStatus();
-  control.mirror_tx_ok = snap.state.mirror_tx_ok;
-  control.mirror_drop_count = snap.state.mirror_drop_count;
+void fillLiveStatus(telem::DownlinkStatusV1& status) {
+  status = {};
+  const telem::LogStatusPayloadV1 log_status = currentLogStatus();
+  status.log_flags = log_status.flags;
+  status.log_session_id = log_status.session_id;
+  status.log_bytes_written = log_status.bytes_written;
+  time_service::fillDownlinkStatus(status, millis());
 }
 
-void fillFastState(const telem::TelemetryFullStateV1& state, telem::DownlinkFastStateV1& fast) {
+void fillFastState(const telem::TelemetryStateRecord& state, telem::DownlinkFastStateV1& fast) {
   fast.roll_deg = state.roll_deg;
   fast.pitch_deg = state.pitch_deg;
   fast.yaw_deg = state.yaw_deg;
@@ -735,7 +755,7 @@ void fillFastState(const telem::TelemetryFullStateV1& state, telem::DownlinkFast
   fast.flags = state.flags;
 }
 
-void fillGpsState(const telem::TelemetryFullStateV1& state, telem::DownlinkGpsStateV1& gps) {
+void fillGpsState(const telem::TelemetryStateRecord& state, telem::DownlinkGpsStateV1& gps) {
   gps.iTOW_ms = state.iTOW_ms;
   gps.fixType = state.fixType;
   gps.numSV = state.numSV;
@@ -748,6 +768,21 @@ void fillGpsState(const telem::TelemetryFullStateV1& state, telem::DownlinkGpsSt
   gps.sAcc_mms = state.sAcc_mms;
   gps.gps_parse_errors = state.gps_parse_errors;
   gps.last_gps_ms = state.last_gps_ms;
+}
+
+void fillExtendedState(const telem::TelemetryStateRecord& state, telem::DownlinkExtendedStateV2& ext) {
+  ext.fusion_gain = state.fusion_gain;
+  ext.fusion_accel_rej = state.fusion_accel_rej;
+  ext.fusion_mag_rej = state.fusion_mag_rej;
+  ext.fusion_recovery_period = state.fusion_recovery_period;
+  ext.raw_present_mask = state.raw_present_mask;
+  const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(state);
+  ext.gps_year = gps_time.year;
+  ext.gps_month = gps_time.month;
+  ext.gps_day = gps_time.day;
+  ext.gps_hour = gps_time.hour;
+  ext.gps_min = gps_time.minute;
+  ext.gps_sec = gps_time.second;
 }
 
 bool maybeSendUnifiedDownlink(const teensy_link::Snapshot& snap) {
@@ -778,7 +813,8 @@ bool maybeSendUnifiedDownlink(const teensy_link::Snapshot& snap) {
   uint8_t payload[telem::kEspNowMaxDataLen - sizeof(telem::FrameHeader)] = {};
   size_t payload_len = sizeof(base);
   bool included_gps = false;
-  bool included_control = false;
+  bool included_extended = false;
+  bool included_status = false;
   memcpy(payload, &base, sizeof(base));
 
   const uint32_t gps_interval_ms = rateIntervalMs(kUnifiedGpsRateHz);
@@ -791,14 +827,26 @@ bool maybeSendUnifiedDownlink(const teensy_link::Snapshot& snap) {
     included_gps = true;
   }
 
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  {
+    telem::DownlinkExtendedStateV2 ext = {};
+    fillExtendedState(snap.state, ext);
+    memcpy(payload + payload_len, &ext, sizeof(ext));
+    payload_len += sizeof(ext);
+    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |=
+        telem::kUnifiedDownlinkFlagHasExtended;
+    included_extended = true;
+  }
+#endif
+
   const uint32_t control_interval_ms = rateIntervalMs(g_radio_control_rate_hz);
   if (g_last_control_tx_ms == 0U || (uint32_t)(now - g_last_control_tx_ms) >= control_interval_ms) {
-    telem::ControlStatusPayloadV1 control = {};
-    fillControlStatus(snap, control);
-    memcpy(payload + payload_len, &control, sizeof(control));
-    payload_len += sizeof(control);
-    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |= telem::kUnifiedDownlinkFlagHasControl;
-    included_control = true;
+    telem::DownlinkStatusV1 status = {};
+    fillLiveStatus(status);
+    memcpy(payload + payload_len, &status, sizeof(status));
+    payload_len += sizeof(status);
+    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |= telem::kUnifiedDownlinkFlagHasStatus;
+    included_status = true;
   }
 
   if (!sendFrame(telem::TELEM_UNIFIED_DOWNLINK, payload, payload_len, 0U, snap.t_us)) return false;
@@ -823,12 +871,9 @@ bool maybeSendUnifiedDownlink(const teensy_link::Snapshot& snap) {
   g_stats.last_source_t_us = snap.t_us;
   g_stats.last_tx_ms = now;
   if (included_gps) g_last_gps_tx_ms = now;
-  if (included_control) {
+  (void)included_extended;
+  if (included_status) {
     g_last_control_tx_ms = now;
-    g_control_has_ack = false;
-    g_control_ack_command = 0U;
-    g_control_ack_code = 0U;
-    g_control_ack_ok = false;
   }
   return true;
 }
@@ -895,84 +940,62 @@ void sendReplayStatusFrame() {
   (void)sendFrame(telem::TELEM_REPLAY_STATUS, &payload, sizeof(payload), 0U, micros());
 }
 
-void sendLogFileListFrames() {
-  uint16_t total_files = 0U;
-  uint16_t returned_files = 0U;
-  telem::LogFileListChunkPayloadV1 chunk = {};
-  if (!log_store::listFiles(chunk.entries,
-                            telem::kLogFileChunkEntries,
-                            0U,
-                            total_files,
-                            returned_files)) {
+void sendCurrentFileListFrames() {
+  FileListStreamContext ctx = {};
+  ctx.page_offset = g_file_list_page.offset;
+  ctx.total_files = g_file_list_page.total_files;
+  ctx.has_more = g_file_list_page.has_more;
+  for (uint16_t i = 0U; i < g_file_list_page.returned_files; ++i) {
+    ctx.page.entries[ctx.page_count] = g_file_list_page.entries[i];
+    ctx.page_count++;
+    if (ctx.page_count >= telem::kLogFileChunkEntries) {
+      if (!flushFileListPage(ctx, false)) {
+        return;
+      }
+    }
+  }
+  (void)flushFileListPage(ctx, true);
+}
+
+void sendLogFileListFrames(uint16_t offset, uint16_t limit) {
+  g_file_list_transfer_active = true;
+  control_plane::Request request = {};
+  request.request_id = micros();
+  request.source = control_plane::SourceInterface::Radio;
+  request.category = control_plane::RequestCategory::FileSd;
+  request.action = control_plane::RequestAction::FileListPage;
+  request.command_id = telem::CMD_GET_LOG_FILE_LIST;
+  request.offset = offset;
+  request.limit = limit;
+  control_plane::Result result = {};
+  (void)control_plane::submit(request, result);
+  const telem::SdApiStatusCode page_code = (telem::SdApiStatusCode)result.code;
+  if (page_code != telem::SdApiStatusCode::OK && page_code != telem::SdApiStatusCode::NO_FILES) {
+    g_file_list_transfer_active = false;
     return;
   }
-
-  const uint16_t chunk_count = (total_files == 0U)
-                                   ? 1U
-                                   : (uint16_t)((total_files + telem::kLogFileChunkEntries - 1U) /
-                                                telem::kLogFileChunkEntries);
-  for (uint16_t chunk_index = 0U; chunk_index < chunk_count; ++chunk_index) {
-    memset(&chunk, 0, sizeof(chunk));
-    if (!log_store::listFiles(chunk.entries,
-                              telem::kLogFileChunkEntries,
-                              (uint16_t)(chunk_index * telem::kLogFileChunkEntries),
-                              total_files,
-                              returned_files)) {
-      return;
-    }
-    chunk.total_files = total_files;
-    chunk.chunk_index = chunk_index;
-    chunk.chunk_count = chunk_count;
-    chunk.entries_in_chunk = returned_files;
-    (void)sendFrame(telem::TELEM_LOG_FILE_LIST, &chunk, sizeof(chunk), 0U, micros());
-    if ((uint16_t)(chunk_index + 1U) < chunk_count) {
-      delay(2);
-    }
-  }
+  g_file_list_page = control_plane::lastFileListPage();
+  sendCurrentFileListFrames();
+  g_file_list_transfer_active = false;
 }
 
-uint16_t currentLogFileCount() {
-  telem::LogFileInfoV1 scratch[1] = {};
-  uint16_t total_files = 0U;
-  uint16_t returned_files = 0U;
-  if (!log_store::listFiles(scratch, 1U, 0U, total_files, returned_files)) {
-    return 0U;
+const telem::StorageStatusPayloadV1& currentStorageStatusPayload() {
+  memset(&g_storage_status_payload, 0, sizeof(g_storage_status_payload));
+  control_plane::Request request = {};
+  request.request_id = micros();
+  request.source = control_plane::SourceInterface::Radio;
+  request.category = control_plane::RequestCategory::FileSd;
+  request.action = control_plane::RequestAction::StorageStatus;
+  request.command_id = telem::CMD_GET_STORAGE_STATUS;
+  control_plane::Result result = {};
+  if (control_plane::submit(request, result) && result.has_storage_status) {
+    g_storage_status_payload = result.storage_status;
   }
-  return total_files;
-}
-
-telem::StorageStatusPayloadV1 currentStorageStatusPayload() {
-  telem::StorageStatusPayloadV1 payload = {};
-  const log_store::RecorderStatus recorder = log_store::recorderStatus();
-  sd_backend::Status backend = {};
-  const bool mounted = sd_backend::mounted();
-  const bool backend_ok = mounted ? sd_backend::refreshStatus(backend) : false;
-
-  payload.media_state = static_cast<uint8_t>(sd_backend::mediaState());
-  payload.init_hz = backend_ok ? backend.init_hz : sd_backend::mountedFrequencyHz();
-  payload.free_bytes = recorder.free_bytes;
-  if (backend_ok) {
-    const uint64_t total_bytes = backend.total_bytes ? backend.total_bytes : backend.card_size_bytes;
-    payload.total_bytes = (total_bytes > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)total_bytes;
-  }
-  payload.file_count = currentLogFileCount();
-
-  uint8_t flags = 0U;
-  if (mounted) flags |= telem::kStorageStatusFlagMounted;
-  if (recorder.backend_ready) flags |= telem::kStorageStatusFlagBackendReady;
-  if (recorder.media_present) flags |= telem::kStorageStatusFlagMediaPresent;
-  if (log_store::busy()) flags |= telem::kStorageStatusFlagBusy;
-  payload.flags = flags;
-
-  const String prefix = log_store::recordPrefix();
-  const String next_name = log_store::previewLogName();
-  strlcpy(payload.record_prefix, prefix.c_str(), sizeof(payload.record_prefix));
-  strlcpy(payload.next_record_name, next_name.c_str(), sizeof(payload.next_record_name));
-  return payload;
+  return g_storage_status_payload;
 }
 
 void sendStorageStatusFrame() {
-  const telem::StorageStatusPayloadV1 payload = currentStorageStatusPayload();
+  const telem::StorageStatusPayloadV1& payload = currentStorageStatusPayload();
   (void)sendFrame(telem::TELEM_STORAGE_STATUS, &payload, sizeof(payload), 0U, micros());
 }
 
@@ -995,6 +1018,14 @@ void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint
   g_control_ack_command = command;
   g_control_ack_code = code;
   g_control_ack_ok = ok;
+}
+
+void sendControlPlaneDispositionAck(uint16_t command,
+                                    const control_plane::Result& result,
+                                    uint32_t seq,
+                                    uint32_t t_us) {
+  const bool accepted = result.disposition == control_plane::DispositionStatus::Accepted;
+  sendCommandAck(command, accepted, result.disposition_code, seq, t_us);
 }
 
 void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_t* payload) {
@@ -1025,10 +1056,16 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdSetFusionSettingsV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      if (teensy_link::sendSetFusionSettings(cmd)) {
-        log_store::enqueueReplayControl(hdr.msg_type, hdr.seq, hdr.t_us, &cmd, sizeof(cmd),
-                                        telem::kReplayControlFlagSourceGui | telem::kReplayControlFlagSourceRadio);
-      }
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::Fusion;
+      request.action = control_plane::RequestAction::FusionSet;
+      request.command_id = hdr.msg_type;
+      request.fusion = cmd;
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       break;
     }
     case telem::CMD_GET_FUSION_SETTINGS:
@@ -1036,7 +1073,17 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         g_stats.rx_bad_len++;
         return;
       }
-      (void)teensy_link::sendGetFusionSettings();
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Fusion;
+        request.action = control_plane::RequestAction::FusionGet;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       break;
     case telem::CMD_SET_STREAM_RATE: {
       if (hdr.payload_len != sizeof(telem::CmdSetStreamRateV1)) {
@@ -1088,12 +1135,18 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      g_log_last_command = hdr.msg_type;
-      g_log_last_change_ms = millis();
-      g_log_session_id = (g_log_session_id == 0U) ? (g_session_id ? g_session_id : 1U) : (g_log_session_id + 1U);
-      g_log_requested = log_store::startSession(g_log_session_id);
-      markLogStatusDirty();
-      sendCommandAck(hdr.msg_type, g_log_requested, g_log_requested ? 0U : 2U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Recording;
+        request.action = control_plane::RequestAction::RecordStart;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        markLogStatusDirty();
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       break;
     case telem::CMD_LOG_STOP:
       if (hdr.payload_len != 0U) {
@@ -1101,12 +1154,18 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      log_store::stopSession();
-      g_log_requested = false;
-      g_log_last_command = hdr.msg_type;
-      g_log_last_change_ms = millis();
-      markLogStatusDirty();
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Recording;
+        request.action = control_plane::RequestAction::RecordStop;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        markLogStatusDirty();
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       break;
     case telem::CMD_GET_LOG_STATUS:
       if (hdr.payload_len != 0U) {
@@ -1114,8 +1173,17 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      g_log_last_command = hdr.msg_type;
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Recording;
+        request.action = control_plane::RequestAction::RecordStatus;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       break;
     case telem::CMD_RADIO_PING:
       if (hdr.payload_len != 0U) {
@@ -1131,11 +1199,16 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      if ((replay_bridge::status().flags & telem::kReplayStatusFlagFileOpen) != 0U ? replay_bridge::resume()
-                                                                                   : replay_bridge::startLatest()) {
-        sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
-      } else {
-        sendCommandAck(hdr.msg_type, false, 2U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Replay;
+        request.action = control_plane::RequestAction::ReplayStartLatest;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       }
       sendReplayStatusFrame();
       break;
@@ -1145,8 +1218,17 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      replay_bridge::stop();
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Replay;
+        request.action = control_plane::RequestAction::ReplayStop;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       sendReplayStatusFrame();
       break;
     case telem::CMD_GET_REPLAY_STATUS:
@@ -1155,58 +1237,107 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
         return;
       }
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Replay;
+        request.action = control_plane::RequestAction::ReplayStatus;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       sendReplayStatusFrame();
       break;
     case telem::CMD_GET_LOG_FILE_LIST:
-      if (hdr.payload_len != 0U) {
+      if (hdr.payload_len != 0U && hdr.payload_len != sizeof(telem::CmdGetLogFileListV1)) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
-      sendLogFileListFrames();
+      {
+        telem::CmdGetLogFileListV1 cmd = {};
+        if (hdr.payload_len == sizeof(cmd)) {
+          memcpy(&cmd, payload, sizeof(cmd));
+        }
+        const uint16_t offset = cmd.offset;
+        const uint16_t limit = (cmd.limit == 0U) ? 32U : cmd.limit;
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::FileSd;
+        request.action = control_plane::RequestAction::FileListPage;
+        request.command_id = hdr.msg_type;
+        request.offset = offset;
+        request.limit = limit;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        if (!result.ok &&
+            result.code != (uint32_t)telem::SdApiStatusCode::NO_FILES) {
+          sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+          return;
+        }
+        g_file_list_page = control_plane::lastFileListPage();
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+        g_file_list_transfer_active = true;
+        sendCurrentFileListFrames();
+        g_file_list_transfer_active = false;
+      }
       break;
     case telem::CMD_GET_STORAGE_STATUS:
       if (hdr.payload_len != 0U) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
-      log_store::probeBackend();
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      {
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::FileSd;
+        request.action = control_plane::RequestAction::StorageStatus;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
+      }
       sendStorageStatusFrame();
       break;
     case telem::CMD_MOUNT_MEDIA: {
       if (hdr.payload_len != 0U) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
-      sd_backend::Status status = {};
-      const bool ok = sd_backend::mount(&status);
-      log_store::probeBackend();
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::FileSd;
+      request.action = control_plane::RequestAction::MountMedia;
+      request.command_id = hdr.msg_type;
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendStorageStatusFrame();
-      if (ok) sendLogFileListFrames();
+      if (result.ok) sendLogFileListFrames();
       break;
     }
     case telem::CMD_EJECT_MEDIA: {
       if (hdr.payload_len != 0U) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
-      const uint8_t replay_flags = replay_bridge::status().flags;
-      const bool replay_open = (replay_flags & telem::kReplayStatusFlagFileOpen) != 0U;
-      if (log_store::active() || log_store::busy() || replay_open) {
-        sendCommandAck(hdr.msg_type, false, 3U, hdr.seq, micros());
-        sendStorageStatusFrame();
-        return;
-      }
-      const bool ok = sd_backend::eject();
-      log_store::probeBackend();
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::FileSd;
+      request.action = control_plane::RequestAction::EjectMedia;
+      request.command_id = hdr.msg_type;
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendStorageStatusFrame();
       sendLogFileListFrames();
       break;
@@ -1214,18 +1345,21 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
     case telem::CMD_DELETE_LOG_FILE: {
       if (hdr.payload_len != sizeof(telem::CmdNamedFileV1)) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
       telem::CmdNamedFileV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      const String file_name = String(cmd.name);
-      if (file_name == replay_bridge::currentFileName()) {
-        replay_bridge::stop();
-        sendReplayStatusFrame();
-      }
-      const bool ok = log_store::deleteFileByName(file_name);
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::FileSd;
+      request.action = control_plane::RequestAction::DeleteFile;
+      request.command_id = hdr.msg_type;
+      strlcpy(request.name, cmd.name, sizeof(request.name));
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendStorageStatusFrame();
       sendLogFileListFrames();
       break;
@@ -1233,19 +1367,22 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
     case telem::CMD_RENAME_LOG_FILE: {
       if (hdr.payload_len != sizeof(telem::CmdRenameLogFileV1)) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
       telem::CmdRenameLogFileV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      const String src_name = String(cmd.src_name);
-      const String dst_name = String(cmd.dst_name);
-      if (src_name == replay_bridge::currentFileName()) {
-        replay_bridge::stop();
-        sendReplayStatusFrame();
-      }
-      const bool ok = log_store::renameFileByName(src_name, dst_name);
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::FileSd;
+      request.action = control_plane::RequestAction::RenameFile;
+      request.command_id = hdr.msg_type;
+      strlcpy(request.name, cmd.src_name, sizeof(request.name));
+      strlcpy(request.aux_name, cmd.dst_name, sizeof(request.aux_name));
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendStorageStatusFrame();
       sendLogFileListFrames();
       break;
@@ -1253,13 +1390,21 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
     case telem::CMD_EXPORT_LOG_CSV: {
       if (hdr.payload_len != sizeof(telem::CmdNamedFileV1)) {
         g_stats.rx_bad_len++;
-        sendCommandAck(hdr.msg_type, false, 1U, hdr.seq, micros());
+        sendCommandAck(hdr.msg_type, false, (uint32_t)telem::SdApiStatusCode::INVALID_ARGUMENT, hdr.seq, micros());
         return;
       }
       telem::CmdNamedFileV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      const bool ok = log_store::exportLogToCsvByName(String(cmd.name), nullptr);
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::FileSd;
+      request.action = control_plane::RequestAction::ExportCsv;
+      request.command_id = hdr.msg_type;
+      strlcpy(request.name, cmd.name, sizeof(request.name));
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendStorageStatusFrame();
       sendLogFileListFrames();
       break;
@@ -1272,11 +1417,16 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdRecordPrefixV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      AppConfig cfg = config_store::get();
-      strlcpy(cfg.record_prefix, cmd.prefix, sizeof(cfg.record_prefix));
-      config_store::update(cfg);
-      log_store::setConfig(cfg);
-      sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::FileSd;
+      request.action = control_plane::RequestAction::SetRecordPrefix;
+      request.command_id = hdr.msg_type;
+      strlcpy(request.prefix, cmd.prefix, sizeof(request.prefix));
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendStorageStatusFrame();
       break;
     }
@@ -1288,8 +1438,16 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdNamedFileV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      const bool ok = replay_bridge::startFile(String(cmd.name));
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::Replay;
+      request.action = control_plane::RequestAction::ReplayStartFile;
+      request.command_id = hdr.msg_type;
+      strlcpy(request.name, cmd.name, sizeof(request.name));
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendReplayStatusFrame();
       break;
     }
@@ -1300,8 +1458,15 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
         return;
       }
       {
-        const bool ok = replay_bridge::pause();
-        sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+        control_plane::Request request = {};
+        request.request_id = hdr.seq;
+        request.source = control_plane::SourceInterface::Radio;
+        request.category = control_plane::RequestCategory::Replay;
+        request.action = control_plane::RequestAction::ReplayPause;
+        request.command_id = hdr.msg_type;
+        control_plane::Result result = {};
+        (void)control_plane::submit(request, result);
+        sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       }
       sendReplayStatusFrame();
       break;
@@ -1313,8 +1478,16 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdReplaySeekRelV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      const bool ok = replay_bridge::seekRelative(cmd.delta_records);
-      sendCommandAck(hdr.msg_type, ok, ok ? 0U : 2U, hdr.seq, micros());
+      control_plane::Request request = {};
+      request.request_id = hdr.seq;
+      request.source = control_plane::SourceInterface::Radio;
+      request.category = control_plane::RequestCategory::Replay;
+      request.action = control_plane::RequestAction::ReplaySeekRelative;
+      request.command_id = hdr.msg_type;
+      request.delta_records = cmd.delta_records;
+      control_plane::Result result = {};
+      (void)control_plane::submit(request, result);
+      sendControlPlaneDispositionAck(hdr.msg_type, result, hdr.seq, micros());
       sendReplayStatusFrame();
       break;
     }
@@ -1441,6 +1614,9 @@ void poll() {
 void publish(const teensy_link::Snapshot& snap) {
   noteSourceSnapshot(snap.seq, snap.t_us, snap.stats.last_rx_ms);
   captureSnapshotAck(snap);
+  if (g_file_list_transfer_active) {
+    return;
+  }
   if (replay_bridge::takeStatusDirty()) {
     sendReplayStatusFrame();
   }
@@ -1451,7 +1627,7 @@ void publish(const teensy_link::Snapshot& snap) {
   (void)maybeSendUnifiedDownlink(snap);
 }
 
-bool publishState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
+bool publishState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us) {
   const uint32_t now = millis();
   g_stats.publish_attempts++;
   g_stats.last_publish_attempt_ms = now;
@@ -1475,7 +1651,7 @@ bool publishState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32
   return ok;
 }
 
-bool publishStressState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
+bool publishStressState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us) {
   const bool ok = g_has_gnd_mac && sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
   if (ok) {
     g_stats.tx_state_packets++;
@@ -1525,6 +1701,7 @@ void setRecorderEnabled(bool enabled) {
   if (!enabled) {
     g_log_requested = false;
   }
+  control_plane::noteRecorderFeatureEnabled(enabled, millis());
   g_log_last_change_ms = millis();
   markLogStatusDirty();
 }

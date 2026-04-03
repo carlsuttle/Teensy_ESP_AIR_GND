@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>Stage 2 Control Test</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #081019;
+      --panel: #101b27;
+      --panel-2: #162434;
+      --line: #2b435b;
+      --ink: #e8f2f8;
+      --muted: #8fa8bc;
+      --good: #5ee28a;
+      --warn: #ffd166;
+      --bad: #ff6b6b;
+      --accent: #59c3ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #081019 0%, #0a131d 100%);
+      color: var(--ink);
+      font: 15px/1.45 "Segoe UI", Tahoma, sans-serif;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 14px;
+      display: grid;
+      gap: 14px;
+    }
+    .panel {
+      background: rgba(16, 27, 39, 0.96);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 14px 32px rgba(0, 0, 0, 0.2);
+    }
+    .sticky {
+      position: sticky;
+      top: 0;
+      z-index: 4;
+      backdrop-filter: blur(8px);
+    }
+    .title {
+      font-size: 26px;
+      font-weight: 700;
+    }
+    .subtitle {
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .badges, .actions, .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .badge, button, select, input {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--ink);
+      font: inherit;
+    }
+    .badge {
+      padding: 8px 12px;
+    }
+    .badge.good { color: var(--good); }
+    .badge.warn { color: var(--warn); }
+    .badge.bad { color: var(--bad); }
+    button, select, input {
+      padding: 9px 12px;
+    }
+    button { cursor: pointer; }
+    .section-title {
+      margin: 0 0 10px;
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+    .card {
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .card h3 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--muted);
+    }
+    .status-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(43, 67, 91, 0.5);
+    }
+    .status-line:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+    .key {
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .value {
+      text-align: right;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      word-break: break-word;
+    }
+    pre {
+      margin: 0;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #0b141d;
+      color: #bfe6ff;
+      overflow: auto;
+      font: 12px/1.45 Consolas, "SFMono-Regular", monospace;
+      max-height: 260px;
+    }
+    .compact {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1.3fr 1fr;
+    }
+    @media (max-width: 800px) {
+      .compact { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel sticky">
+      <div class="title">Stage 2 Control Test</div>
+      <div class="subtitle">Focused control-validation page. Build: 2026-04-02 control-test-1.</div>
+      <div class="badges">
+        <div id="socketBadge" class="badge">Socket connecting</div>
+        <div id="freshBadge" class="badge">Freshness unknown</div>
+        <div id="recordingBadge" class="badge">Recording --</div>
+        <div id="replayBadge" class="badge">Replay --</div>
+      </div>
+      <div class="actions">
+        <button id="reconnectBtn" type="button">Reconnect</button>
+        <button id="clearBtn" type="button">Clear Status</button>
+      </div>
+      <div class="grid" style="margin-top:10px;">
+        <div class="card"><h3>Link</h3><div id="linkSummary"></div></div>
+        <div class="card"><h3>Recording</h3><div id="recordingSummary"></div></div>
+        <div class="card"><h3>Files</h3><div id="filesSummary"></div></div>
+        <div class="card"><h3>Tap Debug</h3><div id="tapDebug"></div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Controls</h2>
+      <div class="compact">
+        <div class="card">
+          <h3>Recording</h3>
+          <div class="button-row">
+            <button id="recordStartBtn" type="button">Start</button>
+            <button id="recordStopBtn" type="button">Stop</button>
+          </div>
+        </div>
+        <div class="card">
+          <h3>Fusion</h3>
+          <div class="button-row">
+            <input id="fusionGainInput" type="number" step="0.001" placeholder="gain" style="width:110px;" />
+            <input id="fusionAccelInput" type="number" step="0.001" placeholder="accel rej" style="width:120px;" />
+            <input id="fusionMagInput" type="number" step="0.001" placeholder="mag rej" style="width:120px;" />
+            <input id="fusionRecoveryInput" type="number" step="1" placeholder="recovery" style="width:120px;" />
+            <button id="fusionApplyBtn" type="button">Apply</button>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:10px;">
+        <h3>Files / SD</h3>
+        <div class="button-row">
+          <select id="fileSelect" style="min-width:240px;"></select>
+          <button id="filesRefreshBtn" type="button">Refresh</button>
+          <button id="filesPrevBtn" type="button">Previous 32</button>
+          <button id="filesNextBtn" type="button">Next 32</button>
+          <button id="fileDeleteBtn" type="button">Delete</button>
+          <button id="fileExportBtn" type="button">Export CSV</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Latest Control Results</h2>
+      <div class="grid">
+        <div class="card"><h3>Recording Result</h3><div id="recordingResult"></div></div>
+        <div class="card"><h3>File Result</h3><div id="fileResult"></div></div>
+        <div class="card"><h3>Fusion Result</h3><div id="fusionResult"></div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Events</h2>
+      <pre id="eventLog">(no events yet)</pre>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Files</h2>
+      <pre id="filesJson">[]</pre>
+    </section>
+  </main>
+
+  <script>
+    const socketBadgeEl = document.getElementById('socketBadge');
+    const freshBadgeEl = document.getElementById('freshBadge');
+    const recordingBadgeEl = document.getElementById('recordingBadge');
+    const replayBadgeEl = document.getElementById('replayBadge');
+    const linkSummaryEl = document.getElementById('linkSummary');
+    const recordingSummaryEl = document.getElementById('recordingSummary');
+    const filesSummaryEl = document.getElementById('filesSummary');
+    const tapDebugEl = document.getElementById('tapDebug');
+    const recordingResultEl = document.getElementById('recordingResult');
+    const fileResultEl = document.getElementById('fileResult');
+    const fusionResultEl = document.getElementById('fusionResult');
+    const filesJsonEl = document.getElementById('filesJson');
+    const eventLogEl = document.getElementById('eventLog');
+    const reconnectBtn = document.getElementById('reconnectBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const recordStartBtn = document.getElementById('recordStartBtn');
+    const recordStopBtn = document.getElementById('recordStopBtn');
+    const filesRefreshBtn = document.getElementById('filesRefreshBtn');
+    const filesPrevBtn = document.getElementById('filesPrevBtn');
+    const filesNextBtn = document.getElementById('filesNextBtn');
+    const fileDeleteBtn = document.getElementById('fileDeleteBtn');
+    const fileExportBtn = document.getElementById('fileExportBtn');
+    const fileSelect = document.getElementById('fileSelect');
+    const fusionGainInput = document.getElementById('fusionGainInput');
+    const fusionAccelInput = document.getElementById('fusionAccelInput');
+    const fusionMagInput = document.getElementById('fusionMagInput');
+    const fusionRecoveryInput = document.getElementById('fusionRecoveryInput');
+    const fusionApplyBtn = document.getElementById('fusionApplyBtn');
+
+    let ws = null;
+    let reconnectTimer = null;
+    let reconnectGeneration = 0;
+    let manualDisconnect = false;
+    let lastSocketMessageAt = 0;
+    let latestSnapshot = null;
+    let latestFiles = null;
+    let latestStorage = null;
+    let reqId = 1;
+    let tapCounter = 0;
+    let selectedFileName = '';
+    let filePageOffset = 0;
+    const FILE_PAGE_SIZE = 32;
+    const SOCKET_STALE_RECONNECT_MS = 4000;
+    let fusionInitialized = false;
+    let pendingControl = '-';
+    const eventLines = [];
+    const controlStatus = {
+      recording: { tx: '-', ack: '-', detail: '-', reqId: '-' },
+      file: { tx: '-', ack: '-', detail: '-', reqId: '-' },
+      fusion: { tx: '-', ack: '-', detail: '-', reqId: '-' }
+    };
+
+    function fmtInt(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+      return String(Math.round(Number(value)));
+    }
+
+    function fmtText(value) {
+      if (value === null || value === undefined || value === '') return '-';
+      return String(value);
+    }
+
+    function boolText(value) {
+      return value ? 'true' : 'false';
+    }
+
+    function statusHtml(entries) {
+      return entries.map(([key, value]) =>
+        `<div class="status-line"><div class="key">${key}</div><div class="value">${fmtText(value)}</div></div>`).join('');
+    }
+
+    function setBadge(el, text, mode = '') {
+      el.textContent = text;
+      el.className = 'badge' + (mode ? ` ${mode}` : '');
+    }
+
+    function appendEvent(text) {
+      const stamp = new Date().toLocaleTimeString();
+      eventLines.unshift(`[${stamp}] ${text}`);
+      while (eventLines.length > 40) eventLines.pop();
+      eventLogEl.textContent = eventLines.join('\n');
+    }
+
+    function updateControlStatus(category, txText, ackText, detailText, reqIdValue) {
+      const bucket = controlStatus[category];
+      if (!bucket) return;
+      if (txText !== undefined) bucket.tx = txText;
+      if (ackText !== undefined) bucket.ack = ackText;
+      if (detailText !== undefined) bucket.detail = detailText;
+      if (reqIdValue !== undefined) bucket.reqId = reqIdValue;
+      renderControlResults();
+      renderSummaries();
+    }
+
+    function renderControlResults() {
+      recordingResultEl.innerHTML = statusHtml([
+        ['pending', pendingControl],
+        ['last_tx', controlStatus.recording.tx],
+        ['last_ack', controlStatus.recording.ack],
+        ['detail', controlStatus.recording.detail],
+        ['req_id', controlStatus.recording.reqId]
+      ]);
+      fileResultEl.innerHTML = statusHtml([
+        ['pending', pendingControl],
+        ['last_tx', controlStatus.file.tx],
+        ['last_ack', controlStatus.file.ack],
+        ['detail', controlStatus.file.detail],
+        ['req_id', controlStatus.file.reqId]
+      ]);
+      fusionResultEl.innerHTML = statusHtml([
+        ['pending', pendingControl],
+        ['last_tx', controlStatus.fusion.tx],
+        ['last_ack', controlStatus.fusion.ack],
+        ['detail', controlStatus.fusion.detail],
+        ['req_id', controlStatus.fusion.reqId]
+      ]);
+    }
+
+    function renderSummaries() {
+      const snap = latestSnapshot || {};
+      const files = latestFiles || {};
+      const storage = latestStorage || {};
+      linkSummaryEl.innerHTML = statusHtml([
+        ['pending_control', pendingControl],
+        ['fresh', snap.fresh === undefined ? '-' : boolText(snap.fresh)],
+        ['age_ms', fmtInt(snap.age_ms)],
+        ['radio_rtt_ms', fmtInt(snap.radio_rtt_ms)],
+        ['seq', fmtInt(snap.seq)],
+        ['ws_seq', fmtInt(snap.ws_seq)]
+      ]);
+      recordingSummaryEl.innerHTML = statusHtml([
+        ['recording_active', snap.recording_active === undefined ? '-' : boolText(snap.recording_active)],
+        ['recording_busy', snap.recording_busy === undefined ? '-' : boolText(snap.recording_busy)],
+        ['session_id', fmtInt(snap.recording_session_id)],
+        ['bytes_written', fmtInt(snap.recording_bytes_written)],
+        ['replay_active', snap.replay_active === undefined ? '-' : boolText(snap.replay_active)],
+        ['replay_file', fmtText(snap.replay_current_file)]
+      ]);
+      filesSummaryEl.innerHTML = statusHtml([
+        ['selected_file', fmtText(selectedFileName)],
+        ['page_offset', fmtInt(files.page_offset)],
+        ['page_limit', fmtInt(files.page_limit)],
+        ['has_prev', files.has_prev === undefined ? '-' : boolText(files.has_prev)],
+        ['has_next', files.has_next === undefined ? '-' : boolText(files.has_next)],
+        ['files_complete', files.complete === undefined ? '-' : boolText(files.complete)],
+        ['refresh_inflight', files.refresh_inflight === undefined ? '-' : boolText(files.refresh_inflight)],
+        ['stored_files', fmtInt(files.stored_files)],
+        ['backend_ready', storage.backend_ready === undefined ? '-' : boolText(storage.backend_ready)],
+        ['mounted', storage.mounted === undefined ? '-' : boolText(storage.mounted)]
+      ]);
+      tapDebugEl.innerHTML = statusHtml([
+        ['tap_counter', fmtInt(tapCounter)],
+        ['pending_control', pendingControl],
+        ['socket_open', ws && ws.readyState === WebSocket.OPEN ? 'true' : 'false']
+      ]);
+    }
+
+    function renderFilesState(files, storage) {
+      latestFiles = files || latestFiles;
+      latestStorage = storage || latestStorage;
+      if (latestFiles && latestFiles.page_offset !== undefined) {
+        filePageOffset = Number(latestFiles.page_offset || 0);
+      }
+      const items = latestFiles && Array.isArray(latestFiles.files) ? latestFiles.files : [];
+      if (!selectedFileName && items.length > 0) selectedFileName = items[0].name;
+      if (selectedFileName && !items.some((item) => item.name === selectedFileName)) {
+        selectedFileName = items.length > 0 ? items[0].name : '';
+      }
+      fileSelect.innerHTML = items.map((item) => {
+        const selected = item.name === selectedFileName ? ' selected' : '';
+        return `<option value="${item.name.replace(/"/g, '&quot;')}"${selected}>${item.name} (${fmtInt(item.size_bytes)} B)</option>`;
+      }).join('');
+      if (items.length === 0) fileSelect.innerHTML = '<option value="">(no files)</option>';
+      filesJsonEl.textContent = JSON.stringify(items, null, 2);
+      renderSummaries();
+      setControlsEnabled(true);
+    }
+
+    function renderSnapshot(snapshot) {
+      latestSnapshot = snapshot;
+      setBadge(socketBadgeEl, 'Socket open', 'good');
+      setBadge(freshBadgeEl,
+               snapshot.fresh ? `Fresh ${fmtInt(snapshot.age_ms)} ms` : `Stale ${fmtInt(snapshot.age_ms)} ms`,
+               snapshot.fresh ? 'good' : 'warn');
+      setBadge(recordingBadgeEl,
+               snapshot.recording_active ? 'Recording active' : 'Recording idle',
+               snapshot.recording_active ? 'good' : '');
+      setBadge(replayBadgeEl,
+               snapshot.replay_active ? 'Replay active' : 'Replay idle',
+               snapshot.replay_active ? 'warn' : '');
+      if (!fusionInitialized) {
+        fusionGainInput.value = Number(snapshot.fusion_gain || 0).toFixed(3);
+        fusionAccelInput.value = Number(snapshot.fusion_accel_rej || 0).toFixed(3);
+        fusionMagInput.value = Number(snapshot.fusion_mag_rej || 0).toFixed(3);
+        fusionRecoveryInput.value = String(Math.round(Number(snapshot.fusion_recovery_period || 0)));
+        fusionInitialized = true;
+      }
+      renderSummaries();
+    }
+
+    function setControlsEnabled(enabled) {
+      const hasSocket = enabled && ws && ws.readyState === WebSocket.OPEN;
+      recordStartBtn.disabled = !hasSocket;
+      recordStopBtn.disabled = !hasSocket;
+      filesRefreshBtn.disabled = !hasSocket;
+      filesPrevBtn.disabled = !hasSocket || !(latestFiles && latestFiles.has_prev);
+      filesNextBtn.disabled = !hasSocket || !(latestFiles && latestFiles.has_next);
+      fileDeleteBtn.disabled = !hasSocket || !selectedFileName;
+      fileExportBtn.disabled = !hasSocket || !selectedFileName;
+      fusionApplyBtn.disabled = !hasSocket;
+    }
+
+    function nextReqId() {
+      const value = reqId;
+      reqId += 1;
+      return value;
+    }
+
+    function recordPending(category, action, reqIdValue) {
+      pendingControl = `${category}/${action} req=${reqIdValue}`;
+      updateControlStatus(category, `tx ${action}`, 'pending', 'waiting for backend', reqIdValue);
+    }
+
+    function applyAck(msg) {
+      const op = String(msg.op || '');
+      let category = '';
+      if (op.includes('record')) category = 'recording';
+      else if (op.includes('file')) category = 'file';
+      else if (op.includes('fusion')) category = 'fusion';
+      if (!category) return;
+      pendingControl = '-';
+      updateControlStatus(category,
+                          undefined,
+                          msg.ok ? 'ok' : 'rejected',
+                          `${fmtText(msg.detail)} (code ${fmtInt(msg.code)})`,
+                          fmtInt(msg.req_id));
+    }
+
+    function sendControl(message) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        appendEvent('control blocked: websocket not open');
+        return;
+      }
+      ws.send(JSON.stringify(message));
+      appendEvent(`tx ${message.category}/${message.action} req=${message.req_id}`);
+    }
+
+    function noteTap(label) {
+      tapCounter += 1;
+      appendEvent(`tap ${label} #${tapCounter}`);
+      renderSummaries();
+    }
+
+    function bindAction(button, label, handler) {
+      if (!button) return;
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        noteTap(label);
+        handler();
+      });
+      button.addEventListener('touchend', (event) => {
+        event.preventDefault();
+        noteTap(`${label} touch`);
+        handler();
+      }, { passive: false });
+    }
+
+    function clearReconnectTimer() {
+      if (!reconnectTimer) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    function scheduleReconnect(expectedGeneration) {
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (expectedGeneration !== reconnectGeneration) return;
+        connect(false);
+      }, 1000);
+    }
+
+    function disconnectSocket(manual) {
+      manualDisconnect = manual;
+      clearReconnectTimer();
+      reconnectGeneration += 1;
+      const socket = ws;
+      ws = null;
+      if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        try { socket.close(); } catch (_) {}
+      }
+      setBadge(socketBadgeEl, manual ? 'Socket closed' : 'Socket disconnected', manual ? 'warn' : 'bad');
+      setControlsEnabled(false);
+    }
+
+    function connect(forced) {
+      disconnectSocket(false);
+      manualDisconnect = false;
+      reconnectGeneration += 1;
+      const generation = reconnectGeneration;
+      setBadge(socketBadgeEl, forced ? 'Socket reconnecting' : 'Socket connecting');
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const socket = new WebSocket(`${proto}//${location.host}/ws`);
+      ws = socket;
+
+      socket.onopen = () => {
+        if (ws !== socket || generation !== reconnectGeneration) return;
+        setBadge(socketBadgeEl, 'Socket open', 'good');
+        appendEvent('socket open');
+        lastSocketMessageAt = Date.now();
+        setControlsEnabled(true);
+      };
+
+      socket.onmessage = (event) => {
+        if (ws !== socket || generation !== reconnectGeneration) return;
+        lastSocketMessageAt = Date.now();
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'snapshot') {
+            renderSnapshot(msg);
+            return;
+          }
+          if (msg.type === 'hello') {
+            appendEvent(`hello snapshot_hz=${fmtInt(msg.snapshot_hz)}`);
+            return;
+          }
+          if (msg.type === 'ack') {
+            applyAck(msg);
+            appendEvent(`ack op=${fmtText(msg.op)} req=${fmtInt(msg.req_id)} ok=${boolText(msg.ok)} code=${fmtInt(msg.code)} detail=${fmtText(msg.detail)}`);
+            return;
+          }
+          if (msg.type === 'files') {
+            appendEvent(`files req=${fmtInt(msg.req_id)} stored=${fmtInt(msg.stored_files)} total=${fmtInt(msg.total_files)} complete=${boolText(msg.complete)}`);
+            renderFilesState(msg, null);
+            return;
+          }
+          if (msg.type === 'storage') {
+            appendEvent(`storage req=${fmtInt(msg.req_id)} ready=${boolText(msg.backend_ready)} busy=${boolText(msg.busy)} files=${fmtInt(msg.file_count)}`);
+            renderFilesState(null, msg);
+            return;
+          }
+          appendEvent(`rx ${fmtText(msg.type)}`);
+        } catch (err) {
+          appendEvent(`json parse error ${String(err)}`);
+        }
+      };
+
+      socket.onclose = () => {
+        if (ws === socket) ws = null;
+        if (generation !== reconnectGeneration) return;
+        setBadge(socketBadgeEl, 'Socket closed', 'warn');
+        appendEvent('socket closed');
+        setControlsEnabled(false);
+        if (!manualDisconnect) scheduleReconnect(generation);
+      };
+
+      socket.onerror = () => {
+        if (ws !== socket || generation !== reconnectGeneration) return;
+        setBadge(socketBadgeEl, 'Socket error', 'bad');
+        appendEvent('socket error');
+      };
+    }
+
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!lastSocketMessageAt) return;
+      const age = Date.now() - lastSocketMessageAt;
+      if (age < SOCKET_STALE_RECONNECT_MS) return;
+      appendEvent(`socket stale_reconnect age_ms=${age}`);
+      connect(true);
+    }, 1000);
+
+    reconnectBtn.addEventListener('click', () => connect(true));
+    clearBtn.addEventListener('click', () => {
+      pendingControl = '-';
+      latestSnapshot = null;
+      latestFiles = null;
+      latestStorage = null;
+      selectedFileName = '';
+      filePageOffset = 0;
+      fusionInitialized = false;
+      eventLines.length = 0;
+      eventLogEl.textContent = '(no events yet)';
+      updateControlStatus('recording', '-', '-', '-', '-');
+      updateControlStatus('file', '-', '-', '-', '-');
+      updateControlStatus('fusion', '-', '-', '-', '-');
+      filesJsonEl.textContent = '[]';
+      fileSelect.innerHTML = '<option value="">(no files)</option>';
+      renderSummaries();
+      setBadge(freshBadgeEl, 'Freshness unknown');
+      setBadge(recordingBadgeEl, 'Recording --');
+      setBadge(replayBadgeEl, 'Replay --');
+    });
+
+    bindAction(recordStartBtn, 'record_start', () => {
+      const req = nextReqId();
+      recordPending('recording', 'start', req);
+      sendControl({ type: 'control', req_id: req, category: 'recording', action: 'start' });
+    });
+
+    bindAction(recordStopBtn, 'record_stop', () => {
+      const req = nextReqId();
+      recordPending('recording', 'stop', req);
+      sendControl({ type: 'control', req_id: req, category: 'recording', action: 'stop' });
+    });
+
+    bindAction(filesRefreshBtn, 'files_refresh', () => {
+      const req = nextReqId();
+      recordPending('file', 'refresh', req);
+      filePageOffset = 0;
+      sendControl({ type: 'control', req_id: req, category: 'file', action: 'refresh', offset: 0, limit: FILE_PAGE_SIZE });
+    });
+
+    bindAction(filesPrevBtn, 'files_prev', () => {
+      const req = nextReqId();
+      const nextOffset = Math.max(0, filePageOffset - FILE_PAGE_SIZE);
+      recordPending('file', `refresh prev ${nextOffset}`, req);
+      filePageOffset = nextOffset;
+      sendControl({ type: 'control', req_id: req, category: 'file', action: 'refresh', offset: nextOffset, limit: FILE_PAGE_SIZE });
+    });
+
+    bindAction(filesNextBtn, 'files_next', () => {
+      const req = nextReqId();
+      const nextOffset = filePageOffset + FILE_PAGE_SIZE;
+      recordPending('file', `refresh next ${nextOffset}`, req);
+      filePageOffset = nextOffset;
+      sendControl({ type: 'control', req_id: req, category: 'file', action: 'refresh', offset: nextOffset, limit: FILE_PAGE_SIZE });
+    });
+
+    bindAction(fileDeleteBtn, 'file_delete', () => {
+      if (!selectedFileName) {
+        appendEvent('delete blocked: no selected file');
+        return;
+      }
+      const req = nextReqId();
+      recordPending('file', `delete ${selectedFileName}`, req);
+      sendControl({ type: 'control', req_id: req, category: 'file', action: 'delete', name: selectedFileName });
+    });
+
+    bindAction(fileExportBtn, 'file_export', () => {
+      if (!selectedFileName) {
+        appendEvent('export blocked: no selected file');
+        return;
+      }
+      const req = nextReqId();
+      recordPending('file', `export_csv ${selectedFileName}`, req);
+      sendControl({ type: 'control', req_id: req, category: 'file', action: 'export_csv', name: selectedFileName });
+    });
+
+    fileSelect.addEventListener('change', () => {
+      selectedFileName = fileSelect.value || '';
+      renderSummaries();
+      setControlsEnabled(true);
+    });
+
+    bindAction(fusionApplyBtn, 'fusion_apply', () => {
+      const req = nextReqId();
+      recordPending('fusion', 'set', req);
+      sendControl({
+        type: 'control',
+        req_id: req,
+        category: 'fusion',
+        action: 'set',
+        gain: Number(fusionGainInput.value),
+        accelerationRejection: Number(fusionAccelInput.value),
+        magneticRejection: Number(fusionMagInput.value),
+        recoveryTriggerPeriod: Number(fusionRecoveryInput.value)
+      });
+    });
+
+    renderControlResults();
+    renderSummaries();
+    connect(false);
+  </script>
+</body>
+</html>

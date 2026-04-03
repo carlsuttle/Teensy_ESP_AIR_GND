@@ -28,7 +28,7 @@ struct BinaryLogRecordV1 {
   uint16_t record_size;
   uint32_t seq;
   uint32_t t_us;
-  telem::TelemetryFullStateV1 state;
+  telem::TelemetryStateRecord state;
 };
 #pragma pack(pop)
 
@@ -302,7 +302,7 @@ void poll() {
   }
 }
 
-void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state) {
+void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryStateRecord& state) {
   if (!g_stats.active) return;
 
   BinaryLogRecordV1 rec = {};

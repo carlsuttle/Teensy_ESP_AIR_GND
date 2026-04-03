@@ -17,6 +17,12 @@ struct ReplayOutputMeta {
   uint32_t last_baro_ms;
   uint32_t present_mask;
   uint32_t iTOW_ms;
+  uint16_t gps_year;
+  uint8_t gps_month;
+  uint8_t gps_day;
+  uint8_t gps_hour;
+  uint8_t gps_min;
+  uint8_t gps_sec;
   uint8_t fixType;
   uint8_t numSV;
   int32_t lat_1e7;

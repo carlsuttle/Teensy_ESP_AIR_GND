@@ -7,12 +7,13 @@
 #include <freertos/FreeRTOS.h>
 #include <string.h>
 
+#include "types_shared.h"
+
 namespace spi_bridge {
 namespace {
 
 constexpr uint32_t kMsgMagic = 0x53504931UL;
 constexpr uint16_t kProtocolVersion = 1U;
-constexpr uint16_t kRecordBytes = 160U;
 constexpr uint16_t kTransactionBytes = 8192U;
 constexpr uint16_t kRingDepth = 128U;
 constexpr uint32_t kDefaultSpiClockHz = 20000000UL;
@@ -29,6 +30,9 @@ constexpr UBaseType_t kSpiTaskPriority = 1U;
 constexpr uint8_t kSpiDeviceQueueDepth = 2U;
 constexpr uint8_t kSpiCsPretransCycles = 8U;
 constexpr uint8_t kSpiCsPosttransCycles = 2U;
+constexpr uint16_t kStateRecordBytes = telem::kActiveSchema.state_record_bytes;
+constexpr uint16_t kReplayInputRecordBytes = telem::kActiveSchema.replay_input_record_bytes;
+constexpr uint16_t kReplayControlRecordBytes = telem::kActiveSchema.replay_control_record_bytes;
 
 #pragma pack(push, 1)
 struct SpiMsgHeader {
@@ -43,7 +47,9 @@ struct SpiMsgHeader {
 #pragma pack(pop)
 
 constexpr size_t kMaxPayloadBytes = kTransactionBytes - sizeof(SpiMsgHeader);
-constexpr uint16_t kMaxRecordsPerPayload = (uint16_t)(kMaxPayloadBytes / kRecordBytes);
+constexpr uint16_t kMaxStateRecordsPerPayload = (uint16_t)(kMaxPayloadBytes / kStateRecordBytes);
+constexpr uint16_t kMaxReplayInputRecordsPerPayload = (uint16_t)(kMaxPayloadBytes / kReplayInputRecordBytes);
+constexpr uint16_t kMaxReplayControlRecordsPerPayload = (uint16_t)(kMaxPayloadBytes / kReplayControlRecordBytes);
 
 enum MsgType : uint16_t {
   kMsgNone = 0U,
@@ -54,6 +60,7 @@ enum MsgType : uint16_t {
   kMsgReplayInputData = 5U,
 };
 
+template <size_t RecordBytes>
 class RecordRing {
  public:
   void reset() {
@@ -70,7 +77,7 @@ class RecordRing {
     portENTER_CRITICAL(&mux_);
     const uint16_t next = (uint16_t)((head_ + 1U) & (kRingDepth - 1U));
     if (next != tail_) {
-      memcpy(storage_[head_], record_bytes, kRecordBytes);
+      memcpy(storage_[head_], record_bytes, RecordBytes);
       head_ = next;
       const uint16_t occ = (uint16_t)((head_ - tail_) & (kRingDepth - 1U));
       if (occ > max_occupancy_) max_occupancy_ = occ;
@@ -85,7 +92,7 @@ class RecordRing {
     bool ok = false;
     portENTER_CRITICAL(&mux_);
     if (tail_ != head_) {
-      memcpy(out, storage_[tail_], kRecordBytes);
+      memcpy(out, storage_[tail_], RecordBytes);
       tail_ = (uint16_t)((tail_ + 1U) & (kRingDepth - 1U));
       ok = true;
     }
@@ -108,7 +115,7 @@ class RecordRing {
   }
 
  private:
-  alignas(4) uint8_t storage_[kRingDepth][kRecordBytes] = {};
+  alignas(4) uint8_t storage_[kRingDepth][RecordBytes] = {};
   volatile uint16_t head_ = 0U;
   volatile uint16_t tail_ = 0U;
   uint16_t max_occupancy_ = 0U;
@@ -168,9 +175,9 @@ class Bridge {
 
   spi_device_handle_t device_ = nullptr;
   TaskHandle_t task_ = nullptr;
-  RecordRing state_rx_ring_;
-  RecordRing raw_rx_ring_;
-  RecordRing replay_tx_ring_;
+  RecordRing<kStateRecordBytes> state_rx_ring_;
+  RecordRing<kReplayInputRecordBytes> raw_rx_ring_;
+  RecordRing<kReplayControlRecordBytes> replay_tx_ring_;
   Stats stats_ = {};
   uint32_t spi_clock_hz_ = kDefaultSpiClockHz;
   uint32_t transaction_rate_hz_ = kDefaultTransactionRateHz;
@@ -181,7 +188,7 @@ class Bridge {
   uint8_t* tx_buffer_ = nullptr;
   uint8_t* rx_buffer_ = nullptr;
   uint8_t pending_replay_count_ = 0U;
-  uint8_t pending_replay_records_[kMaxRecordsPerPayload * kRecordBytes] = {};
+  uint8_t pending_replay_records_[kMaxReplayControlRecordsPerPayload * kReplayControlRecordBytes] = {};
 };
 
 Bridge g_bridge;
@@ -290,9 +297,10 @@ void Bridge::buildTxFrame() {
   header->crc32 = 0U;
 
   if (pending_replay_count_ == 0U && remote_replay_rx_free_ != 0U) {
-    const uint16_t batch_limit = (remote_replay_rx_free_ < kMaxRecordsPerPayload) ? remote_replay_rx_free_ : kMaxRecordsPerPayload;
+    const uint16_t batch_limit =
+        (remote_replay_rx_free_ < kMaxReplayControlRecordsPerPayload) ? remote_replay_rx_free_ : kMaxReplayControlRecordsPerPayload;
     while (pending_replay_count_ < batch_limit) {
-      if (!replay_tx_ring_.pop(pending_replay_records_ + (pending_replay_count_ * kRecordBytes))) {
+      if (!replay_tx_ring_.pop(pending_replay_records_ + (pending_replay_count_ * kReplayControlRecordBytes))) {
         break;
       }
       pending_replay_count_++;
@@ -300,7 +308,7 @@ void Bridge::buildTxFrame() {
   }
 
   if (pending_replay_count_ != 0U) {
-    const uint16_t payload_len = (uint16_t)(pending_replay_count_ * kRecordBytes);
+    const uint16_t payload_len = (uint16_t)(pending_replay_count_ * kReplayControlRecordBytes);
     memcpy(payload, pending_replay_records_, payload_len);
     header->type = kMsgReplayData;
     header->payload_len = payload_len;
@@ -331,11 +339,11 @@ void Bridge::parseRxFrame() {
 
   remote_replay_rx_free_ = header->flags;
   if (header->type == kMsgStateData) {
-    if (header->payload_len == 0U || (header->payload_len % kRecordBytes) != 0U) {
+    if (header->payload_len == 0U || (header->payload_len % kStateRecordBytes) != 0U) {
       stats_.rx_type_errors++;
       return;
     }
-    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kRecordBytes)) {
+    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kStateRecordBytes)) {
       if (!state_rx_ring_.push(payload + offset)) {
         stats_.rx_overflows++;
         continue;
@@ -347,11 +355,11 @@ void Bridge::parseRxFrame() {
   }
 
   if (header->type == kMsgReplayInputData) {
-    if (header->payload_len == 0U || (header->payload_len % kRecordBytes) != 0U) {
+    if (header->payload_len == 0U || (header->payload_len % kReplayInputRecordBytes) != 0U) {
       stats_.rx_type_errors++;
       return;
     }
-    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kRecordBytes)) {
+    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kReplayInputRecordBytes)) {
       if (!raw_rx_ring_.push(payload + offset)) {
         stats_.rx_overflows++;
         continue;
@@ -437,17 +445,17 @@ void poll() {
 }
 
 bool popStateRecord(uint8_t* record_out, size_t len) {
-  if (!record_out || len != kRecordBytes) return false;
+  if (!record_out || len != kStateRecordBytes) return false;
   return g_bridge.popState(record_out);
 }
 
 bool popRawRecord(uint8_t* record_out, size_t len) {
-  if (!record_out || len != kRecordBytes) return false;
+  if (!record_out || len != kReplayInputRecordBytes) return false;
   return g_bridge.popRaw(record_out);
 }
 
 bool queueReplayRecord(const uint8_t* record_bytes, size_t len) {
-  if (!record_bytes || len != kRecordBytes) return false;
+  if (!record_bytes || len != kReplayControlRecordBytes) return false;
   const bool ok = g_bridge.queueReplay(record_bytes);
   if (!ok) {
     Stats current = g_bridge.stats();

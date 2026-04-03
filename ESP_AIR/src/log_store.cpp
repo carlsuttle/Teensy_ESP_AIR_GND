@@ -14,6 +14,8 @@
 namespace log_store {
 using File = sd_api::File;
 namespace {
+using BinaryLogRecord = telem::BinaryLogRecordV2;
+using BinaryLogRecordV2 = telem::BinaryLogRecordV2;
 
 constexpr char LOG_DIR[] = "/logs";
 constexpr char kBinaryExt[] = ".tlog";
@@ -30,19 +32,6 @@ constexpr uint32_t kBenchFlushIntervalMs = 250U;
 constexpr uint32_t kMountedStatusRefreshMs = 1000U;
 constexpr uint32_t kMissingMediaProbeIntervalMs = 5000U;
 constexpr uint32_t kIdleMediaCheckMs = 1000U;
-
-#pragma pack(push, 1)
-struct BinaryLogRecordV2 {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t record_size;
-  uint16_t record_kind;
-  uint16_t reserved;
-  uint32_t seq;
-  uint32_t t_us;
-  uint8_t payload[telem::kReplayRecordBytes];
-};
-#pragma pack(pop)
 
 struct Block {
   uint8_t data[kBlockBytes];
@@ -112,7 +101,7 @@ QueueHandle_t g_full_block_queue = nullptr;
 Stats g_stats = {};
 RecorderStatus g_recorder = {};
 Block* g_blocks = nullptr;
-BinaryLogRecordV2* g_bench_ring = nullptr;
+telem::BinaryLogRecordV2* g_bench_ring = nullptr;
 uint8_t* g_bench_write_buffer = nullptr;
 int g_active_block_index = -1;
 bool g_close_pending = false;
@@ -416,7 +405,7 @@ bool writeCsvHeader(File& csv) {
   static constexpr char kHeader[] =
       "record_kind_name,record_kind,seq,t_us,"
       "roll_deg,pitch_deg,yaw_deg,mag_heading_deg,"
-      "iTOW_ms,fixType,numSV,lat_1e7,lon_1e7,hMSL_mm,gSpeed_mms,headMot_1e5deg,hAcc_mm,sAcc_mms,"
+      "iTOW_ms,gps_year,gps_month,gps_day,gps_hour,gps_min,gps_sec,fixType,numSV,lat_1e7,lon_1e7,hMSL_mm,gSpeed_mms,headMot_1e5deg,hAcc_mm,sAcc_mms,"
       "gps_parse_errors,mirror_tx_ok,mirror_drop_count,last_gps_ms,last_imu_ms,last_baro_ms,"
       "baro_temp_c,baro_press_hpa,baro_alt_m,baro_vsi_mps,"
       "fusion_gain,fusion_accel_rej,fusion_mag_rej,fusion_recovery_period,flags,"
@@ -430,10 +419,71 @@ bool writeCsvHeader(File& csv) {
   return csv.print(kHeader) == (sizeof(kHeader) - 1U);
 }
 
-bool writeStateCsvRow(File& csv, const BinaryLogRecordV2& record) {
+bool decodeStateRecord(const BinaryLogRecordV2& record, uint16_t schema_id, uint16_t schema_version,
+                       telem::TelemetryFullStateV1& state, telem::GpsCalendarTime& gps_time,
+                       bool& has_calendar) {
+  memset(&state, 0, sizeof(state));
+  gps_time = {};
+  has_calendar = false;
+  if (schema_id == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE && schema_version == 2U) {
+    telem::TelemetryFullStateV2 state_v2 = {};
+    memcpy(&state_v2, record.payload, sizeof(state_v2));
+    state.roll_deg = state_v2.roll_deg;
+    state.pitch_deg = state_v2.pitch_deg;
+    state.yaw_deg = state_v2.yaw_deg;
+    state.mag_heading_deg = state_v2.mag_heading_deg;
+    state.iTOW_ms = state_v2.iTOW_ms;
+    state.fixType = state_v2.fixType;
+    state.numSV = state_v2.numSV;
+    state.lat_1e7 = state_v2.lat_1e7;
+    state.lon_1e7 = state_v2.lon_1e7;
+    state.hMSL_mm = state_v2.hMSL_mm;
+    state.gSpeed_mms = state_v2.gSpeed_mms;
+    state.headMot_1e5deg = state_v2.headMot_1e5deg;
+    state.hAcc_mm = state_v2.hAcc_mm;
+    state.sAcc_mms = state_v2.sAcc_mms;
+    state.gps_parse_errors = state_v2.gps_parse_errors;
+    state.mirror_tx_ok = state_v2.mirror_tx_ok;
+    state.mirror_drop_count = state_v2.mirror_drop_count;
+    state.last_gps_ms = state_v2.last_gps_ms;
+    state.last_imu_ms = state_v2.last_imu_ms;
+    state.last_baro_ms = state_v2.last_baro_ms;
+    state.baro_temp_c = state_v2.baro_temp_c;
+    state.baro_press_hpa = state_v2.baro_press_hpa;
+    state.baro_alt_m = state_v2.baro_alt_m;
+    state.baro_vsi_mps = state_v2.baro_vsi_mps;
+    state.fusion_gain = state_v2.fusion_gain;
+    state.fusion_accel_rej = state_v2.fusion_accel_rej;
+    state.fusion_mag_rej = state_v2.fusion_mag_rej;
+    state.fusion_recovery_period = state_v2.fusion_recovery_period;
+    state.flags = state_v2.flags;
+    state.accel_x_mps2 = state_v2.accel_x_mps2;
+    state.accel_y_mps2 = state_v2.accel_y_mps2;
+    state.accel_z_mps2 = state_v2.accel_z_mps2;
+    state.gyro_x_dps = state_v2.gyro_x_dps;
+    state.gyro_y_dps = state_v2.gyro_y_dps;
+    state.gyro_z_dps = state_v2.gyro_z_dps;
+    state.mag_x_uT = state_v2.mag_x_uT;
+    state.mag_y_uT = state_v2.mag_y_uT;
+    state.mag_z_uT = state_v2.mag_z_uT;
+    state.raw_present_mask = state_v2.raw_present_mask;
+    gps_time = telem::gpsCalendarTime(state_v2);
+    has_calendar = true;
+    return true;
+  }
+
+  telem::TelemetryFullStateV1 state_v1 = {};
+  memcpy(&state_v1, record.payload, sizeof(state_v1));
+  state = state_v1;
+  return true;
+}
+
+bool writeStateCsvRow(File& csv, const BinaryLogRecordV2& record, uint16_t schema_id, uint16_t schema_version) {
   telem::TelemetryFullStateV1 state = {};
-  memcpy(&state, record.payload, sizeof(state));
-  const FusionReplayDiagDecoded diag = decodeFusionReplayDiag(state);
+  telem::GpsCalendarTime gps_time = {};
+  bool has_calendar = false;
+  if (!decodeStateRecord(record, schema_id, schema_version, state, gps_time, has_calendar)) return false;
+  const FusionReplayDiagDecoded diag = has_calendar ? FusionReplayDiagDecoded{} : decodeFusionReplayDiag(state);
 
   String line;
   line.reserve(768);
@@ -446,6 +496,16 @@ bool writeStateCsvRow(File& csv, const BinaryLogRecordV2& record) {
   appendCsvFloat(line, state.yaw_deg);
   appendCsvFloat(line, state.mag_heading_deg);
   appendCsvU32(line, state.iTOW_ms);
+  if (has_calendar) {
+    appendCsvU16(line, gps_time.year);
+    appendCsvU32(line, gps_time.month);
+    appendCsvU32(line, gps_time.day);
+    appendCsvU32(line, gps_time.hour);
+    appendCsvU32(line, gps_time.minute);
+    appendCsvU32(line, gps_time.second);
+  } else {
+    for (uint8_t i = 0U; i < 6U; ++i) appendCsvBlank(line);
+  }
   appendCsvU32(line, state.fixType);
   appendCsvU32(line, state.numSV);
   appendCsvI32(line, state.lat_1e7);
@@ -488,8 +548,13 @@ bool writeStateCsvRow(File& csv, const BinaryLogRecordV2& record) {
   appendCsvFloat(line, diag.mag_fusion_x);
   appendCsvFloat(line, diag.mag_fusion_y);
   appendCsvFloat(line, diag.mag_fusion_z);
-  appendCsvU16(line, state.reserved0);
-  appendCsvText(line, hexString(state.reserved1, sizeof(state.reserved1)));
+  if (has_calendar) {
+    appendCsvBlank(line);
+    appendCsvBlank(line);
+  } else {
+    appendCsvU16(line, state.reserved0);
+    appendCsvText(line, hexString(state.reserved1, sizeof(state.reserved1)));
+  }
   for (uint8_t i = 0U; i < 6U; ++i) appendCsvBlank(line);
   line += "\r\n";
   return csv.print(line) == line.length();
@@ -631,6 +696,8 @@ bool exportSingleLogToCsv(File& src, File& csv, uint32_t& rows, uint32_t& unsupp
   if (!writeCsvHeader(csv)) return false;
 
   BinaryLogRecordV2 record = {};
+  uint16_t schema_id = TELEM_SCHEMA_ID_RELEASE_0_02;
+  uint16_t schema_version = 1U;
   for (;;) {
     const size_t got = readExact(src, (uint8_t*)&record, sizeof(record));
     if (got == 0U) return true;
@@ -640,10 +707,20 @@ bool exportSingleLogToCsv(File& src, File& csv, uint32_t& rows, uint32_t& unsupp
     bool ok = false;
     switch ((telem::LogRecordKind)record.record_kind) {
       case telem::LogRecordKind::Metadata160:
+        {
+          telem::LogMetadataPayloadV1 metadata = {};
+          memcpy(&metadata, record.payload, sizeof(metadata));
+          if (telem::isSupportedTransferSchema(metadata.transfer_schema_id, metadata.transfer_schema_version) &&
+              telem::logMetadataMatchesSchema(metadata, *telem::findTransferSchema(metadata.transfer_schema_id,
+                                                                                   metadata.transfer_schema_version))) {
+            schema_id = metadata.transfer_schema_id;
+            schema_version = metadata.transfer_schema_version;
+          }
+        }
         ok = writeUnknownCsvRow(csv, record);
         break;
       case telem::LogRecordKind::State160:
-        ok = writeStateCsvRow(csv, record);
+        ok = writeStateCsvRow(csv, record, schema_id, schema_version);
         break;
       case telem::LogRecordKind::ReplayControl160:
         ok = writeReplayControlCsvRow(csv, record);
@@ -670,6 +747,8 @@ struct CoreComparableState {
 
 ReadStateResult readNextStateRecord(File& file, BinaryLogRecordV2& record, telem::TelemetryFullStateV1& state,
                                     uint32_t& state_count) {
+  uint16_t schema_id = TELEM_SCHEMA_ID_RELEASE_0_02;
+  uint16_t schema_version = 1U;
   for (;;) {
     const size_t got = readExact(file, (uint8_t*)&record, sizeof(record));
     if (got == 0U) return ReadStateResult::Eof;
@@ -677,8 +756,23 @@ ReadStateResult readNextStateRecord(File& file, BinaryLogRecordV2& record, telem
     if (record.magic != kLogMagic || record.version != kLogVersion || record.record_size != sizeof(record)) {
       return ReadStateResult::Error;
     }
+    if ((telem::LogRecordKind)record.record_kind == telem::LogRecordKind::Metadata160) {
+      telem::LogMetadataPayloadV1 metadata = {};
+      memcpy(&metadata, record.payload, sizeof(metadata));
+      if (telem::isSupportedTransferSchema(metadata.transfer_schema_id, metadata.transfer_schema_version) &&
+          telem::logMetadataMatchesSchema(metadata, *telem::findTransferSchema(metadata.transfer_schema_id,
+                                                                               metadata.transfer_schema_version))) {
+        schema_id = metadata.transfer_schema_id;
+        schema_version = metadata.transfer_schema_version;
+      }
+      continue;
+    }
     if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::State160) continue;
-    memcpy(&state, record.payload, sizeof(state));
+    telem::GpsCalendarTime ignored = {};
+    bool has_calendar = false;
+    if (!decodeStateRecord(record, schema_id, schema_version, state, ignored, has_calendar)) {
+      return ReadStateResult::Error;
+    }
     state_count++;
     return ReadStateResult::Ok;
   }
@@ -774,6 +868,16 @@ bool openCurrentLog() {
 
   telem::LogMetadataPayloadV1 metadata = {};
   metadata.schema_version = kLogMetadataSchemaVersion;
+  metadata.transfer_schema_id = telem::kActiveSchema.schema_id;
+  metadata.transfer_schema_version = telem::kActiveSchema.schema_version;
+  metadata.state_record_bytes = telem::kActiveSchema.state_record_bytes;
+  metadata.replay_input_record_bytes = telem::kActiveSchema.replay_input_record_bytes;
+  metadata.replay_control_record_bytes = telem::kActiveSchema.replay_control_record_bytes;
+  metadata.log_metadata_payload_bytes = telem::kActiveSchema.log_metadata_payload_bytes;
+  metadata.state_record_kind = (uint16_t)telem::kActiveSchema.state_record_kind;
+  metadata.replay_control_record_kind = (uint16_t)telem::kActiveSchema.replay_control_record_kind;
+  metadata.replay_input_record_kind = (uint16_t)telem::kActiveSchema.replay_input_record_kind;
+  metadata.metadata_record_kind = (uint16_t)telem::kActiveSchema.metadata_record_kind;
   metadata.file_session_id = g_recorder.session_id;
   metadata.replay_average_factor = g_next_log_metadata.valid ? g_next_log_metadata.replay_average_factor : 1U;
   metadata.applied_capture_rate_hz = g_next_log_metadata.valid ? g_next_log_metadata.applied_capture_rate_hz
@@ -803,7 +907,7 @@ bool openCurrentLog() {
   record.magic = kLogMagic;
   record.version = kLogVersion;
   record.record_size = (uint16_t)sizeof(record);
-  record.record_kind = (uint16_t)telem::LogRecordKind::Metadata160;
+  record.record_kind = (uint16_t)telem::kActiveSchema.metadata_record_kind;
   memcpy(record.payload, &metadata, sizeof(metadata));
 
   uint32_t elapsed_ms = 0U;
@@ -1377,7 +1481,7 @@ void poll() {
   }
 }
 
-void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state) {
+void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryStateRecord& state) {
   if (!g_recorder.feature_enabled || !g_recorder.active) return;
   if (seq == g_last_seq) return;
   g_last_seq = seq;
@@ -1386,14 +1490,14 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1
   record.magic = kLogMagic;
   record.version = kLogVersion;
   record.record_size = (uint16_t)sizeof(record);
-  record.record_kind = (uint16_t)telem::LogRecordKind::State160;
+  record.record_kind = (uint16_t)telem::kActiveSchema.state_record_kind;
   record.seq = seq;
   record.t_us = t_us;
   memcpy(record.payload, &state, sizeof(state));
   (void)enqueueRecord(record);
 }
 
-void enqueueReplayInput(uint32_t seq, uint32_t t_us, const telem::ReplayInputRecord160& replay) {
+void enqueueReplayInput(uint32_t seq, uint32_t t_us, const telem::ReplayInputRecord& replay) {
   (void)seq;
   (void)t_us;
   (void)replay;
@@ -1444,6 +1548,7 @@ struct ListedFileEntry {
   String short_name;
   String extension;
   uint32_t size_bytes = 0U;
+  uint32_t mtime_utc_s = 0U;
   uint32_t session_id = 0U;
   uint32_t stamp = 0U;
   bool parsed = false;
@@ -1469,9 +1574,12 @@ void sortListedFiles(ListedFileEntry* entries, size_t count, FileSortKey sort_ke
           }
           break;
         case FileSortKey::date:
-          take_j = (sort_dir == FileSortDirection::ascending) ? (entries[j].stamp < entries[i].stamp)
-                                                              : (entries[j].stamp > entries[i].stamp);
-          if (entries[j].stamp == entries[i].stamp) {
+          {
+            const uint32_t lhs = entries[i].mtime_utc_s != 0U ? entries[i].mtime_utc_s : entries[i].stamp;
+            const uint32_t rhs = entries[j].mtime_utc_s != 0U ? entries[j].mtime_utc_s : entries[j].stamp;
+            take_j = (sort_dir == FileSortDirection::ascending) ? (rhs < lhs) : (rhs > lhs);
+          }
+          if (entries[j].mtime_utc_s == entries[i].mtime_utc_s && entries[j].stamp == entries[i].stamp) {
             take_j = entries[j].short_name < entries[i].short_name;
           }
           break;
@@ -1534,6 +1642,8 @@ bool collectListedFiles(ListedFileEntry*& out_entries, size_t& out_count, bool l
         entry.short_name = short_name;
         entry.full_name = normalizeLogPath(short_name);
         entry.size_bytes = (uint32_t)f.size();
+        const time_t last_write = f.getLastWrite();
+        entry.mtime_utc_s = last_write > 0 ? (uint32_t)last_write : 0U;
         const int dot = short_name.lastIndexOf('.');
         entry.extension = (dot >= 0) ? short_name.substring(dot + 1) : String("");
         entry.parsed = parseLogNameParts(short_name, entry.session_id, entry.stamp);
@@ -1563,6 +1673,8 @@ String filesJson(FileSortKey sort_key, FileSortDirection sort_dir) {
     out += entries[i].short_name;
     out += "\",\"size\":";
     out += String(entries[i].size_bytes);
+    out += ",\"mtime_utc_s\":";
+    out += String(entries[i].mtime_utc_s);
     out += ",\"session\":";
     out += String(entries[i].session_id);
     out += ",\"date\":";
@@ -1601,10 +1713,145 @@ bool listFiles(telem::LogFileInfoV1* out_files,
     telem::LogFileInfoV1& entry = out_files[returned_files];
     memset(&entry, 0, sizeof(entry));
     entry.size_bytes = entries[i].size_bytes;
+    entry.mtime_utc_s = entries[i].mtime_utc_s;
     strncpy(entry.name, entries[i].short_name.c_str(), sizeof(entry.name) - 1U);
     returned_files++;
   }
   delete[] entries;
+  return true;
+}
+
+bool listFilesSnapshot(telem::LogFileInfoV1*& out_files,
+                       uint16_t& total_files,
+                       FileSortKey sort_key,
+                       FileSortDirection sort_dir) {
+  out_files = nullptr;
+  total_files = 0U;
+
+  LockGuard lock(g_state_mutex);
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    return false;
+  }
+
+  ListedFileEntry* entries = nullptr;
+  size_t count = 0U;
+  if (!collectListedFiles(entries, count, true, sort_key, sort_dir)) return false;
+
+  total_files = (count > 0xFFFFU) ? 0xFFFFU : (uint16_t)count;
+  if (total_files == 0U) {
+    delete[] entries;
+    return true;
+  }
+
+  telem::LogFileInfoV1* snapshot = new telem::LogFileInfoV1[total_files];
+  if (!snapshot) {
+    delete[] entries;
+    return false;
+  }
+
+  for (uint16_t i = 0U; i < total_files; ++i) {
+    memset(&snapshot[i], 0, sizeof(snapshot[i]));
+    snapshot[i].size_bytes = entries[i].size_bytes;
+    snapshot[i].mtime_utc_s = entries[i].mtime_utc_s;
+    strncpy(snapshot[i].name, entries[i].short_name.c_str(), sizeof(snapshot[i].name) - 1U);
+  }
+
+  delete[] entries;
+  out_files = snapshot;
+  return true;
+}
+
+void freeFilesSnapshot(telem::LogFileInfoV1* files) {
+  delete[] files;
+}
+
+bool enumerateManagedLogFiles(LogFileEnumerateCallback cb, void* ctx, uint16_t& total_files) {
+  total_files = 0U;
+
+  LockGuard lock(g_state_mutex);
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    return false;
+  }
+
+  File dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String short_name = String(f.name());
+      if (short_name.startsWith("/logs/")) short_name = short_name.substring(6);
+      if (shouldIncludeListedFile(short_name, true)) {
+        telem::LogFileInfoV1 entry = {};
+        entry.size_bytes = (uint32_t)f.size();
+        const time_t last_write = f.getLastWrite();
+        entry.mtime_utc_s = last_write > 0 ? (uint32_t)last_write : 0U;
+        strncpy(entry.name, short_name.c_str(), sizeof(entry.name) - 1U);
+        if (cb && !cb(entry, total_files, ctx)) {
+          f.close();
+          dir.close();
+          return false;
+        }
+        total_files++;
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+
+  dir.close();
+  return true;
+}
+
+bool listFilesPage(telem::LogFileInfoV1* out_files,
+                   uint16_t max_files,
+                   uint16_t offset,
+                   uint16_t& returned_files,
+                   bool& has_more) {
+  returned_files = 0U;
+  has_more = false;
+  if (!out_files || max_files == 0U) return false;
+
+  LockGuard lock(g_state_mutex);
+  refreshBackendStatus(true);
+  if (!g_recorder.backend_ready || !g_recorder.media_present || !sd_backend::mounted()) {
+    return false;
+  }
+
+  File dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  uint16_t seen = 0U;
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String short_name = String(f.name());
+      if (short_name.startsWith("/logs/")) short_name = short_name.substring(6);
+      if (shouldIncludeListedFile(short_name, true)) {
+        if (seen >= offset && returned_files < max_files) {
+          telem::LogFileInfoV1& entry = out_files[returned_files];
+          memset(&entry, 0, sizeof(entry));
+          entry.size_bytes = (uint32_t)f.size();
+          const time_t last_write = f.getLastWrite();
+          entry.mtime_utc_s = last_write > 0 ? (uint32_t)last_write : 0U;
+          strncpy(entry.name, short_name.c_str(), sizeof(entry.name) - 1U);
+          returned_files++;
+        } else if (seen >= offset && returned_files >= max_files) {
+          has_more = true;
+          f.close();
+          dir.close();
+          return true;
+        }
+        seen++;
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+
+  dir.close();
   return true;
 }
 

@@ -12,7 +12,7 @@ namespace {
 constexpr uint8_t kUnitAir = 1U;
 constexpr uint8_t kUnitGnd = 2U;
 constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
-constexpr size_t kRxQueueCapacity = 128U;
+constexpr size_t kRxQueueCapacity = 256U;
 constexpr uint8_t kSendFailThreshold = 6U;
 constexpr uint32_t kHelloIntervalMs = 1000U;
 constexpr uint32_t kPeerStaleMs = 3000U;
@@ -24,7 +24,7 @@ constexpr uint16_t kRemoteFileChunkCapacity =
     (uint16_t)((kRemoteFileCapacity + telem::kLogFileChunkEntries - 1U) / telem::kLogFileChunkEntries);
 constexpr uint8_t kRemoteFileChunkWordCount =
     (uint8_t)((kRemoteFileChunkCapacity + 31U) / 32U);
-constexpr uint32_t kRemoteFilesRefreshTimeoutMs = 2500U;
+constexpr uint32_t kRemoteFilesRefreshTimeoutMs = 15000U;
 constexpr uint32_t kRemoteFilesRefreshDebounceMs = 750U;
 
 struct RxFrame {
@@ -74,6 +74,8 @@ bool g_remote_files_refresh_inflight = false;
 bool g_remote_files_truncated = false;
 uint32_t g_remote_files_revision = 0U;
 uint32_t g_remote_files_last_update_ms = 0U;
+uint16_t g_remote_file_page_offset = 0U;
+uint16_t g_remote_file_page_limit = 32U;
 telem::StorageStatusPayloadV1 g_remote_storage = {};
 bool g_remote_storage_known = false;
 uint32_t g_remote_storage_revision = 0U;
@@ -83,7 +85,7 @@ bool stateOnlyModeEnabled() {
   return config_store::get().radio_state_only != 0U;
 }
 
-void resetRemoteFiles(uint16_t total_files = 0U, uint16_t chunk_count = 0U) {
+void resetRemoteFiles(uint16_t total_files = 0U, uint16_t chunk_count = 0U, uint16_t page_offset = 0U, uint16_t page_limit = 32U) {
   memset(g_remote_files, 0, sizeof(g_remote_files));
   g_remote_file_total = total_files;
   g_remote_file_count = 0U;
@@ -92,10 +94,12 @@ void resetRemoteFiles(uint16_t total_files = 0U, uint16_t chunk_count = 0U) {
   memset(g_remote_file_chunk_seen, 0, sizeof(g_remote_file_chunk_seen));
   g_remote_files_complete = false;
   g_remote_files_truncated = (total_files > kRemoteFileCapacity) || (chunk_count > kRemoteFileChunkCapacity);
+  g_remote_file_page_offset = page_offset;
+  g_remote_file_page_limit = page_limit;
 }
 
-void beginRemoteFilesRefresh() {
-  resetRemoteFiles();
+void beginRemoteFilesRefresh(uint16_t page_offset = 0U, uint16_t page_limit = 32U) {
+  resetRemoteFiles(0U, 0U, page_offset, page_limit);
   g_remote_files_refresh_inflight = true;
   g_remote_files_last_update_ms = millis();
 }
@@ -512,6 +516,15 @@ void applyControlStatusPayload(const telem::ControlStatusPayloadV1& control, con
   g_snapshot.state.mirror_drop_count = control.mirror_drop_count;
 }
 
+void applyLiveStatusPayload(const telem::DownlinkStatusV1& status) {
+  g_snapshot.live_status = status;
+  g_snapshot.has_live_status = true;
+  g_snapshot.log_status.flags = status.log_flags;
+  g_snapshot.log_status.session_id = status.log_session_id;
+  g_snapshot.log_status.bytes_written = status.log_bytes_written;
+  g_snapshot.has_log_status = true;
+}
+
 void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload) {
   if (hdr.payload_len < sizeof(telem::UnifiedDownlinkBaseV1)) {
     g_snapshot.stats.len_err++;
@@ -523,7 +536,10 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
 
   size_t offset = sizeof(base);
   telem::DownlinkGpsStateV1 gps = {};
-  telem::ControlStatusPayloadV1 control = {};
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  telem::DownlinkExtendedStateV2 ext = {};
+#endif
+  telem::DownlinkStatusV1 status = {};
 
   if ((base.section_flags & telem::kUnifiedDownlinkFlagHasGps) != 0U) {
     if (offset + sizeof(gps) > hdr.payload_len) {
@@ -534,13 +550,24 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
     offset += sizeof(gps);
   }
 
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasControl) != 0U) {
-    if (offset + sizeof(control) > hdr.payload_len) {
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasExtended) != 0U) {
+    if (offset + sizeof(ext) > hdr.payload_len) {
       g_snapshot.stats.len_err++;
       return;
     }
-    memcpy(&control, payload + offset, sizeof(control));
-    offset += sizeof(control);
+    memcpy(&ext, payload + offset, sizeof(ext));
+    offset += sizeof(ext);
+  }
+#endif
+
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasStatus) != 0U) {
+    if (offset + sizeof(status) > hdr.payload_len) {
+      g_snapshot.stats.len_err++;
+      return;
+    }
+    memcpy(&status, payload + offset, sizeof(status));
+    offset += sizeof(status);
   }
 
   if (offset != hdr.payload_len) {
@@ -588,8 +615,24 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
     g_snapshot.state.last_gps_ms = gps.last_gps_ms;
   }
 
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasControl) != 0U) {
-    applyControlStatusPayload(control, hdr);
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasExtended) != 0U) {
+    g_snapshot.state.fusion_gain = ext.fusion_gain;
+    g_snapshot.state.fusion_accel_rej = ext.fusion_accel_rej;
+    g_snapshot.state.fusion_mag_rej = ext.fusion_mag_rej;
+    g_snapshot.state.fusion_recovery_period = ext.fusion_recovery_period;
+    g_snapshot.state.raw_present_mask = ext.raw_present_mask;
+    g_snapshot.state.gps_year = ext.gps_year;
+    g_snapshot.state.gps_month = ext.gps_month;
+    g_snapshot.state.gps_day = ext.gps_day;
+    g_snapshot.state.gps_hour = ext.gps_hour;
+    g_snapshot.state.gps_min = ext.gps_min;
+    g_snapshot.state.gps_sec = ext.gps_sec;
+  }
+#endif
+
+  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasStatus) != 0U) {
+    applyLiveStatusPayload(status);
   }
 
   g_snapshot.has_state = true;
@@ -607,7 +650,7 @@ void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload)
 void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
   switch ((telem::MsgType)hdr.msg_type) {
     case telem::TELEM_FULL_STATE:
-      if (hdr.payload_len != sizeof(telem::TelemetryFullStateV1)) {
+      if (hdr.payload_len != sizeof(telem::TelemetryStateRecord)) {
         g_snapshot.stats.len_err++;
         return;
       }
@@ -684,20 +727,16 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::LogFileListChunkPayloadV1 chunk = {};
       memcpy(&chunk, payload, sizeof(chunk));
-      const uint16_t chunk_count = chunk.chunk_count == 0U ? 1U : chunk.chunk_count;
-      if (chunk.chunk_index == 0U ||
-          chunk_count != g_remote_file_chunk_count ||
-          chunk.total_files != g_remote_file_total) {
-        resetRemoteFiles(chunk.total_files, chunk_count);
+      const bool complete = (chunk.flags & telem::kLogFileListFlagComplete) != 0U;
+      if (g_remote_file_count == 0U && !g_remote_files_complete) {
+        g_remote_file_page_offset = chunk.offset;
       }
-      if (chunk.chunk_index >= g_remote_file_chunk_count) {
-        g_remote_files_last_update_ms = millis();
-        g_remote_files_refresh_inflight = false;
-        g_snapshot.stats.frames_ok++;
-        g_snapshot.stats.last_rx_ms = millis();
-        break;
+      if (chunk.offset < g_remote_file_page_offset) {
+        resetRemoteFiles(0U, 0U, chunk.offset, g_remote_file_page_limit);
       }
-      const uint16_t base_index = (uint16_t)(chunk.chunk_index * telem::kLogFileChunkEntries);
+      const uint16_t base_index = (chunk.offset >= g_remote_file_page_offset)
+                                      ? (uint16_t)(chunk.offset - g_remote_file_page_offset)
+                                      : 0U;
       const uint16_t copy_count =
           (chunk.entries_in_chunk < telem::kLogFileChunkEntries) ? chunk.entries_in_chunk : telem::kLogFileChunkEntries;
       for (uint16_t i = 0U; i < copy_count; ++i) {
@@ -708,18 +747,13 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
           g_remote_file_count = (uint16_t)(dst_index + 1U);
         }
       }
-      const uint16_t chunk_word = (uint16_t)(chunk.chunk_index / 32U);
-      const uint32_t chunk_bit = (1UL << (chunk.chunk_index % 32U));
-      if ((g_remote_file_chunk_seen[chunk_word] & chunk_bit) == 0U) {
-        g_remote_file_chunk_seen[chunk_word] |= chunk_bit;
-        g_remote_file_chunk_seen_count++;
-      }
       g_remote_files_last_update_ms = millis();
-      g_remote_files_refresh_inflight = false;
-      if (g_remote_file_chunk_seen_count >= g_remote_file_chunk_count) {
-        g_remote_files_complete = true;
-        g_remote_files_revision++;
-      }
+      g_remote_file_total = complete ? chunk.total_files : (uint16_t)(g_remote_file_page_offset + g_remote_file_count);
+      g_remote_files_truncated =
+          ((chunk.flags & telem::kLogFileListFlagTruncated) != 0U) || (g_remote_file_total > kRemoteFileCapacity);
+      g_remote_files_complete = complete;
+      g_remote_files_refresh_inflight = !complete;
+      g_remote_files_revision++;
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.last_rx_ms = millis();
       break;
@@ -924,14 +958,17 @@ bool sendReplaySeekRelative(int32_t delta_records) {
 
 bool sendGetReplayStatus() { return sendFrame(telem::CMD_GET_REPLAY_STATUS, nullptr, 0U); }
 
-bool sendGetLogFileList() {
+bool sendGetLogFileList(uint16_t offset, uint16_t limit) {
   const uint32_t now = millis();
   if (g_remote_files_refresh_inflight && g_remote_files_last_update_ms != 0U &&
       (uint32_t)(now - g_remote_files_last_update_ms) < kRemoteFilesRefreshDebounceMs) {
     return true;
   }
-  beginRemoteFilesRefresh();
-  const bool ok = sendFrame(telem::CMD_GET_LOG_FILE_LIST, nullptr, 0U);
+  beginRemoteFilesRefresh(offset, limit);
+  telem::CmdGetLogFileListV1 cmd = {};
+  cmd.offset = offset;
+  cmd.limit = limit;
+  const bool ok = sendFrame(telem::CMD_GET_LOG_FILE_LIST, &cmd, sizeof(cmd));
   if (!ok) g_remote_files_refresh_inflight = false;
   return ok;
 }
@@ -975,6 +1012,8 @@ RemoteFilesStatus remoteFilesStatus() {
   out.revision = g_remote_files_revision;
   out.total_files = g_remote_file_total;
   out.stored_files = g_remote_file_count;
+  out.page_offset = g_remote_file_page_offset;
+  out.page_limit = g_remote_file_page_limit;
   out.last_update_ms = g_remote_files_last_update_ms;
   out.complete = g_remote_files_complete;
   out.refresh_inflight = g_remote_files_refresh_inflight;
@@ -998,6 +1037,14 @@ String remoteFilesJson(bool refresh_requested) {
   json += String(g_remote_file_total);
   json += ",\"stored_files\":";
   json += String(g_remote_file_count);
+  json += ",\"page_offset\":";
+  json += String(g_remote_file_page_offset);
+  json += ",\"page_limit\":";
+  json += String(g_remote_file_page_limit);
+  json += ",\"has_prev\":";
+  json += g_remote_file_page_offset > 0U ? "true" : "false";
+  json += ",\"has_next\":";
+  json += g_remote_files_truncated ? "true" : "false";
   json += ",\"truncated\":";
   json += g_remote_files_truncated ? "true" : "false";
   json += ",\"last_update_ms\":";
@@ -1010,8 +1057,10 @@ String remoteFilesJson(bool refresh_requested) {
     first = false;
     json += "{\"name\":\"";
     json += jsonEscape(g_remote_files[i].name);
-    json += "\",\"size\":";
+    json += "\",\"size_bytes\":";
     json += String(g_remote_files[i].size_bytes);
+    json += ",\"mtime_utc_s\":";
+    json += String(g_remote_files[i].mtime_utc_s);
     json += "}";
   }
   json += "]}";
@@ -1032,6 +1081,12 @@ RemoteStorageStatus remoteStorageStatus() {
   out.free_bytes = g_remote_storage.free_bytes;
   out.total_bytes = g_remote_storage.total_bytes;
   out.file_count = g_remote_storage.file_count;
+  out.time_state = g_remote_storage.time_state;
+  out.time_source = g_remote_storage.time_source;
+  out.time_flags = g_remote_storage.time_flags;
+  out.system_time_utc_s = g_remote_storage.system_time_utc_s;
+  out.time_last_set_age_ms = g_remote_storage.time_last_set_age_ms;
+  out.time_sync_count = g_remote_storage.time_sync_count;
   strncpy(out.record_prefix, g_remote_storage.record_prefix, sizeof(out.record_prefix) - 1U);
   strncpy(out.next_record_name, g_remote_storage.next_record_name, sizeof(out.next_record_name) - 1U);
   return out;
@@ -1066,6 +1121,22 @@ String remoteStorageJson(bool refresh_requested) {
   json += String(g_remote_storage.total_bytes);
   json += ",\"file_count\":";
   json += String(g_remote_storage.file_count);
+  json += ",\"time_state\":\"";
+  json += telem::timeStateText(g_remote_storage.time_state);
+  json += "\",\"time_source\":\"";
+  json += telem::timeSourceText(g_remote_storage.time_source);
+  json += "\",\"gps_calendar_present\":";
+  json += (g_remote_storage.time_flags & telem::kTimeStatusFlagGpsCalendarPresent) ? "true" : "false";
+  json += ",\"gps_time_valid\":";
+  json += (g_remote_storage.time_flags & telem::kTimeStatusFlagGpsTimeValid) ? "true" : "false";
+  json += ",\"system_time_set\":";
+  json += (g_remote_storage.time_flags & telem::kTimeStatusFlagSystemTimeSet) ? "true" : "false";
+  json += ",\"system_time_utc_s\":";
+  json += String(g_remote_storage.system_time_utc_s);
+  json += ",\"time_last_set_age_ms\":";
+  json += String(g_remote_storage.time_last_set_age_ms);
+  json += ",\"time_sync_count\":";
+  json += String(g_remote_storage.time_sync_count);
   json += ",\"record_prefix\":\"";
   json += jsonEscape(g_remote_storage.record_prefix);
   json += "\",\"next_record_name\":\"";

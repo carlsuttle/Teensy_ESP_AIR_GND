@@ -2,6 +2,9 @@
 
 #include <string.h>
 
+#include "radio_link.h"
+#include "replay_bridge.h"
+
 namespace {
 
 bool floatNearAbs(float a, float b, float tol) {
@@ -15,7 +18,7 @@ uint32_t carrySignatureValue(uint32_t seq) {
   return x & 0x1FFFFFFFUL;
 }
 
-void fillCarrySignatureRecord(uint32_t index, telem::ReplayInputRecord160& replay) {
+void fillCarrySignatureRecord(uint32_t index, telem::ReplayInputRecord& replay) {
   memset(&replay, 0, sizeof(replay));
   replay.hdr.magic = telem::kReplayMagic;
   replay.hdr.version = telem::kReplayVersion;
@@ -40,6 +43,16 @@ void fillCarrySignatureRecord(uint32_t index, telem::ReplayInputRecord160& repla
   p.mag_milli_uT[1] = -8888 + (int32_t)index;
   p.mag_milli_uT[2] = 9999 - (int32_t)index;
   p.iTOW_ms = 500000U + 17U * index;
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  {
+    p.gps_year = 2026U;
+    p.gps_month = (uint8_t)(1U + (index % 12U));
+    p.gps_day = (uint8_t)(1U + (index % 28U));
+    p.gps_hour = (uint8_t)(index % 24U);
+    p.gps_min = (uint8_t)((10U + index) % 60U);
+    p.gps_sec = (uint8_t)((20U + index) % 60U);
+  }
+#endif
   p.fixType = 3U;
   p.numSV = (uint8_t)(10U + (index % 5U));
   p.gps_flags = 0xB0U + (uint16_t)index;
@@ -60,6 +73,13 @@ void fillCarrySignatureRecord(uint32_t index, telem::ReplayInputRecord160& repla
   memcpy(p.reserved + 0, &last_gps_ms, sizeof(last_gps_ms));
   memcpy(p.reserved + 4, &last_imu_ms, sizeof(last_imu_ms));
   memcpy(p.reserved + 8, &last_baro_ms, sizeof(last_baro_ms));
+}
+
+void serviceLiveLinkDuringBenchmark() {
+  radio_link::poll();
+  replay_bridge::poll();
+  const auto snap = teensy_link::snapshot();
+  radio_link::publish(snap);
 }
 
 bool waitForCarrySignatureState(uint32_t expected_seq, uint32_t expected_t_us,
@@ -175,7 +195,7 @@ CarrySummary runCarrySignatureTest(Stream& out, uint8_t count) {
   const uint8_t runs = count ? count : 1U;
   teensy_link::clearPendingStates();
   for (uint32_t i = 0; i < runs; ++i) {
-    telem::ReplayInputRecord160 replay = {};
+    telem::ReplayInputRecord replay = {};
     fillCarrySignatureRecord(i, replay);
     summary.sent++;
     if (!teensy_link::sendReplayInputRecord(replay)) {
@@ -201,13 +221,29 @@ CarrySummary runCarrySignatureTest(Stream& out, uint8_t count) {
     uint32_t last_gps_ms = 0U;
     uint32_t last_imu_ms = 0U;
     uint32_t last_baro_ms = 0U;
+    const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(s);
+    telem::GpsCalendarTime expected_gps_time = {};
     memcpy(&last_gps_ms, p.reserved + 0, sizeof(last_gps_ms));
     memcpy(&last_imu_ms, p.reserved + 4, sizeof(last_imu_ms));
     memcpy(&last_baro_ms, p.reserved + 8, sizeof(last_baro_ms));
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+    expected_gps_time.year = p.gps_year;
+    expected_gps_time.month = p.gps_month;
+    expected_gps_time.day = p.gps_day;
+    expected_gps_time.hour = p.gps_hour;
+    expected_gps_time.minute = p.gps_min;
+    expected_gps_time.second = p.gps_sec;
+#endif
 
     const bool stamp_ok = pending.seq == replay.hdr.seq && pending.t_us == replay.hdr.t_us;
     const bool gps_ok =
         s.iTOW_ms == p.iTOW_ms &&
+        gps_time.year == expected_gps_time.year &&
+        gps_time.month == expected_gps_time.month &&
+        gps_time.day == expected_gps_time.day &&
+        gps_time.hour == expected_gps_time.hour &&
+        gps_time.minute == expected_gps_time.minute &&
+        gps_time.second == expected_gps_time.second &&
         s.fixType == p.fixType &&
         s.numSV == p.numSV &&
         s.lat_1e7 == p.lat_1e7 &&
@@ -310,7 +346,7 @@ CarrySummary runCarrySequenceCsvTest(Stream& out, uint32_t duration_ms, uint8_t 
   while ((int32_t)(millis() - drain_deadline_ms) < 0) {
     const uint32_t now_ms = millis();
     while ((int32_t)(now_ms - stop_send_ms) < 0 && inflight < window_limit && summary.sent < kMaxRows) {
-      telem::ReplayInputRecord160 replay = {};
+      telem::ReplayInputRecord replay = {};
       fillCarrySignatureRecord(next_index, replay);
       if (!teensy_link::sendReplayInputRecord(replay)) {
         break;
@@ -400,10 +436,11 @@ ReplayBatchBenchmarkSummary runReplayBatchBenchmark(Stream& out, uint32_t durati
   while ((int32_t)(millis() - drain_deadline_ms) < 0) {
     const uint32_t now_ms = millis();
     const uint32_t now_us = micros();
+    serviceLiveLinkDuringBenchmark();
     if ((int32_t)(now_ms - stop_send_ms) < 0 && (int32_t)(now_us - next_batch_us) >= 0) {
       uint16_t sent_this_batch = 0U;
       while (sent_this_batch < records_per_batch) {
-        telem::ReplayInputRecord160 replay = {};
+        telem::ReplayInputRecord replay = {};
         fillCarrySignatureRecord(next_index, replay);
         if (!teensy_link::sendReplayInputRecord(replay)) {
           break;

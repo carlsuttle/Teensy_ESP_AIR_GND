@@ -9,6 +9,12 @@ struct State {
   float mag_heading;
 
   uint32_t iTOW;
+  uint16_t gps_year;
+  uint8_t gps_month;
+  uint8_t gps_day;
+  uint8_t gps_hour;
+  uint8_t gps_min;
+  uint8_t gps_sec;
   uint8_t fixType;
   uint8_t numSV;
   int32_t lat;

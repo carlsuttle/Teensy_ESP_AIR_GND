@@ -24,7 +24,7 @@
   <div class="raw-shell">
     <div class="raw-card">
       <div class="raw-title">Raw WebSocket Sequence</div>
-      <div class="raw-note">Dedicated browser test page. No telemetry parsing, no DQI, no link heuristics. This page only listens on <code>/ws_raw</code> and shows the latest received telemetry sequence number from GND.</div>
+      <div class="raw-note">Dedicated browser test page. No telemetry parsing, no DQI, no link heuristics. This page only listens on <code>/ws</code> and shows the latest received telemetry sequence number from GND.</div>
       <div class="raw-grid">
         <div class="raw-metric">
           <div class="raw-label">Socket</div>
@@ -64,7 +64,7 @@
 
     <div class="raw-card">
       <div class="raw-title">Transfer Log</div>
-      <div class="raw-note">Sequence number just before each payload is handed to the page over <code>/ws_raw</code>.</div>
+      <div class="raw-note">Sequence number just before each payload is handed to the page over <code>/ws</code>.</div>
       <pre id="transferLog" class="raw-log">(waiting)</pre>
     </div>
   </div>
@@ -161,7 +161,7 @@
       }
       setSocketState(forced ? 'Reconnecting' : 'Connecting');
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const socket = new WebSocket(`${proto}//${location.host}/ws_raw`);
+      const socket = new WebSocket(`${proto}//${location.host}/ws`);
       ws = socket;
       socket.onopen = () => {
         if (ws !== socket || generation !== reconnectGeneration) return;

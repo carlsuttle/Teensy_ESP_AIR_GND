@@ -2,9 +2,12 @@
 #include <WiFi.h>
 #include <ctype.h>
 #include <esp_wifi.h>
+#include <sys/time.h>
+#include <time.h>
 #include <string.h>
 
 #include "config_store.h"
+#include "control_plane.h"
 #include "log_store.h"
 #include "sd_api.h"
 #include "sd_backend.h"
@@ -14,6 +17,8 @@
 #include "radio_link.h"
 #include "spi_bridge.h"
 #include "replay_bridge.h"
+#include "sd_file_api.h"
+#include "time_service.h"
 
 namespace {
 
@@ -29,7 +34,7 @@ uint16_t g_last_stream_rate_ui_hz = 0;
 uint16_t g_last_stream_rate_log_hz = 0;
 uint32_t g_last_capture_rate_tx_ms = 0;
 uint16_t g_last_capture_rate_hz = 0;
-bool g_quiet_serial = false;
+bool g_quiet_serial = true;
 bool g_radio_ready = false;
 bool g_link_ready = false;
 bool g_link_wait_printed = false;
@@ -39,6 +44,7 @@ bool g_gpio_pulse_active = false;
 uint8_t g_gpio_pulse_pin = 0U;
 uint32_t g_gpio_pulse_until_ms = 0U;
 bool g_sd_capture_was_active = false;
+telem::StorageStatusPayloadV1 g_console_storage_payload = {};
 bool g_sd_soak_active = false;
 uint16_t g_sd_soak_rate_hz = 0U;
 uint32_t g_sd_soak_seq = 0U;
@@ -50,6 +56,7 @@ uint32_t g_baseline_duration_ms = 0U;
 uint32_t g_baseline_started_ms = 0U;
 uint32_t g_baseline_stopped_ms = 0U;
 uint32_t g_console_log_session_id = 0U;
+uint32_t g_console_control_request_id = 0U;
 struct SdReadWriteSoakRun {
   bool active = false;
   bool ok = false;
@@ -134,19 +141,6 @@ constexpr uint32_t kBenchApplySettleMs = 1000U;
 constexpr uint32_t kReplayCompareSettleMs = 1000U;
 constexpr size_t kSdRwSoakChunkBytes = 65536U;
 
-#pragma pack(push, 1)
-struct SoakBinaryLogRecordV2 {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t record_size;
-  uint16_t record_kind;
-  uint16_t reserved;
-  uint32_t seq;
-  uint32_t t_us;
-  uint8_t payload[telem::kReplayRecordBytes];
-};
-#pragma pack(pop)
-
 constexpr uint32_t kSoakLogMagic = 0x4C4F4731UL;
 constexpr uint16_t kSoakLogVersion = 2U;
 
@@ -188,9 +182,14 @@ bool saveCaptureRateDefaults();
 bool beginBenchSweep(uint32_t duration_ms);
 void serviceBenchSweep();
 void printSdApiStatus(const char* tag = "SDSTATE");
+void printTimeStatus(const char* tag = "TIME");
 bool waitForLogStoreIdle(uint32_t timeout_ms);
 bool writeSdApiTestLog();
+bool writeTimeMarkerFile(const String& path, const char* text, telem::LogFileInfoV1* out_info = nullptr);
+bool runTimeValidation(Stream& out);
 uint16_t replayCaptureRateForFactor(uint8_t average_factor);
+uint32_t nextConsoleControlRequestId();
+control_plane::Result submitConsoleRequest(control_plane::Request request);
 bool getActiveFusionSettings(telem::CmdSetFusionSettingsV1& cmd);
 bool applyReplayRunControls(uint8_t average_factor, uint16_t* applied_capture_hz = nullptr);
 
@@ -220,6 +219,20 @@ uint32_t nextConsoleLogSessionId() {
   g_console_log_session_id++;
   if (g_console_log_session_id == 0U) g_console_log_session_id = 1U;
   return g_console_log_session_id;
+}
+
+uint32_t nextConsoleControlRequestId() {
+  g_console_control_request_id++;
+  if (g_console_control_request_id == 0U) g_console_control_request_id = 1U;
+  return g_console_control_request_id;
+}
+
+control_plane::Result submitConsoleRequest(control_plane::Request request) {
+  request.request_id = nextConsoleControlRequestId();
+  request.source = control_plane::SourceInterface::SerialConsole;
+  control_plane::Result result = {};
+  (void)control_plane::submit(request, result);
+  return result;
 }
 
 bool isStandaloneBench() {
@@ -418,6 +431,8 @@ void printConsoleHelp() {
   Serial.println("  sdmount       - mount the SD card backend");
   Serial.println("  sdeject       - eject the SD card backend when idle");
   Serial.println("  sdstate       - print SD mount and backend state");
+  Serial.println("  timestat      - print GPS-derived UTC wall-clock state");
+  Serial.println("  timeselftest  - run embedded time-state validation cases");
   Serial.println("  sdwrite       - write one small managed test log through the SD API");
   Serial.println("  sdrename a b  - rename one managed file through the SD API");
   Serial.println("  sddelete <f>  - delete one managed file through the SD API");
@@ -472,6 +487,7 @@ void printConsoleHelp() {
   Serial.println("  relink        - restart AIR radio-link");
   Serial.println("  resetnet      - restart AIR Wi-Fi/ESP-NOW side");
   Serial.println("  setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
+  Serial.println("  airstate      - print latest Teensy state seen by AIR");
   Serial.println("  quiet on/off/status - stop or resume unsolicited serial chatter");
   Serial.println("  stats         - start 1Hz STAT stream");
   Serial.println("  x             - stop active stream/mode");
@@ -544,6 +560,36 @@ void printStats(const teensy_link::Snapshot& snap) {
       (unsigned long)cap.queue_max);
 }
 
+void printLatestStateSummary(const teensy_link::Snapshot& snap) {
+  const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(snap.state);
+  Serial.printf(
+      "AIRSTATE has=%u seq=%lu t_us=%lu fix=%u sv=%u lat=%ld lon=%ld iTOW=%lu hMSL=%ld gSpeed=%ld headMot=%ld hAcc=%lu sAcc=%lu last_gps_ms=%lu last_imu_ms=%lu last_baro_ms=%lu gps_time=%04u-%02u-%02u %02u:%02u:%02u flags=0x%04X raw_mask=0x%04X\r\n",
+      snap.has_state ? 1U : 0U,
+      (unsigned long)snap.seq,
+      (unsigned long)snap.t_us,
+      (unsigned)snap.state.fixType,
+      (unsigned)snap.state.numSV,
+      (long)snap.state.lat_1e7,
+      (long)snap.state.lon_1e7,
+      (unsigned long)snap.state.iTOW_ms,
+      (long)snap.state.hMSL_mm,
+      (long)snap.state.gSpeed_mms,
+      (long)snap.state.headMot_1e5deg,
+      (unsigned long)snap.state.hAcc_mm,
+      (unsigned long)snap.state.sAcc_mms,
+      (unsigned long)snap.state.last_gps_ms,
+      (unsigned long)snap.state.last_imu_ms,
+      (unsigned long)snap.state.last_baro_ms,
+      (unsigned)gps_time.year,
+      (unsigned)gps_time.month,
+      (unsigned)gps_time.day,
+      (unsigned)gps_time.hour,
+      (unsigned)gps_time.minute,
+      (unsigned)gps_time.second,
+      (unsigned)snap.state.flags,
+      (unsigned)snap.state.raw_present_mask);
+}
+
 void beginSdCaptureBenchmark(uint32_t duration_ms) {
   stopSdSoakBenchmark();
   stopBaselineBenchmark();
@@ -590,20 +636,22 @@ bool handleTeensyApiConsoleCommand(const char* line) {
   }
 
   if (strcmp(args, "getfusion") == 0) {
-    teensy_api::CommandAckResult result = {};
-    const bool ok = teensy_api::getFusionSettings(result);
-    Serial.printf("TAPI GETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu seq=%lu t_us=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
-                  result.tx_ok ? 1U : 0U,
-                  result.ack_seen ? 1U : 0U,
-                  result.ack_ok ? 1U : 0U,
-                  (unsigned long)result.ack_code,
-                  (unsigned long)result.snapshot.seq,
-                  (unsigned long)result.snapshot.t_us,
-                  result.snapshot.has_state ? (double)result.snapshot.state.fusion_gain : 0.0,
-                  result.snapshot.has_state ? (double)result.snapshot.state.fusion_accel_rej : 0.0,
-                  result.snapshot.has_state ? (double)result.snapshot.state.fusion_mag_rej : 0.0,
-                  result.snapshot.has_state ? (unsigned)result.snapshot.state.fusion_recovery_period : 0U);
-    Serial.printf("TAPI GETFUSION RESULT ok=%u\r\n", (ok && result.ack_ok) ? 1U : 0U);
+    control_plane::Request request = {};
+    request.category = control_plane::RequestCategory::Fusion;
+    request.action = control_plane::RequestAction::FusionGet;
+    request.command_id = telem::CMD_GET_FUSION_SETTINGS;
+    const control_plane::Result result = submitConsoleRequest(request);
+    const auto snap = teensy_link::snapshot();
+    Serial.printf("TAPI GETFUSION ok=%u has_settings=%u seq=%lu t_us=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
+                  result.ok ? 1U : 0U,
+                  snap.has_fusion_settings ? 1U : 0U,
+                  (unsigned long)snap.seq,
+                  (unsigned long)snap.t_us,
+                  snap.has_fusion_settings ? (double)snap.fusion_settings.gain : 0.0,
+                  snap.has_fusion_settings ? (double)snap.fusion_settings.accelerationRejection : 0.0,
+                  snap.has_fusion_settings ? (double)snap.fusion_settings.magneticRejection : 0.0,
+                  snap.has_fusion_settings ? (unsigned)snap.fusion_settings.recoveryTriggerPeriod : 0U);
+    Serial.printf("TAPI GETFUSION RESULT ok=%u\r\n", result.ok ? 1U : 0U);
     return true;
   }
 
@@ -656,18 +704,20 @@ bool handleTeensyApiConsoleCommand(const char* line) {
       cmd.accelerationRejection = a;
       cmd.magneticRejection = m;
       cmd.recoveryTriggerPeriod = (uint16_t)r;
-      teensy_api::CommandAckResult result = {};
-      const bool ok = teensy_api::setFusionSettings(cmd, result);
-      Serial.printf("TAPI SETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
-                    result.tx_ok ? 1U : 0U,
-                    result.ack_seen ? 1U : 0U,
-                    result.ack_ok ? 1U : 0U,
-                    (unsigned long)result.ack_code,
+      control_plane::Request request = {};
+      request.category = control_plane::RequestCategory::Fusion;
+      request.action = control_plane::RequestAction::FusionSet;
+      request.command_id = telem::CMD_SET_FUSION_SETTINGS;
+      request.fusion = cmd;
+      const control_plane::Result result = submitConsoleRequest(request);
+      Serial.printf("TAPI SETFUSION ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
+                    result.ok ? 1U : 0U,
+                    (unsigned long)result.code,
                     (double)cmd.gain,
                     (double)cmd.accelerationRejection,
                     (double)cmd.magneticRejection,
                     (unsigned)cmd.recoveryTriggerPeriod);
-      Serial.printf("TAPI SETFUSION RESULT ok=%u\r\n", (ok && result.ack_ok) ? 1U : 0U);
+      Serial.printf("TAPI SETFUSION RESULT ok=%u\r\n", result.ok ? 1U : 0U);
     } else {
       Serial.println("TAPI SETFUSION usage: tapi setfusion <gain> <accelRej> <magRej> <recovery>");
     }
@@ -783,7 +833,7 @@ void serviceSdSoakBenchmark() {
     return;
   }
 
-  telem::TelemetryFullStateV1 state = {};
+  telem::TelemetryStateRecord state = {};
   const uint32_t now_us = micros();
   uint8_t generated = 0U;
   while ((int32_t)(now_us - g_sd_soak_next_us) >= 0 && generated < 32U) {
@@ -908,22 +958,57 @@ void printAirLogStatus() {
 }
 
 void printSdApiStatus(const char* tag) {
-  log_store::probeBackend();
-  sd_backend::Status backend = {};
-  const bool ready = sd_backend::refreshStatus(backend);
-  const auto recorder = log_store::recorderStatus();
-  Serial.printf("%s ready=%u mounted=%u media=%u state=%u init_hz=%lu total=%lu used=%lu free=%lu prefix=%s preview=%s\r\n",
+  memset(&g_console_storage_payload, 0, sizeof(g_console_storage_payload));
+  control_plane::Request request = {};
+  request.category = control_plane::RequestCategory::FileSd;
+  request.action = control_plane::RequestAction::StorageStatus;
+  request.command_id = telem::CMD_GET_STORAGE_STATUS;
+  const control_plane::Result result = submitConsoleRequest(request);
+  const telem::SdApiStatusCode code = (telem::SdApiStatusCode)result.code;
+  if (result.has_storage_status) {
+    g_console_storage_payload = result.storage_status;
+  }
+  Serial.printf("%s status=%s mounted=%u ready=%u media=%u state=%u init_hz=%lu total=%lu free=%lu files=%u time_state=%s time_source=%s gps_cal=%u gps_valid=%u time_set=%u time_syncs=%u sys_utc=%lu age_ms=%lu prefix=%s preview=%s\r\n",
                 tag ? tag : "SDSTATE",
-                ready ? 1U : 0U,
-                sd_backend::mounted() ? 1U : 0U,
-                sd_backend::mediaPresent() ? 1U : 0U,
-                (unsigned)sd_backend::mediaState(),
-                (unsigned long)backend.init_hz,
-                (unsigned long)backend.total_bytes,
-                (unsigned long)backend.used_bytes,
-                (unsigned long)recorder.free_bytes,
-                log_store::recordPrefix().c_str(),
-                shortLogName(log_store::previewLogName()).c_str());
+                telem::sdApiStatusText((uint32_t)code),
+                (g_console_storage_payload.flags & telem::kStorageStatusFlagMounted) ? 1U : 0U,
+                (g_console_storage_payload.flags & telem::kStorageStatusFlagBackendReady) ? 1U : 0U,
+                (g_console_storage_payload.flags & telem::kStorageStatusFlagMediaPresent) ? 1U : 0U,
+                (unsigned)g_console_storage_payload.media_state,
+                (unsigned long)g_console_storage_payload.init_hz,
+                (unsigned long)g_console_storage_payload.total_bytes,
+                (unsigned long)g_console_storage_payload.free_bytes,
+                (unsigned)g_console_storage_payload.file_count,
+                telem::timeStateText(g_console_storage_payload.time_state),
+                telem::timeSourceText(g_console_storage_payload.time_source),
+                (g_console_storage_payload.time_flags & telem::kTimeStatusFlagGpsCalendarPresent) ? 1U : 0U,
+                (g_console_storage_payload.time_flags & telem::kTimeStatusFlagGpsTimeValid) ? 1U : 0U,
+                (g_console_storage_payload.time_flags & telem::kTimeStatusFlagSystemTimeSet) ? 1U : 0U,
+                (unsigned)g_console_storage_payload.time_sync_count,
+                (unsigned long)g_console_storage_payload.system_time_utc_s,
+                (unsigned long)g_console_storage_payload.time_last_set_age_ms,
+                g_console_storage_payload.record_prefix,
+                shortLogName(String(g_console_storage_payload.next_record_name)).c_str());
+}
+
+void printTimeStatus(const char* tag) {
+  const auto ts = time_service::snapshot(millis());
+  Serial.printf("%s state=%s source=%s gps_calendar_present=%u gps_time_valid=%u system_time_set=%u sync_count=%lu sys_utc=%lu age_ms=%lu last_gps=%04u-%02u-%02uT%02u:%02u:%02uZ\r\n",
+                tag ? tag : "TIME",
+                telem::timeStateText(ts.time_state),
+                telem::timeSourceText(ts.time_source),
+                (ts.time_flags & telem::kTimeStatusFlagGpsCalendarPresent) ? 1U : 0U,
+                (ts.time_flags & telem::kTimeStatusFlagGpsTimeValid) ? 1U : 0U,
+                (ts.time_flags & telem::kTimeStatusFlagSystemTimeSet) ? 1U : 0U,
+                (unsigned long)ts.time_sync_count,
+                (unsigned long)ts.system_time_utc_s,
+                (unsigned long)ts.time_last_set_age_ms,
+                (unsigned)ts.last_trusted_gps.year,
+                (unsigned)ts.last_trusted_gps.month,
+                (unsigned)ts.last_trusted_gps.day,
+                (unsigned)ts.last_trusted_gps.hour,
+                (unsigned)ts.last_trusted_gps.minute,
+                (unsigned)ts.last_trusted_gps.second);
 }
 
 bool waitForLogStoreIdle(uint32_t timeout_ms) {
@@ -967,7 +1052,7 @@ bool writeSdApiTestLog() {
     return false;
   }
 
-  telem::TelemetryFullStateV1 state = {};
+  telem::TelemetryStateRecord state = {};
   const auto snap = teensy_link::snapshot();
   if (snap.has_state) {
     state = snap.state;
@@ -1001,6 +1086,151 @@ bool writeSdApiTestLog() {
                 (unsigned long)stats.dropped);
   printSdApiStatus("SDWRITE");
   return found_name;
+}
+
+bool setValidationUtcEpoch(uint32_t epoch_s) {
+  struct timeval tv = {};
+  tv.tv_sec = (time_t)epoch_s;
+  tv.tv_usec = 0;
+  return settimeofday(&tv, nullptr) == 0;
+}
+
+bool writeTimeMarkerFile(const String& path, const char* text, telem::LogFileInfoV1* out_info) {
+  if (out_info) memset(out_info, 0, sizeof(*out_info));
+  if (!path.startsWith("/logs/")) return false;
+
+  sd_backend::Status backend = {};
+  if (!sd_backend::mounted() && !sd_backend::mount(&backend)) {
+    return false;
+  }
+
+  sd_api::File file = sd_api::open(path, sd_api::OpenMode::write);
+  if (!file) return false;
+  if (text && text[0] != '\0') {
+    (void)file.print(text);
+    (void)file.print("\n");
+  }
+  file.flush();
+  file.close();
+
+  sd_api::File verify = sd_api::open(path, sd_api::OpenMode::read);
+  if (!verify) return false;
+  if (out_info) {
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->size_bytes = (uint32_t)verify.size();
+    const time_t last_write = verify.getLastWrite();
+    out_info->mtime_utc_s = last_write > 0 ? (uint32_t)last_write : 0U;
+    const String short_name = shortLogName(path);
+    strlcpy(out_info->name, short_name.c_str(), sizeof(out_info->name));
+  }
+  verify.close();
+  return true;
+}
+
+bool runTimeValidation(Stream& out) {
+  bool ok = true;
+  out.println("TIMETEST START");
+
+  ok &= time_service::runSelfTest(out);
+
+  time_service::begin();
+  ok &= setValidationUtcEpoch(0U);
+  const uint32_t base_ms = millis();
+  const auto startup_status = time_service::snapshot(base_ms);
+  const bool startup_ok = startup_status.time_state == (uint8_t)telem::TimeStateCode::UNSET &&
+                          (startup_status.time_flags & telem::kTimeStatusFlagSystemTimeSet) == 0U;
+  out.printf("TIMETEST case=no_lock_startup ok=%u state=%s system_time_set=%u\r\n",
+             startup_ok ? 1U : 0U,
+             telem::timeStateText(startup_status.time_state),
+             (startup_status.time_flags & telem::kTimeStatusFlagSystemTimeSet) ? 1U : 0U);
+  ok &= startup_ok;
+
+  telem::LogFileInfoV1 pre_lock_file = {};
+  const String pre_lock_name = String("/logs/time_prelock_") + String(base_ms) + ".txt";
+  const bool pre_lock_file_ok = writeTimeMarkerFile(pre_lock_name, "time_prelock", &pre_lock_file);
+  out.printf("TIMETEST case=no_lock_file ok=%u file=%s mtime_utc_s=%lu\r\n",
+             pre_lock_file_ok ? 1U : 0U,
+             shortLogName(pre_lock_name).c_str(),
+             (unsigned long)pre_lock_file.mtime_utc_s);
+  ok &= pre_lock_file_ok;
+
+  const uint32_t session_id = nextConsoleLogSessionId();
+  bool record_before_lock_ok = false;
+  if (log_store::startSession(session_id)) {
+    telem::TelemetryStateRecord state = {};
+    state.roll_deg = 1.0f;
+    state.pitch_deg = 2.0f;
+    state.yaw_deg = 3.0f;
+    state.last_imu_ms = millis();
+    log_store::enqueueState(1U, micros(), state);
+    telem::GpsCalendarTime gps_time0 = {};
+    gps_time0.year = 2026U;
+    gps_time0.month = 4U;
+    gps_time0.day = 2U;
+    gps_time0.hour = 12U;
+    telem::GpsCalendarTime gps_time1 = gps_time0;
+    telem::GpsCalendarTime gps_time2 = gps_time0;
+    gps_time2.second = 1U;
+    time_service::ingestGpsSample(3U, gps_time0, 0U, base_ms + 1000U);
+    time_service::ingestGpsSample(3U, gps_time1, 0U, base_ms + 1100U);
+    time_service::ingestGpsSample(3U, gps_time2, 0U, base_ms + 1200U);
+    state.fixType = 3U;
+    telem::setGpsCalendarTime(state, gps_time2);
+    log_store::enqueueState(2U, micros(), state);
+    log_store::stopSession();
+    record_before_lock_ok = waitForLogStoreIdle(4000U);
+  }
+  const auto post_lock_status = time_service::snapshot(base_ms + 1300U);
+  out.printf("TIMETEST case=record_before_lock_then_lock ok=%u state=%s sync_count=%lu\r\n",
+             record_before_lock_ok ? 1U : 0U,
+             telem::timeStateText(post_lock_status.time_state),
+             (unsigned long)post_lock_status.time_sync_count);
+  ok &= record_before_lock_ok &&
+        post_lock_status.time_state == (uint8_t)telem::TimeStateCode::GPS_VALID;
+
+  telem::LogFileInfoV1 post_lock_file = {};
+  const String post_lock_name = String("/logs/time_postlock_") + String(base_ms) + ".txt";
+  const bool post_lock_file_ok = writeTimeMarkerFile(post_lock_name, "time_postlock", &post_lock_file);
+  out.printf("TIMETEST case=delayed_lock_file ok=%u file=%s mtime_utc_s=%lu\r\n",
+             post_lock_file_ok ? 1U : 0U,
+             shortLogName(post_lock_name).c_str(),
+             (unsigned long)post_lock_file.mtime_utc_s);
+  ok &= post_lock_file_ok && post_lock_file.mtime_utc_s >= 1704067200UL;
+
+  time_service::ingestGpsSample(0U, {}, 0U, base_ms + 3000U);
+  const auto holdover_status = time_service::snapshot(base_ms + 3000U);
+  out.printf("TIMETEST case=holdover_after_loss ok=%u state=%s system_time_set=%u\r\n",
+             holdover_status.time_state == (uint8_t)telem::TimeStateCode::HOLDOVER ? 1U : 0U,
+             telem::timeStateText(holdover_status.time_state),
+             (holdover_status.time_flags & telem::kTimeStatusFlagSystemTimeSet) ? 1U : 0U);
+  ok &= holdover_status.time_state == (uint8_t)telem::TimeStateCode::HOLDOVER;
+
+  telem::LogFileInfoV1 holdover_file = {};
+  const String holdover_name = String("/logs/time_holdover_") + String(base_ms) + ".txt";
+  const bool holdover_file_ok = writeTimeMarkerFile(holdover_name, "time_holdover", &holdover_file);
+  out.printf("TIMETEST case=holdover_file ok=%u file=%s mtime_utc_s=%lu\r\n",
+             holdover_file_ok ? 1U : 0U,
+             shortLogName(holdover_name).c_str(),
+             (unsigned long)holdover_file.mtime_utc_s);
+  ok &= holdover_file_ok && holdover_file.mtime_utc_s >= post_lock_file.mtime_utc_s;
+
+  const uint32_t sync_count_before_reject = holdover_status.time_sync_count;
+  telem::GpsCalendarTime invalid_time = {};
+  invalid_time.year = 2100U;
+  invalid_time.month = 1U;
+  invalid_time.day = 1U;
+  time_service::ingestGpsSample(3U, invalid_time, 0U, base_ms + 3500U);
+  const auto reject_status = time_service::snapshot(base_ms + 3500U);
+  const bool reject_ok = reject_status.time_sync_count == sync_count_before_reject &&
+                         reject_status.time_state == (uint8_t)telem::TimeStateCode::HOLDOVER;
+  out.printf("TIMETEST case=invalid_reject ok=%u state=%s sync_count=%lu\r\n",
+             reject_ok ? 1U : 0U,
+             telem::timeStateText(reject_status.time_state),
+             (unsigned long)reject_status.time_sync_count);
+  ok &= reject_ok;
+
+  out.printf("TIMETEST RESULT ok=%u\r\n", ok ? 1U : 0U);
+  return ok;
 }
 
 bool beginSdReadWriteSoak(uint32_t duration_ms, const String* source_override) {
@@ -1273,7 +1503,7 @@ void serviceSdReadWriteLogSoak() {
     return;
   }
 
-  SoakBinaryLogRecordV2 record = {};
+  telem::BinaryLogRecordV2 record = {};
   if (!readExactFile(g_sd_rw_log_soak.source_file, (uint8_t*)&record, sizeof(record))) {
     if (!g_sd_rw_log_soak.source_file.seek(0U)) {
       g_sd_rw_log_soak.read_failures++;
@@ -1300,19 +1530,19 @@ void serviceSdReadWriteLogSoak() {
 
   switch ((telem::LogRecordKind)record.record_kind) {
     case telem::LogRecordKind::State160: {
-      telem::TelemetryFullStateV1 state = {};
+      telem::TelemetryStateRecord state = {};
       memcpy(&state, record.payload, sizeof(state));
       log_store::enqueueState(record.seq, record.t_us, state);
       break;
     }
     case telem::LogRecordKind::ReplayInput160: {
-      telem::ReplayInputRecord160 replay = {};
+      telem::ReplayInputRecord replay = {};
       memcpy(&replay, record.payload, sizeof(replay));
       log_store::enqueueReplayInput(record.seq, record.t_us, replay);
       break;
     }
     case telem::LogRecordKind::ReplayControl160: {
-      telem::ReplayControlRecord160 replay = {};
+      telem::ReplayControlRecord replay = {};
       memcpy(&replay, record.payload, sizeof(replay));
       log_store::enqueueReplayControl(
           replay.payload.command_id,
@@ -1412,7 +1642,13 @@ bool beginReplayDirect(const String& source_name) {
     Serial.println("AIRREPLAY START ok=0 reason=no_source_log");
     return false;
   }
-  if (!replay_bridge::startFile(source_name)) {
+  control_plane::Request request = {};
+  request.category = control_plane::RequestCategory::Replay;
+  request.action = control_plane::RequestAction::ReplayStartFile;
+  request.command_id = telem::CMD_REPLAY_START_FILE;
+  strlcpy(request.name, source_name.c_str(), sizeof(request.name));
+  const control_plane::Result result = submitConsoleRequest(request);
+  if (!result.ok) {
     Serial.printf("AIRREPLAY START ok=0 reason=replay_start_failed src=%s\r\n",
                   shortLogName(source_name).c_str());
     return false;
@@ -1670,24 +1906,40 @@ void handleConsoleCommands() {
       } else if (strcmp(g_console_line, "sdprobe") == 0) {
         printSdApiStatus("SDPROBE");
       } else if (strcmp(g_console_line, "sdmount") == 0) {
-        sd_backend::Status backend = {};
-        const bool ok = sd_backend::mount(&backend);
-        Serial.printf("SDMOUNT ok=%u mounted=%u card_type=%u init_hz=%lu total=%lu used=%lu\r\n",
-                      ok ? 1U : 0U,
-                      sd_backend::mounted() ? 1U : 0U,
-                      (unsigned)backend.card_type,
-                      (unsigned long)backend.init_hz,
-                      (unsigned long)backend.total_bytes,
-                      (unsigned long)backend.used_bytes);
+        control_plane::Request request = {};
+        request.category = control_plane::RequestCategory::FileSd;
+        request.action = control_plane::RequestAction::MountMedia;
+        request.command_id = telem::CMD_MOUNT_MEDIA;
+        const control_plane::Result result = submitConsoleRequest(request);
+        const telem::StorageStatusPayloadV1 payload =
+            result.has_storage_status ? result.storage_status : telem::StorageStatusPayloadV1{};
+        const telem::SdApiStatusCode code = (telem::SdApiStatusCode)result.code;
+        Serial.printf("SDMOUNT ok=%u code=%s mounted=%u init_hz=%lu total=%lu free=%lu\r\n",
+                      code == telem::SdApiStatusCode::OK ? 1U : 0U,
+                      telem::sdApiStatusText((uint32_t)code),
+                      (payload.flags & telem::kStorageStatusFlagMounted) ? 1U : 0U,
+                      (unsigned long)payload.init_hz,
+                      (unsigned long)payload.total_bytes,
+                      (unsigned long)payload.free_bytes);
       } else if (strcmp(g_console_line, "sdeject") == 0) {
-        if (log_store::busy() || replay_bridge::active()) {
-          Serial.println("SDEJECT ok=0 reason=busy");
-        } else {
-          const bool ok = sd_backend::eject();
-          Serial.printf("SDEJECT ok=%u mounted=%u\r\n", ok ? 1U : 0U, sd_backend::mounted() ? 1U : 0U);
-        }
+        control_plane::Request request = {};
+        request.category = control_plane::RequestCategory::FileSd;
+        request.action = control_plane::RequestAction::EjectMedia;
+        request.command_id = telem::CMD_EJECT_MEDIA;
+        const control_plane::Result result = submitConsoleRequest(request);
+        const telem::StorageStatusPayloadV1 payload =
+            result.has_storage_status ? result.storage_status : telem::StorageStatusPayloadV1{};
+        const telem::SdApiStatusCode code = (telem::SdApiStatusCode)result.code;
+        Serial.printf("SDEJECT ok=%u code=%s mounted=%u\r\n",
+                      code == telem::SdApiStatusCode::OK ? 1U : 0U,
+                      telem::sdApiStatusText((uint32_t)code),
+                      (payload.flags & telem::kStorageStatusFlagMounted) ? 1U : 0U);
       } else if (strcmp(g_console_line, "sdstate") == 0) {
         printSdApiStatus("SDSTATE");
+      } else if (strcmp(g_console_line, "timestat") == 0) {
+        printTimeStatus("TIME");
+      } else if (strcmp(g_console_line, "timeselftest") == 0) {
+        (void)runTimeValidation(Serial);
       } else if (strcmp(g_console_line, "sdrwsoakstat") == 0) {
         Serial.printf("SDRWSOAK active=%u src=%s dst=%s bytes_read=%lu bytes_written=%lu wraps=%lu read_fail=%lu write_fail=%lu max_read_us=%lu max_write_us=%lu iterations=%lu\r\n",
                       g_sd_rw_soak.active ? 1U : 0U,
@@ -1785,16 +2037,36 @@ void handleConsoleCommands() {
         char src_name[48] = {};
         char dst_name[48] = {};
         if (sscanf(g_console_line + 9, "%47s %47s", src_name, dst_name) == 2) {
-          const bool ok = log_store::renameFileByName(String(src_name), String(dst_name));
-          Serial.printf("SDRENAME ok=%u from=%s to=%s\r\n", ok ? 1U : 0U, src_name, dst_name);
+          control_plane::Request request = {};
+          request.category = control_plane::RequestCategory::FileSd;
+          request.action = control_plane::RequestAction::RenameFile;
+          request.command_id = telem::CMD_RENAME_LOG_FILE;
+          strlcpy(request.name, src_name, sizeof(request.name));
+          strlcpy(request.aux_name, dst_name, sizeof(request.aux_name));
+          const control_plane::Result result = submitConsoleRequest(request);
+          const telem::SdApiStatusCode code = (telem::SdApiStatusCode)result.code;
+          Serial.printf("SDRENAME ok=%u code=%s from=%s to=%s\r\n",
+                        code == telem::SdApiStatusCode::OK ? 1U : 0U,
+                        telem::sdApiStatusText((uint32_t)code),
+                        src_name,
+                        dst_name);
         } else {
           Serial.println("SDRENAME usage: sdrename <from> <to>");
         }
       } else if (strncmp(g_console_line, "sddelete ", 9) == 0) {
         char file_name[48] = {};
         if (sscanf(g_console_line + 9, "%47s", file_name) == 1) {
-          const bool ok = log_store::deleteFileByName(String(file_name));
-          Serial.printf("SDDELETE ok=%u file=%s\r\n", ok ? 1U : 0U, file_name);
+          control_plane::Request request = {};
+          request.category = control_plane::RequestCategory::FileSd;
+          request.action = control_plane::RequestAction::DeleteFile;
+          request.command_id = telem::CMD_DELETE_LOG_FILE;
+          strlcpy(request.name, file_name, sizeof(request.name));
+          const control_plane::Result result = submitConsoleRequest(request);
+          const telem::SdApiStatusCode code = (telem::SdApiStatusCode)result.code;
+          Serial.printf("SDDELETE ok=%u code=%s file=%s\r\n",
+                        code == telem::SdApiStatusCode::OK ? 1U : 0U,
+                        telem::sdApiStatusText((uint32_t)code),
+                        file_name);
         } else {
           Serial.println("SDDELETE usage: sddelete <file>");
         }
@@ -1815,7 +2087,14 @@ void handleConsoleCommands() {
         const uint32_t session_id = nextConsoleLogSessionId();
         log_store::setNextSessionMetadata(String(), 1U, config_store::get().source_rate_hz);
         if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
-        const bool ok = log_store::startSession(session_id);
+        control_plane::Request request = {};
+        request.category = control_plane::RequestCategory::Recording;
+        request.action = control_plane::RequestAction::RecordStart;
+        request.command_id = telem::CMD_LOG_START;
+        request.session_id = session_id;
+        request.has_explicit_session_id = true;
+        const control_plane::Result result = submitConsoleRequest(request);
+        const bool ok = result.ok;
         Serial.printf("AIRLOG START ok=%u session=%lu\r\n",
                       ok ? 1U : 0U,
                       (unsigned long)session_id);
@@ -1826,14 +2105,25 @@ void handleConsoleCommands() {
           g_console_log_session_id = (uint32_t)session_id;
           log_store::setNextSessionMetadata(String(), 1U, config_store::get().source_rate_hz);
           if (!isStandaloneBench()) radio_link::setRecorderEnabled(true);
-          const bool ok = log_store::startSession((uint32_t)session_id);
+          control_plane::Request request = {};
+          request.category = control_plane::RequestCategory::Recording;
+          request.action = control_plane::RequestAction::RecordStart;
+          request.command_id = telem::CMD_LOG_START;
+          request.session_id = (uint32_t)session_id;
+          request.has_explicit_session_id = true;
+          const control_plane::Result result = submitConsoleRequest(request);
+          const bool ok = result.ok;
           Serial.printf("AIRLOG START ok=%u session=%u\r\n", ok ? 1U : 0U, session_id);
           printAirLogStatus();
         } else {
           Serial.println("AIRLOG usage: logstartid <session>");
         }
       } else if (strcmp(g_console_line, "logstop") == 0) {
-        log_store::stopSession();
+        control_plane::Request request = {};
+        request.category = control_plane::RequestCategory::Recording;
+        request.action = control_plane::RequestAction::RecordStop;
+        request.command_id = telem::CMD_LOG_STOP;
+        (void)submitConsoleRequest(request);
         Serial.println("AIRLOG STOP requested=1");
         const bool stopped_ok = waitForLogStoreIdle(10000U);
         Serial.printf("AIRLOG STOP ok=%u\r\n", stopped_ok ? 1U : 0U);
@@ -1858,14 +2148,23 @@ void handleConsoleCommands() {
           if (strcmp(dir_buf, "asc") == 0) sort_dir = log_store::FileSortDirection::ascending;
           else if (strcmp(dir_buf, "desc") == 0) sort_dir = log_store::FileSortDirection::descending;
         }
-        Serial.println(log_store::filesJson(sort_key, sort_dir));
+        control_plane::Request request = {};
+        request.category = control_plane::RequestCategory::FileSd;
+        request.action = control_plane::RequestAction::FileListJson;
+        request.command_id = telem::CMD_GET_LOG_FILE_LIST;
+        request.sort_key = sort_key;
+        request.sort_dir = sort_dir;
+        const control_plane::Result result = submitConsoleRequest(request);
+        Serial.println(result.has_files_json ? result.files_json : String("[]"));
       } else if (strncmp(g_console_line, "logprefix", 9) == 0) {
         char prefix_buf[24] = {};
         if (sscanf(g_console_line + 9, "%23s", prefix_buf) == 1) {
-          AppConfig cfg = config_store::get();
-          strlcpy(cfg.record_prefix, prefix_buf, sizeof(cfg.record_prefix));
-          config_store::update(cfg);
-          log_store::setConfig(config_store::get());
+          control_plane::Request request = {};
+          request.category = control_plane::RequestCategory::FileSd;
+          request.action = control_plane::RequestAction::SetRecordPrefix;
+          request.command_id = telem::CMD_SET_RECORD_PREFIX;
+          strlcpy(request.prefix, prefix_buf, sizeof(request.prefix));
+          (void)submitConsoleRequest(request);
         }
         Serial.printf("AIRLOG prefix=%s preview=%s\r\n",
                       log_store::recordPrefix().c_str(),
@@ -1897,8 +2196,18 @@ void handleConsoleCommands() {
       } else if (strncmp(g_console_line, "csvfile ", 8) == 0) {
         char file_name[48] = {};
         if (sscanf(g_console_line + 8, "%47s", file_name) == 1) {
-          const bool ok = log_store::exportLogToCsvByName(String(file_name), &Serial);
-          Serial.printf("AIRCSV FILE ok=%u file=%s\r\n", ok ? 1U : 0U, file_name);
+          control_plane::Request request = {};
+          request.category = control_plane::RequestCategory::FileSd;
+          request.action = control_plane::RequestAction::ExportCsv;
+          request.command_id = telem::CMD_EXPORT_LOG_CSV;
+          request.io_stream = &Serial;
+          strlcpy(request.name, file_name, sizeof(request.name));
+          const control_plane::Result result = submitConsoleRequest(request);
+          const telem::SdApiStatusCode code = (telem::SdApiStatusCode)result.code;
+          Serial.printf("AIRCSV FILE ok=%u code=%s file=%s\r\n",
+                        code == telem::SdApiStatusCode::OK ? 1U : 0U,
+                        telem::sdApiStatusText((uint32_t)code),
+                        file_name);
         } else {
           Serial.println("AIRCSV usage: csvfile <name.tlog>");
         }
@@ -2021,13 +2330,19 @@ void handleConsoleCommands() {
           Serial.println("SETPIN usage: setpin <gpio>");
         }
       } else if (strcmp(g_console_line, "getfusion") == 0 || strcmp(g_console_line, "get fusion") == 0) {
-        teensy_api::CommandAckResult result = {};
-        (void)teensy_api::getFusionSettings(result);
-        Serial.printf("GETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu\r\n",
-                      result.tx_ok ? 1U : 0U,
-                      result.ack_seen ? 1U : 0U,
-                      result.ack_ok ? 1U : 0U,
-                      (unsigned long)result.ack_code);
+        control_plane::Request request = {};
+        request.category = control_plane::RequestCategory::Fusion;
+        request.action = control_plane::RequestAction::FusionGet;
+        request.command_id = telem::CMD_GET_FUSION_SETTINGS;
+        const control_plane::Result result = submitConsoleRequest(request);
+        const auto snap = teensy_link::snapshot();
+        Serial.printf("GETFUSION ok=%u has_settings=%u gain=%.3f accRej=%.2f magRej=%.2f rec=%u\r\n",
+                      result.ok ? 1U : 0U,
+                      snap.has_fusion_settings ? 1U : 0U,
+                      snap.has_fusion_settings ? (double)snap.fusion_settings.gain : 0.0,
+                      snap.has_fusion_settings ? (double)snap.fusion_settings.accelerationRejection : 0.0,
+                      snap.has_fusion_settings ? (double)snap.fusion_settings.magneticRejection : 0.0,
+                      snap.has_fusion_settings ? (unsigned)snap.fusion_settings.recoveryTriggerPeriod : 0U);
       } else if (strncmp(g_console_line, "setcap ", 7) == 0) {
         unsigned hz = 0U;
         if (sscanf(g_console_line + 7, "%u", &hz) == 1) {
@@ -2102,6 +2417,9 @@ void handleConsoleCommands() {
                         (unsigned long)snap.seq,
                         (unsigned long)snap.t_us);
         }
+      } else if (strcmp(g_console_line, "airstate") == 0) {
+        const auto snap = teensy_link::snapshot();
+        printLatestStateSummary(snap);
       } else if (strcmp(g_console_line, "linkclear") == 0) {
         if (isStandaloneBench()) {
           Serial.println("LINKCLEAR skipped reason=bench_mode");
@@ -2165,13 +2483,15 @@ void handleConsoleCommands() {
           cmd.accelerationRejection = a;
           cmd.magneticRejection = m;
           cmd.recoveryTriggerPeriod = (uint16_t)r;
-          teensy_api::CommandAckResult result = {};
-          (void)teensy_api::setFusionSettings(cmd, result);
-          Serial.printf("SETFUSION tx_ok=%u ack_seen=%u ack_ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
-                        result.tx_ok ? 1U : 0U,
-                        result.ack_seen ? 1U : 0U,
-                        result.ack_ok ? 1U : 0U,
-                        (unsigned long)result.ack_code,
+          control_plane::Request request = {};
+          request.category = control_plane::RequestCategory::Fusion;
+          request.action = control_plane::RequestAction::FusionSet;
+          request.command_id = telem::CMD_SET_FUSION_SETTINGS;
+          request.fusion = cmd;
+          const control_plane::Result result = submitConsoleRequest(request);
+          Serial.printf("SETFUSION ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
+                        result.ok ? 1U : 0U,
+                        (unsigned long)result.code,
                         (double)cmd.gain,
                         (double)cmd.accelerationRejection,
                         (double)cmd.magneticRejection,
@@ -2183,10 +2503,12 @@ void handleConsoleCommands() {
         g_quiet_serial = true;
         g_stats_streaming = false;
         radio_link::setVerbose(false);
+        time_service::setVerbose(false);
         Serial.println("QUIET on");
       } else if (strcmp(g_console_line, "quiet off") == 0) {
         g_quiet_serial = false;
         radio_link::setVerbose(true);
+        time_service::setVerbose(true);
         Serial.println("QUIET off");
       } else if (strcmp(g_console_line, "quiet status") == 0) {
         Serial.printf("QUIET enabled=%u airtx=%u stats=%u\r\n",
@@ -2222,16 +2544,18 @@ void beginWifiStation() {
   (void)esp_wifi_set_max_tx_power(78);
   (void)esp_wifi_set_channel(telem::kRadioChannel, WIFI_SECOND_CHAN_NONE);
 
-  Serial.printf("AIR RADIO channel=%u ap=%s lr=%u\n",
-                (unsigned)telem::kRadioChannel,
-                cfg.ap_ssid,
-                (unsigned)(cfg.radio_lr_mode != 0U));
+  if (serialNoiseEnabled()) {
+    Serial.printf("AIR RADIO channel=%u ap=%s lr=%u\n",
+                  (unsigned)telem::kRadioChannel,
+                  cfg.ap_ssid,
+                  (unsigned)(cfg.radio_lr_mode != 0U));
+  }
 }
 
 void restartWifiStation() {
   if (isStandaloneBench()) return;
   const AppConfig& cfg = config_store::get();
-  Serial.println("AIR CMD reset_network");
+  if (serialNoiseEnabled()) Serial.println("AIR CMD reset_network");
   radio_link::resetNetworkState();
   resetWifiStatusFlags();
   WiFi.mode(WIFI_OFF);
@@ -2372,15 +2696,17 @@ void maybeRecoverRadioLink(const teensy_link::Snapshot& snap) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP_AIR boot");
+  if (serialNoiseEnabled()) Serial.println("ESP_AIR boot");
 
   config_store::begin();
   const AppConfig& cfg = config_store::get();
-  Serial.printf("TEENSY LINK cfg(legacy_uart_fields) port=%u rx=%u tx=%u baud=%lu\n",
-                (unsigned)cfg.uart_port,
-                (unsigned)cfg.uart_rx_pin,
-                (unsigned)cfg.uart_tx_pin,
-                (unsigned long)cfg.uart_baud);
+  if (serialNoiseEnabled()) {
+    Serial.printf("TEENSY LINK cfg(legacy_uart_fields) port=%u rx=%u tx=%u baud=%lu\n",
+                  (unsigned)cfg.uart_port,
+                  (unsigned)cfg.uart_rx_pin,
+                  (unsigned)cfg.uart_tx_pin,
+                  (unsigned long)cfg.uart_baud);
+  }
 
   beginWifiStation();
 
@@ -2389,16 +2715,23 @@ void setup() {
   teensy_link::begin(cfg);
   if (!isStandaloneBench()) {
     radio_link::begin(cfg);
+    radio_link::setVerbose(!g_quiet_serial);
   }
   replay_bridge::begin();
   log_store::begin(cfg, air_file_logging_enabled);
+  sd_file_api::begin();
+  time_service::begin();
+  control_plane::begin();
+  time_service::setVerbose(!g_quiet_serial);
   g_console_log_session_id = log_store::highestLogSessionId();
   if (!isStandaloneBench()) {
     radio_link::setRecorderEnabled(air_file_logging_enabled);
   }
-  Serial.printf("AIR INFO recorder=%s\n", air_file_logging_enabled ? "on" : "off");
-  Serial.printf("AIR INFO next_session=%lu\n", (unsigned long)(g_console_log_session_id + 1U));
-  if (isStandaloneBench()) {
+  if (serialNoiseEnabled()) {
+    Serial.printf("AIR INFO recorder=%s\n", air_file_logging_enabled ? "on" : "off");
+    Serial.printf("AIR INFO next_session=%lu\n", (unsigned long)(g_console_log_session_id + 1U));
+  }
+  if (isStandaloneBench() && serialNoiseEnabled()) {
     Serial.println("AIR INFO mode=standalone_bench spi_dma=1 radio=0");
   }
   g_last_stream_rate_ui_hz = 0;
@@ -2406,7 +2739,9 @@ void setup() {
   g_last_stream_rate_tx_ms = 0;
   g_wait_stream_rate_ack = true;
   resetRadioWatchdog();
-  printConsoleHelp();
+  if (serialNoiseEnabled()) {
+    printConsoleHelp();
+  }
 }
 
 void loop() {
@@ -2442,6 +2777,7 @@ void loop() {
 
   const auto snap = teensy_link::snapshot();
   updateTeensyReadiness(snap);
+  time_service::ingestState(snap.state, snap.has_state, millis());
 
   if (g_wait_getfusion_ack && snap.has_ack && snap.ack_command == 101U &&
       snap.ack_rx_seq != g_last_printed_ack_seq) {

@@ -70,9 +70,9 @@ void setDefaults(AppConfig& c) {
   c.uart_rx_pin = 3;
   c.uart_tx_pin = 4;
   c.uart_baud = 921600;
-  c.source_rate_hz = 50;
+  c.source_rate_hz = 10;
   c.ui_rate_hz = 30;
-  c.log_rate_hz = 50;
+  c.log_rate_hz = 10;
   c.log_mode = 1;
   c.radio_state_only = 0;
   c.radio_lr_mode = 1;
@@ -101,7 +101,7 @@ void sanitizeRecordPrefix(char* prefix, size_t len) {
 }
 
 void sanitize(AppConfig& c) {
-  c.source_rate_hz = clampv<uint16_t>(c.source_rate_hz, 50U, 1600U);
+  c.source_rate_hz = clampv<uint16_t>(c.source_rate_hz, 10U, 1600U);
   c.ui_rate_hz = 30U;
   c.log_rate_hz = c.source_rate_hz;
   if (c.max_log_bytes < 512UL * 1024UL) c.max_log_bytes = 512UL * 1024UL;

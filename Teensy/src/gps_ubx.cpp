@@ -66,6 +66,12 @@ void decode_nav_pvt(State& s, const uint8_t* p, uint16_t len) {
   }
 
   s.iTOW = load_u32_le(&p[0]);
+  s.gps_year = (uint16_t)(p[4] | ((uint16_t)p[5] << 8));
+  s.gps_month = p[6];
+  s.gps_day = p[7];
+  s.gps_hour = p[8];
+  s.gps_min = p[9];
+  s.gps_sec = p[10];
   s.fixType = p[20];
   s.numSV = p[23];
   s.lon = load_i32_le(&p[24]);

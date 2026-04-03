@@ -25,28 +25,14 @@ constexpr uint32_t kReplayErrorNoLogFound = 2U;
 constexpr uint32_t kReplayErrorShortRead = 3U;
 constexpr uint32_t kReplayErrorUnsupportedRecord = 4U;
 constexpr uint32_t kReplayErrorSendFailed = 5U;
+constexpr uint32_t kReplayErrorSchemaMismatch = 6U;
 constexpr uint8_t kReplayAverageMax = 32U;
-
-#pragma pack(push, 1)
-struct BinaryLogRecordV2 {
-  uint32_t magic;
-  uint16_t version;
-  uint16_t record_size;
-  uint16_t record_kind;
-  uint16_t reserved;
-  uint32_t seq;
-  uint32_t t_us;
-  uint8_t payload[telem::kReplayRecordBytes];
-};
-#pragma pack(pop)
-
-static_assert(sizeof(BinaryLogRecordV2) == 180U, "BinaryLogRecordV2 must match logger record size");
 
 sd_api::File g_file;
 Status g_status = {};
 bool g_status_dirty = false;
 bool g_have_pending = false;
-BinaryLogRecordV2 g_pending = {};
+telem::BinaryLogRecordV2 g_pending = {};
 bool g_prefer_replay_input = false;
 uint8_t g_average_factor = 1U;
 uint32_t g_next_send_us = 0U;
@@ -64,19 +50,22 @@ uint16_t g_output_source_head = 0U;
 uint16_t g_output_source_tail = 0U;
 uint16_t g_output_source_count = 0U;
 portMUX_TYPE g_output_source_mux = portMUX_INITIALIZER_UNLOCKED;
+bool g_log_metadata_checked = false;
+uint16_t g_log_transfer_schema_id = 0U;
+uint16_t g_log_transfer_schema_version = 0U;
 
 struct StateWindow {
   uint8_t count = 0U;
   uint32_t seq = 0U;
   uint32_t t_us = 0U;
-  telem::TelemetryFullStateV1 latest = {};
+  telem::TelemetryStateRecord latest = {};
 };
 
 struct ReplayInputWindow {
   uint8_t count = 0U;
   uint32_t seq = 0U;
   uint32_t t_us = 0U;
-  telem::ReplayInputRecord160 latest = {};
+  telem::ReplayInputRecord latest = {};
 };
 
 uint8_t clampAverageFactor(uint8_t factor) {
@@ -126,6 +115,9 @@ void resetRuntime(bool preserve_session = true) {
   g_last_progress_report_ms = 0U;
   g_last_record_t_us = 0U;
   g_metadata_source_rate_hz = 0U;
+  g_log_metadata_checked = false;
+  g_log_transfer_schema_id = 0U;
+  g_log_transfer_schema_version = 0U;
   portENTER_CRITICAL(&g_output_source_mux);
   g_output_source_head = 0U;
   g_output_source_tail = 0U;
@@ -143,7 +135,7 @@ bool seekToRecord(uint32_t target_index) {
   if (target_index >= g_status.records_total) {
     target_index = g_status.records_total - 1U;
   }
-  const size_t record_offset = (size_t)target_index * sizeof(BinaryLogRecordV2);
+  const size_t record_offset = (size_t)target_index * sizeof(telem::BinaryLogRecordV2);
   if (!g_file.seek(record_offset)) return false;
   g_have_pending = false;
   g_pending = {};
@@ -215,7 +207,7 @@ bool openLogByName(const String& requested_name, String& out_name) {
 
 bool loadNextRecord() {
   if (!g_file) return false;
-  BinaryLogRecordV2 record = {};
+  telem::BinaryLogRecordV2 record = {};
   size_t total = 0U;
   while (total < sizeof(record)) {
     const size_t got = g_file.read(((uint8_t*)&record) + total, sizeof(record) - total);
@@ -238,6 +230,25 @@ bool loadNextRecord() {
   }
   g_pending = record;
   g_have_pending = true;
+  if ((telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::Metadata) {
+    telem::LogMetadataPayloadV1 metadata = {};
+    memcpy(&metadata, g_pending.payload, sizeof(metadata));
+    g_log_metadata_checked = true;
+    const telem::TransferSchemaDescriptor* logged_schema =
+        telem::findTransferSchema(metadata.transfer_schema_id, metadata.transfer_schema_version);
+    if (!logged_schema || !telem::logMetadataMatchesSchema(metadata, *logged_schema)) {
+      g_status.last_error = kReplayErrorSchemaMismatch;
+      g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
+      markStatusChanged();
+      stop();
+      return false;
+    }
+    g_log_transfer_schema_id = metadata.transfer_schema_id;
+    g_log_transfer_schema_version = metadata.transfer_schema_version;
+    if (metadata.applied_capture_rate_hz != 0U) {
+      g_metadata_source_rate_hz = metadata.applied_capture_rate_hz;
+    }
+  }
   return true;
 }
 
@@ -245,7 +256,7 @@ bool preferReplayInputSource() {
   if (!g_file) return false;
   const uint32_t saved_pos = (uint32_t)g_file.position();
   if (!g_file.seek(0U)) return false;
-  BinaryLogRecordV2 record = {};
+  telem::BinaryLogRecordV2 record = {};
   uint32_t state_count = 0U;
   uint32_t replay_input_count = 0U;
   while (g_file.read((uint8_t*)&record, sizeof(record)) == sizeof(record)) {
@@ -253,12 +264,12 @@ bool preferReplayInputSource() {
       break;
     }
     switch ((telem::LogRecordKind)record.record_kind) {
-      case telem::LogRecordKind::State160:
+      case telem::LogRecordKind::State:
         state_count++;
         break;
-      case telem::LogRecordKind::Metadata160:
+      case telem::LogRecordKind::Metadata:
         break;
-      case telem::LogRecordKind::ReplayInput160:
+      case telem::LogRecordKind::ReplayInput:
         replay_input_count++;
         break;
       default:
@@ -275,14 +286,21 @@ uint16_t findReplaySourceRateHz() {
   if (!g_file) return 0U;
   const uint32_t saved_pos = (uint32_t)g_file.position();
   if (!g_file.seek(0U)) return 0U;
-  BinaryLogRecordV2 record = {};
+  telem::BinaryLogRecordV2 record = {};
   uint16_t found_hz = 0U;
   while (g_file.read((uint8_t*)&record, sizeof(record)) == sizeof(record)) {
     if (record.magic != kLogMagic || record.version != kLogVersion || record.record_size != sizeof(record)) {
       break;
     }
-    if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::ReplayControl160) continue;
-    telem::ReplayControlRecord160 replay = {};
+    const telem::LogRecordKind kind = (telem::LogRecordKind)record.record_kind;
+    if (kind == telem::LogRecordKind::Metadata) {
+      telem::LogMetadataPayloadV1 metadata = {};
+      memcpy(&metadata, record.payload, sizeof(metadata));
+      if (metadata.applied_capture_rate_hz != 0U) found_hz = metadata.applied_capture_rate_hz;
+      continue;
+    }
+    if (kind != telem::LogRecordKind::ReplayControl) continue;
+    telem::ReplayControlRecord replay = {};
     memcpy(&replay, record.payload, sizeof(replay));
     if (replay.payload.command_id != telem::CMD_SET_CAPTURE_SETTINGS) continue;
     if (replay.payload.payload_len < sizeof(telem::CmdSetCaptureSettingsV1)) continue;
@@ -294,24 +312,105 @@ uint16_t findReplaySourceRateHz() {
   return found_hz;
 }
 
-bool decodeStateRecord(const BinaryLogRecordV2& record, telem::TelemetryFullStateV1& state) {
-  if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::State160) return false;
+bool decodeStateRecord(const telem::BinaryLogRecordV2& record, telem::TelemetryStateRecord& state) {
+  if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::State) return false;
+  memset(&state, 0, sizeof(state));
+  if (g_log_transfer_schema_id == TELEM_SCHEMA_ID_RELEASE_0_02 ||
+      g_log_transfer_schema_version == 1U) {
+    telem::TelemetryFullStateV1 state_v1 = {};
+    memcpy(&state_v1, record.payload, sizeof(state_v1));
+    state.roll_deg = state_v1.roll_deg;
+    state.pitch_deg = state_v1.pitch_deg;
+    state.yaw_deg = state_v1.yaw_deg;
+    state.mag_heading_deg = state_v1.mag_heading_deg;
+    state.iTOW_ms = state_v1.iTOW_ms;
+    state.fixType = state_v1.fixType;
+    state.numSV = state_v1.numSV;
+    state.lat_1e7 = state_v1.lat_1e7;
+    state.lon_1e7 = state_v1.lon_1e7;
+    state.hMSL_mm = state_v1.hMSL_mm;
+    state.gSpeed_mms = state_v1.gSpeed_mms;
+    state.headMot_1e5deg = state_v1.headMot_1e5deg;
+    state.hAcc_mm = state_v1.hAcc_mm;
+    state.sAcc_mms = state_v1.sAcc_mms;
+    state.gps_parse_errors = state_v1.gps_parse_errors;
+    state.mirror_tx_ok = state_v1.mirror_tx_ok;
+    state.mirror_drop_count = state_v1.mirror_drop_count;
+    state.last_gps_ms = state_v1.last_gps_ms;
+    state.last_imu_ms = state_v1.last_imu_ms;
+    state.last_baro_ms = state_v1.last_baro_ms;
+    state.baro_temp_c = state_v1.baro_temp_c;
+    state.baro_press_hpa = state_v1.baro_press_hpa;
+    state.baro_alt_m = state_v1.baro_alt_m;
+    state.baro_vsi_mps = state_v1.baro_vsi_mps;
+    state.fusion_gain = state_v1.fusion_gain;
+    state.fusion_accel_rej = state_v1.fusion_accel_rej;
+    state.fusion_mag_rej = state_v1.fusion_mag_rej;
+    state.fusion_recovery_period = state_v1.fusion_recovery_period;
+    state.flags = state_v1.flags;
+    state.accel_x_mps2 = state_v1.accel_x_mps2;
+    state.accel_y_mps2 = state_v1.accel_y_mps2;
+    state.accel_z_mps2 = state_v1.accel_z_mps2;
+    state.gyro_x_dps = state_v1.gyro_x_dps;
+    state.gyro_y_dps = state_v1.gyro_y_dps;
+    state.gyro_z_dps = state_v1.gyro_z_dps;
+    state.mag_x_uT = state_v1.mag_x_uT;
+    state.mag_y_uT = state_v1.mag_y_uT;
+    state.mag_z_uT = state_v1.mag_z_uT;
+    state.raw_present_mask = state_v1.raw_present_mask;
+    return true;
+  }
   memcpy(&state, record.payload, sizeof(state));
   return true;
 }
 
-bool decodeReplayInputRecord(const BinaryLogRecordV2& record, telem::ReplayInputRecord160& replay) {
-  if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::ReplayInput160) return false;
+bool decodeReplayInputRecord(const telem::BinaryLogRecordV2& record, telem::ReplayInputRecord& replay) {
+  if ((telem::LogRecordKind)record.record_kind != telem::LogRecordKind::ReplayInput) return false;
+  memset(&replay, 0, sizeof(replay));
+  if (g_log_transfer_schema_id == TELEM_SCHEMA_ID_RELEASE_0_02 ||
+      g_log_transfer_schema_version == 1U) {
+    telem::ReplayInputRecord160 replay_v1 = {};
+    memcpy(&replay_v1, record.payload, sizeof(replay_v1));
+    replay.hdr = replay_v1.hdr;
+    replay.payload.present_mask = replay_v1.payload.present_mask;
+    replay.payload.source_flags = replay_v1.payload.source_flags;
+    replay.payload.imu_seq = replay_v1.payload.imu_seq;
+    replay.payload.gps_seq = replay_v1.payload.gps_seq;
+    replay.payload.baro_seq = replay_v1.payload.baro_seq;
+    memcpy(replay.payload.accel_milli_mps2, replay_v1.payload.accel_milli_mps2,
+           sizeof(replay.payload.accel_milli_mps2));
+    memcpy(replay.payload.gyro_milli_dps, replay_v1.payload.gyro_milli_dps,
+           sizeof(replay.payload.gyro_milli_dps));
+    memcpy(replay.payload.mag_milli_uT, replay_v1.payload.mag_milli_uT,
+           sizeof(replay.payload.mag_milli_uT));
+    replay.payload.iTOW_ms = replay_v1.payload.iTOW_ms;
+    replay.payload.fixType = replay_v1.payload.fixType;
+    replay.payload.numSV = replay_v1.payload.numSV;
+    replay.payload.gps_flags = replay_v1.payload.gps_flags;
+    replay.payload.lat_1e7 = replay_v1.payload.lat_1e7;
+    replay.payload.lon_1e7 = replay_v1.payload.lon_1e7;
+    replay.payload.hMSL_mm = replay_v1.payload.hMSL_mm;
+    replay.payload.gSpeed_mms = replay_v1.payload.gSpeed_mms;
+    replay.payload.headMot_1e5deg = replay_v1.payload.headMot_1e5deg;
+    replay.payload.hAcc_mm = replay_v1.payload.hAcc_mm;
+    replay.payload.sAcc_mms = replay_v1.payload.sAcc_mms;
+    replay.payload.baro_temp_milli_c = replay_v1.payload.baro_temp_milli_c;
+    replay.payload.baro_press_milli_hpa = replay_v1.payload.baro_press_milli_hpa;
+    replay.payload.baro_alt_mm = replay_v1.payload.baro_alt_mm;
+    replay.payload.baro_vsi_milli_mps = replay_v1.payload.baro_vsi_milli_mps;
+    memcpy(replay.payload.reserved, replay_v1.payload.reserved, sizeof(replay_v1.payload.reserved));
+    return true;
+  }
   memcpy(&replay, record.payload, sizeof(replay));
   return true;
 }
 
 bool isSkippableRecordKind(telem::LogRecordKind kind) {
-  return kind == telem::LogRecordKind::Metadata160;
+  return kind == telem::LogRecordKind::Metadata;
 }
 
-void beginStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
-                      const telem::TelemetryFullStateV1& state) {
+void beginStateWindow(StateWindow& window, const telem::BinaryLogRecordV2& record,
+                      const telem::TelemetryStateRecord& state) {
   window = {};
   window.count = 1U;
   window.seq = record.seq;
@@ -319,16 +418,16 @@ void beginStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
   window.latest = state;
 }
 
-void extendStateWindow(StateWindow& window, const BinaryLogRecordV2& record,
-                       const telem::TelemetryFullStateV1& state) {
+void extendStateWindow(StateWindow& window, const telem::BinaryLogRecordV2& record,
+                       const telem::TelemetryStateRecord& state) {
   window.count++;
   window.seq = record.seq;
   window.t_us = record.t_us;
   window.latest = state;
 }
 
-bool fillReplayInputFromState(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us,
-                              telem::ReplayInputRecord160& replay) {
+bool fillReplayInputFromState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us,
+                              telem::ReplayInputRecord& replay) {
   memset(&replay, 0, sizeof(replay));
 
   replay.hdr.magic = telem::kReplayMagic;
@@ -353,6 +452,17 @@ bool fillReplayInputFromState(const telem::TelemetryFullStateV1& state, uint32_t
   replay.payload.mag_milli_uT[1] = (int32_t)lroundf(state.mag_y_uT * 1000.0f);
   replay.payload.mag_milli_uT[2] = (int32_t)lroundf(state.mag_z_uT * 1000.0f);
   replay.payload.iTOW_ms = state.iTOW_ms;
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  {
+    const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(state);
+    replay.payload.gps_year = gps_time.year;
+    replay.payload.gps_month = gps_time.month;
+    replay.payload.gps_day = gps_time.day;
+    replay.payload.gps_hour = gps_time.hour;
+    replay.payload.gps_min = gps_time.minute;
+    replay.payload.gps_sec = gps_time.second;
+  }
+#endif
   replay.payload.fixType = state.fixType;
   replay.payload.numSV = state.numSV;
   replay.payload.gps_flags = state.flags;
@@ -373,13 +483,13 @@ bool fillReplayInputFromState(const telem::TelemetryFullStateV1& state, uint32_t
   return true;
 }
 
-bool fillReplayInputFromWindow(const StateWindow& window, telem::ReplayInputRecord160& replay) {
+bool fillReplayInputFromWindow(const StateWindow& window, telem::ReplayInputRecord& replay) {
   if (window.count == 0U) return false;
   return fillReplayInputFromState(window.latest, window.seq, window.t_us, replay);
 }
 
-void beginReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& record,
-                            const telem::ReplayInputRecord160& replay) {
+void beginReplayInputWindow(ReplayInputWindow& window, const telem::BinaryLogRecordV2& record,
+                            const telem::ReplayInputRecord& replay) {
   window = {};
   window.count = 1U;
   window.seq = record.seq;
@@ -387,15 +497,15 @@ void beginReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& 
   window.latest = replay;
 }
 
-void extendReplayInputWindow(ReplayInputWindow& window, const BinaryLogRecordV2& record,
-                             const telem::ReplayInputRecord160& replay) {
+void extendReplayInputWindow(ReplayInputWindow& window, const telem::BinaryLogRecordV2& record,
+                             const telem::ReplayInputRecord& replay) {
   window.count++;
   window.seq = record.seq;
   window.t_us = record.t_us;
   window.latest = replay;
 }
 
-bool fillReplayInputFromWindow(const ReplayInputWindow& window, telem::ReplayInputRecord160& replay) {
+bool fillReplayInputFromWindow(const ReplayInputWindow& window, telem::ReplayInputRecord& replay) {
   if (window.count == 0U) return false;
   replay = window.latest;
   replay.hdr.seq = window.seq;
@@ -425,16 +535,16 @@ bool sendPendingRecord() {
   }
 
   while (g_have_pending && g_prefer_replay_input &&
-         (telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State160) {
+         (telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State) {
     g_have_pending = false;
     g_status.records_sent++;
     if (!loadNextRecord()) return true;
   }
 
   switch ((telem::LogRecordKind)g_pending.record_kind) {
-    case telem::LogRecordKind::ReplayInput160: {
+    case telem::LogRecordKind::ReplayInput: {
       ReplayInputWindow window = {};
-      telem::ReplayInputRecord160 replay = {};
+      telem::ReplayInputRecord replay = {};
       if (!decodeReplayInputRecord(g_pending, replay)) {
         g_status.last_error = kReplayErrorUnsupportedRecord;
         return false;
@@ -450,12 +560,12 @@ bool sendPendingRecord() {
           g_status.records_sent++;
           continue;
         }
-        if ((telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State160 && g_prefer_replay_input) {
+        if ((telem::LogRecordKind)g_pending.record_kind == telem::LogRecordKind::State && g_prefer_replay_input) {
           g_have_pending = false;
           g_status.records_sent++;
           continue;
         }
-        if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::ReplayInput160) {
+        if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::ReplayInput) {
           break;
         }
         if (!decodeReplayInputRecord(g_pending, replay)) {
@@ -487,9 +597,9 @@ bool sendPendingRecord() {
       finishSentRecord(window.t_us);
       break;
     }
-    case telem::LogRecordKind::State160: {
+    case telem::LogRecordKind::State: {
       StateWindow window = {};
-      telem::TelemetryFullStateV1 state = {};
+      telem::TelemetryStateRecord state = {};
       if (!decodeStateRecord(g_pending, state)) {
         g_status.last_error = kReplayErrorUnsupportedRecord;
         return false;
@@ -505,7 +615,7 @@ bool sendPendingRecord() {
           g_status.records_sent++;
           continue;
         }
-        if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::State160) {
+        if ((telem::LogRecordKind)g_pending.record_kind != telem::LogRecordKind::State) {
           break;
         }
         if (!decodeStateRecord(g_pending, state)) {
@@ -516,7 +626,7 @@ bool sendPendingRecord() {
         g_have_pending = false;
       }
 
-      telem::ReplayInputRecord160 replay = {};
+      telem::ReplayInputRecord replay = {};
       if (!fillReplayInputFromWindow(window, replay)) {
         g_status.last_error = kReplayErrorUnsupportedRecord;
         return false;
@@ -538,8 +648,8 @@ bool sendPendingRecord() {
       finishSentRecord(window.t_us);
       break;
     }
-    case telem::LogRecordKind::ReplayControl160: {
-      telem::ReplayControlRecord160 replay = {};
+    case telem::LogRecordKind::ReplayControl: {
+      telem::ReplayControlRecord replay = {};
       memcpy(&replay, g_pending.payload, sizeof(replay));
       if (!teensy_link::sendReplayControlRecord(replay)) {
         g_status.last_error = kReplayErrorSendFailed;
@@ -610,7 +720,7 @@ bool startLatest() {
   }
 
   g_status.session_id = g_next_session_id++;
-  g_status.records_total = (uint32_t)(g_file.size() / sizeof(BinaryLogRecordV2));
+  g_status.records_total = (uint32_t)(g_file.size() / sizeof(telem::BinaryLogRecordV2));
   g_status.records_sent = 0U;
   g_status.last_error = 0U;
   g_status.last_command = telem::CMD_REPLAY_START;
@@ -634,7 +744,7 @@ bool startFile(const String& file_name) {
   }
 
   g_status.session_id = g_next_session_id++;
-  g_status.records_total = (uint32_t)(g_file.size() / sizeof(BinaryLogRecordV2));
+  g_status.records_total = (uint32_t)(g_file.size() / sizeof(telem::BinaryLogRecordV2));
   g_status.records_sent = 0U;
   g_status.last_error = 0U;
   g_status.last_command = telem::CMD_REPLAY_START;

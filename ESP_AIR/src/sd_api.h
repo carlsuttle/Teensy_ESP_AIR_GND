@@ -21,6 +21,7 @@ class File {
   const char* name();
   size_t size();
   size_t position();
+  time_t getLastWrite();
   bool seek(size_t pos);
   size_t read(uint8_t* dst, size_t len);
   size_t write(const uint8_t* src, size_t len);

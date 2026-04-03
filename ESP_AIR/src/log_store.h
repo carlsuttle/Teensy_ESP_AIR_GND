@@ -54,6 +54,10 @@ struct RecorderStatus {
   uint32_t init_hz = 0;
 };
 
+using LogFileEnumerateCallback = bool (*)(const telem::LogFileInfoV1& entry,
+                                          uint16_t index,
+                                          void* ctx);
+
 void begin(const AppConfig& cfg, bool enabled = true);
 void setConfig(const AppConfig& cfg);
 void setEnabled(bool enabled);
@@ -65,8 +69,8 @@ void clearNextSessionMetadata();
 bool startSession(uint32_t session_id);
 void stopSession();
 void poll();
-void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state);
-void enqueueReplayInput(uint32_t seq, uint32_t t_us, const telem::ReplayInputRecord160& replay);
+void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryStateRecord& state);
+void enqueueReplayInput(uint32_t seq, uint32_t t_us, const telem::ReplayInputRecord& replay);
 void enqueueReplayControl(uint16_t command_id, uint32_t seq, uint32_t t_us,
                           const void* payload, uint16_t payload_len, uint32_t apply_flags);
 bool active();
@@ -81,6 +85,17 @@ bool listFiles(telem::LogFileInfoV1* out_files, uint16_t max_files, uint16_t off
                uint16_t& total_files, uint16_t& returned_files,
                FileSortKey sort_key = FileSortKey::date,
                FileSortDirection sort_dir = FileSortDirection::descending);
+bool listFilesSnapshot(telem::LogFileInfoV1*& out_files,
+                       uint16_t& total_files,
+                       FileSortKey sort_key = FileSortKey::date,
+                       FileSortDirection sort_dir = FileSortDirection::descending);
+void freeFilesSnapshot(telem::LogFileInfoV1* files);
+bool enumerateManagedLogFiles(LogFileEnumerateCallback cb, void* ctx, uint16_t& total_files);
+bool listFilesPage(telem::LogFileInfoV1* out_files,
+                   uint16_t max_files,
+                   uint16_t offset,
+                   uint16_t& returned_files,
+                   bool& has_more);
 bool deleteFileByName(const String& name);
 bool renameFileByName(const String& src_name, const String& dst_name);
 bool isSafeName(const String& name);

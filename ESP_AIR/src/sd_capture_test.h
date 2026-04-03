@@ -41,7 +41,7 @@ void begin();
 bool start(uint32_t duration_ms);
 void stop(bool timed_out = false);
 void poll();
-void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryFullStateV1& state);
+void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryStateRecord& state);
 Stats stats();
 void clearCompleted();
 void printReport(Stream& out, const Stats& stats);

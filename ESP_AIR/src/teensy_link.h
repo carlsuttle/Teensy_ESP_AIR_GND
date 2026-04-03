@@ -24,7 +24,7 @@ struct RxStats {
 
 struct Snapshot {
   bool has_state;
-  telem::TelemetryFullStateV1 state;
+  telem::TelemetryStateRecord state;
   uint32_t seq;
   uint32_t t_us;
   bool has_fusion_settings;
@@ -39,7 +39,7 @@ struct Snapshot {
 };
 
 struct PendingState {
-  telem::TelemetryFullStateV1 state;
+  telem::TelemetryStateRecord state;
   uint32_t seq;
   uint32_t t_us;
 };
@@ -68,8 +68,8 @@ bool sendSetCaptureSettings(const telem::CmdSetCaptureSettingsV1& cmd);
 bool sendSaveCaptureSettings();
 bool sendGetFusionSettings();
 bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd);
-bool sendReplayInputRecord(const telem::ReplayInputRecord160& record);
-bool sendReplayControlRecord(const telem::ReplayControlRecord160& record);
+bool sendReplayInputRecord(const telem::ReplayInputRecord& record);
+bool sendReplayControlRecord(const telem::ReplayControlRecord& record);
 bool probeRxPin(uint8_t rx_pin, uint32_t baud, uint32_t dwell_ms, uint32_t& out_bytes);
 
 }  // namespace teensy_link

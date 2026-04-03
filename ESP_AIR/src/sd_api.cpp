@@ -24,6 +24,10 @@ size_t File::position() {
   return file_ ? (size_t)file_.position() : 0U;
 }
 
+time_t File::getLastWrite() {
+  return file_ ? file_.getLastWrite() : (time_t)0;
+}
+
 bool File::seek(size_t pos) {
   return file_ && file_.seek(pos);
 }

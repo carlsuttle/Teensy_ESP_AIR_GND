@@ -94,7 +94,7 @@ void getSourceFlowSnapshot(SourceFlowSnapshot& out);
 void setReplayMode(bool active);
 bool replayMode();
 bool takeReplayDebug(FusionReplayDebug& out);
-bool takeRawReplayInput(telem::ReplayInputRecord160& out);
+bool takeRawReplayInput(telem::ReplayInputRecord& out);
 bool submitReplaySample(float ax_mps2, float ay_mps2, float az_mps2,
                         float gx_dps, float gy_dps, float gz_dps,
                         float mx_uT, float my_uT, float mz_uT,

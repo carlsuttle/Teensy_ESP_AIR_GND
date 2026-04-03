@@ -11,7 +11,7 @@ namespace {
 
 constexpr uint16_t kDefaultStreamRateHz = 50U;
 constexpr uint16_t kDefaultLogRateHz = 50U;
-constexpr size_t kRecordBytes = sizeof(telem::TelemetryFullStateV1);
+constexpr size_t kRecordBytes = sizeof(telem::TelemetryStateRecord);
 constexpr uint32_t kReplayIdleTimeoutMs = 250U;
 constexpr uint8_t kReplayOutputQueueDepth = 64U;
 
@@ -113,7 +113,7 @@ void applyFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
       cmd.gain, cmd.accelerationRejection, cmd.magneticRejection, cmd.recoveryTriggerPeriod);
 }
 
-void handleReplayControl(const telem::ReplayControlRecord160& replay) {
+void handleReplayControl(const telem::ReplayControlRecord& replay) {
   const uint8_t* payload = replay.payload.payload;
   switch (replay.payload.command_id) {
     case telem::CMD_SET_FUSION_SETTINGS: {
@@ -192,9 +192,9 @@ void queueReplayOutputMeta(const ReplayOutputMeta& meta) {
   g_replay_perf.queue_meta.record(micros() - start_us);
 }
 
-void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
+void applyReplayInput(State& s, const telem::ReplayInputRecord& replay) {
   const uint32_t start_us = micros();
-  const telem::ReplayInputPayloadV1& p = replay.payload;
+  const auto& p = replay.payload;
   ReplayInputMetaV1 meta = {};
   memcpy(&meta, p.reserved, sizeof(meta));
   const uint32_t now_ms = millis();
@@ -219,6 +219,16 @@ void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
 
   if ((p.present_mask & telem::kSensorPresentGps) != 0U) {
     s.iTOW = p.iTOW_ms;
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+    {
+      s.gps_year = p.gps_year;
+      s.gps_month = p.gps_month;
+      s.gps_day = p.gps_day;
+      s.gps_hour = p.gps_hour;
+      s.gps_min = p.gps_min;
+      s.gps_sec = p.gps_sec;
+    }
+#endif
     s.fixType = p.fixType;
     s.numSV = p.numSV;
     s.lat = p.lat_1e7;
@@ -247,6 +257,16 @@ void applyReplayInput(State& s, const telem::ReplayInputRecord160& replay) {
   out.last_baro_ms = meta.last_baro_ms;
   out.present_mask = p.present_mask;
   out.iTOW_ms = p.iTOW_ms;
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  {
+    out.gps_year = p.gps_year;
+    out.gps_month = p.gps_month;
+    out.gps_day = p.gps_day;
+    out.gps_hour = p.gps_hour;
+    out.gps_min = p.gps_min;
+    out.gps_sec = p.gps_sec;
+  }
+#endif
   out.fixType = p.fixType;
   out.numSV = p.numSV;
   out.lat_1e7 = p.lat_1e7;
@@ -313,12 +333,24 @@ bool sendFastState(const State& s, uint32_t seq, uint32_t t_us,
   const uint32_t send_start_us = micros();
   (void)seq;
   (void)t_us;
-  telem::TelemetryFullStateV1 payload = {};
+  telem::TelemetryStateRecord payload = {};
   payload.roll_deg = s.roll;
   payload.pitch_deg = s.pitch;
   payload.yaw_deg = s.yaw;
   payload.mag_heading_deg = s.mag_heading;
   payload.iTOW_ms = replay_meta ? replay_meta->iTOW_ms : s.iTOW;
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  {
+    telem::GpsCalendarTime gps_time = {};
+    gps_time.year = replay_meta ? replay_meta->gps_year : s.gps_year;
+    gps_time.month = replay_meta ? replay_meta->gps_month : s.gps_month;
+    gps_time.day = replay_meta ? replay_meta->gps_day : s.gps_day;
+    gps_time.hour = replay_meta ? replay_meta->gps_hour : s.gps_hour;
+    gps_time.minute = replay_meta ? replay_meta->gps_min : s.gps_min;
+    gps_time.second = replay_meta ? replay_meta->gps_sec : s.gps_sec;
+    telem::setGpsCalendarTime(payload, gps_time);
+  }
+#endif
   payload.fixType = replay_meta ? replay_meta->fixType : s.fixType;
   payload.numSV = replay_meta ? replay_meta->numSV : s.numSV;
   payload.lat_1e7 = replay_meta ? replay_meta->lat_1e7 : s.lat;
@@ -419,7 +451,7 @@ void pollRx(State& s) {
     if (hdr.kind == (uint8_t)telem::ReplayRecordKind::Input) {
       g_dbg.replayInputFrames++;
       replay_inputs++;
-      telem::ReplayInputRecord160 replay = {};
+      telem::ReplayInputRecord replay = {};
       memcpy(&replay, record, sizeof(replay));
       applyReplayInput(s, replay);
       continue;
@@ -428,7 +460,7 @@ void pollRx(State& s) {
     if (hdr.kind == (uint8_t)telem::ReplayRecordKind::Control) {
       g_dbg.replayControlFrames++;
       replay_ctrls++;
-      telem::ReplayControlRecord160 replay = {};
+      telem::ReplayControlRecord replay = {};
       memcpy(&replay, record, sizeof(replay));
       handleReplayControl(replay);
       continue;

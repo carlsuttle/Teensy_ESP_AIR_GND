@@ -21,6 +21,65 @@ Current head:
 - Core Teensy API validation scripts are passing again when run from this baseline.
 - Baseline-lock protocol has been added to project governance documentation and manifest.
 
+### Current 0.03 Proven Backend State
+
+The following backend/platform pieces are now present and should be treated as available infrastructure for the current `0.03` cycle:
+
+- Teensy DMA-backed capture / transport API is in place and remains the validated fast path.
+- schema-defined bidirectional transport between AIR and GND is in place and tested.
+- AIR-owned SD API is in place and is the authoritative backend for:
+  - file listing
+  - file paging
+  - file delete / rename / CSV export
+  - storage readiness / mount / eject
+  - mode-aware inhibition and SD result codes
+- AIR-owned GPS-derived UTC time service is in place for filesystem timestamps and browser-visible time-valid state.
+- AIR-owned control-plane work has started so AIR-side control paths can converge on one shared backend abstraction instead of interface-local logic.
+
+### Current 0.03 Proven Stage 2 Telemetry Route
+
+The current single-client Stage 2 browser telemetry route has been measured at both `10 Hz` and `30 Hz` over the `ESP-NOW` AIR -> GND path and did not materially worsen the validated Teensy/AIR replay envelope at the existing `50Hz x 48` operating point.
+
+What is proven for that route:
+
+- AIR -> GND `ESP-NOW` live route is functioning with schema v2 active.
+- bidirectional command / acknowledgement transport is functioning over the same schema-defined link.
+- one browser client on GND is acceptable at `10 Hz`
+- one browser client on GND is also acceptable at `30 Hz`
+- the measured browser path did not materially affect:
+  - validated replay throughput
+  - queue headroom metrics
+  - CRC / type integrity
+  - the established record / replay / live proof envelope
+
+Interpretation:
+
+- the Stage 2 browser telemetry path is acceptable as a single-client engineering GUI route at both tested rates
+- this does not mean all browser control / SD operations are fully optimized yet
+- it does mean the basic telemetry fan-out route itself is no longer the primary performance concern relative to the validated AIR/Teensy record-replay path
+
+### Other Useful 0.03 Rework Already Available
+
+In addition to the measured `ESP-NOW` browser telemetry route, the following reusable pieces now exist from this rework and should be considered available rather than speculative:
+
+- shared schema-selection infrastructure for the active build
+- schema v2 state carrying GPS calendar/time
+- Stage 2 field contract:
+  - [docs/STAGE2_FIELD_CONTRACT_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/STAGE2_FIELD_CONTRACT_0.03.md)
+- SD API contract:
+  - [docs/SD_API_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/SD_API_0.03.md)
+- time-service contract:
+  - [docs/TIME_SERVICE_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/TIME_SERVICE_0.03.md)
+- AIR control-plane design:
+  - [docs/AIR_CONTROL_PLANE_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/AIR_CONTROL_PLANE_0.03.md)
+
+Practical meaning:
+
+- file and storage operations now have an AIR-owned backend contract instead of being only console-side behavior
+- browser/GND file-list work can use bounded pages rather than one giant blocking dump
+- GPS-derived UTC timestamps are available for file metadata once AIR time becomes valid
+- the repo now has enough documented backend structure to keep future UI/control work thinner and more deterministic
+
 Key confirmation runs:
 
 - `run_teensy_api_exerciser.ps1`:

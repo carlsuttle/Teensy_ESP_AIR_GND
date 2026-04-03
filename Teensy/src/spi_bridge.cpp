@@ -3,12 +3,13 @@
 #include <DMAChannel.h>
 #include <string.h>
 
+#include "types_shared.h"
+
 namespace spi_bridge {
 namespace {
 
 constexpr uint32_t kMsgMagic = 0x53504931UL;
 constexpr uint16_t kProtocolVersion = 1U;
-constexpr uint16_t kRecordBytes = 160U;
 constexpr uint16_t kTransactionBytes = 8192U;
 constexpr uint16_t kTxRingDepth = 512U;
 constexpr uint16_t kRxRingDepth = 512U;
@@ -21,6 +22,14 @@ constexpr uint8_t kReadyOut = 2U;
 constexpr uint32_t kLpspiClearFlags = LPSPI_SR_DMF | LPSPI_SR_REF | LPSPI_SR_TEF |
                                       LPSPI_SR_TCF | LPSPI_SR_FCF | LPSPI_SR_WCF |
                                       LPSPI_SR_RDF | LPSPI_SR_TDF;
+constexpr uint16_t kStateRecordBytes = telem::kActiveStateRecordBytes;
+constexpr uint16_t kReplayInputRecordBytes = telem::kActiveReplayInputRecordBytes;
+constexpr uint16_t kReplayControlRecordBytes = telem::kActiveReplayControlRecordBytes;
+constexpr bool kUniformTransportRecordBytes = kStateRecordBytes == kReplayInputRecordBytes &&
+                                              kStateRecordBytes == kReplayControlRecordBytes;
+static_assert(kUniformTransportRecordBytes,
+              "Teensy SPI bridge fast path currently requires equal active transport record sizes");
+constexpr uint16_t kTransportRecordBytes = kStateRecordBytes;
 
 #pragma pack(push, 1)
 struct SpiMsgHeader {
@@ -46,7 +55,7 @@ struct StatusPayload {
 #pragma pack(pop)
 
 constexpr size_t kMaxPayloadBytes = kTransactionBytes - sizeof(SpiMsgHeader);
-constexpr uint16_t kMaxRecordsPerPayload = (uint16_t)(kMaxPayloadBytes / kRecordBytes);
+constexpr uint16_t kMaxRecordsPerPayload = (uint16_t)(kMaxPayloadBytes / kTransportRecordBytes);
 
 enum MsgType : uint16_t {
   kMsgNone = 0U,
@@ -73,7 +82,7 @@ class RecordRing {
     noInterrupts();
     const uint16_t next = (uint16_t)((head_ + 1U) & (kTxRingDepth - 1U));
     if (next != tail_) {
-      memcpy(storage_[head_], record_bytes, kRecordBytes);
+      memcpy(storage_[head_], record_bytes, kTransportRecordBytes);
       head_ = next;
       const uint16_t occ = (uint16_t)((head_ - tail_) & (kTxRingDepth - 1U));
       if (occ > max_occupancy_) max_occupancy_ = occ;
@@ -88,7 +97,7 @@ class RecordRing {
     bool ok = false;
     noInterrupts();
     if (tail_ != head_) {
-      memcpy(out, storage_[tail_], kRecordBytes);
+      memcpy(out, storage_[tail_], kTransportRecordBytes);
       tail_ = (uint16_t)((tail_ + 1U) & (kTxRingDepth - 1U));
       ok = true;
     }
@@ -137,15 +146,8 @@ class RecordRing {
     interrupts();
   }
 
-  bool empty() const {
-    noInterrupts();
-    const bool empty = head_ == tail_;
-    interrupts();
-    return empty;
-  }
-
  private:
-  alignas(4) uint8_t storage_[kTxRingDepth][kRecordBytes] = {};
+  alignas(4) uint8_t storage_[kTxRingDepth][kTransportRecordBytes] = {};
   volatile uint16_t head_ = 0U;
   volatile uint16_t tail_ = 0U;
   uint16_t max_occupancy_ = 0U;
@@ -307,7 +309,7 @@ void buildTxFrame() {
   // connected but permanently stale.
   if (g_state_tx_ring.peekContiguous(src, contiguous) && contiguous != 0U) {
     const uint16_t records_to_send = (contiguous < kMaxRecordsPerPayload) ? contiguous : kMaxRecordsPerPayload;
-    const uint16_t payload_len = (uint16_t)(records_to_send * kRecordBytes);
+    const uint16_t payload_len = (uint16_t)(records_to_send * kTransportRecordBytes);
     memcpy(payload, src, payload_len);
     header->type = kMsgStateData;
     header->payload_len = payload_len;
@@ -318,7 +320,7 @@ void buildTxFrame() {
 
   if (g_raw_tx_ring.peekContiguous(src, contiguous) && contiguous != 0U) {
     const uint16_t records_to_send = (contiguous < kMaxRecordsPerPayload) ? contiguous : kMaxRecordsPerPayload;
-    const uint16_t payload_len = (uint16_t)(records_to_send * kRecordBytes);
+    const uint16_t payload_len = (uint16_t)(records_to_send * kTransportRecordBytes);
     memcpy(payload, src, payload_len);
     header->type = kMsgReplayInputData;
     header->payload_len = payload_len;
@@ -357,11 +359,11 @@ void parseRxFrame() {
   }
 
   if (header->type == kMsgReplayData) {
-    if (header->payload_len == 0U || (header->payload_len % kRecordBytes) != 0U) {
+    if (header->payload_len == 0U || (header->payload_len % kTransportRecordBytes) != 0U) {
       g_stats.rx_type_errors++;
       return;
     }
-    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kRecordBytes)) {
+    for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kTransportRecordBytes)) {
       if (!g_replay_rx_ring.push(payload + offset)) {
         g_stats.rx_overflows++;
         continue;
@@ -463,21 +465,21 @@ void poll() {
 }
 
 bool pushStateRecord(const uint8_t* record_bytes, size_t len) {
-  if (!record_bytes || len != kRecordBytes) return false;
+  if (!record_bytes || len != kStateRecordBytes) return false;
   const bool ok = g_state_tx_ring.push(record_bytes);
   if (!ok) g_stats.tx_overflows++;
   return ok;
 }
 
 bool pushRawRecord(const uint8_t* record_bytes, size_t len) {
-  if (!record_bytes || len != kRecordBytes) return false;
+  if (!record_bytes || len != kReplayInputRecordBytes) return false;
   const bool ok = g_raw_tx_ring.push(record_bytes);
   if (!ok) g_stats.tx_overflows++;
   return ok;
 }
 
 bool popReplayRecord(uint8_t* record_out, size_t len) {
-  if (!record_out || len != kRecordBytes) return false;
+  if (!record_out || len != kReplayControlRecordBytes) return false;
   return g_replay_rx_ring.pop(record_out);
 }
 
@@ -506,6 +508,3 @@ void resetStats() {
 }
 
 }  // namespace spi_bridge
-
-
-

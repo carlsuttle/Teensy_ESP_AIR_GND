@@ -17,7 +17,7 @@ uint32_t g_local_state_seq = 0U;
 uint32_t g_local_ack_seq = 0U;
 
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
-telem::TelemetryFullStateV1 g_state = {};
+telem::TelemetryStateRecord g_state = {};
 bool g_has_state = false;
 uint32_t g_seq = 0U;
 uint32_t g_t_us = 0U;
@@ -47,7 +47,7 @@ void setAckLocked(uint16_t command, bool ok, uint32_t code) {
   g_ack_code = code;
 }
 
-void updateFusionFromStateLocked(const telem::TelemetryFullStateV1& state) {
+void updateFusionFromStateLocked(const telem::TelemetryStateRecord& state) {
   g_fusion_settings.gain = state.fusion_gain;
   g_fusion_settings.accelerationRejection = state.fusion_accel_rej;
   g_fusion_settings.magneticRejection = state.fusion_mag_rej;
@@ -57,7 +57,7 @@ void updateFusionFromStateLocked(const telem::TelemetryFullStateV1& state) {
   g_fusion_rx_seq = g_seq;
 }
 
-void queuePendingStateLocked(const telem::TelemetryFullStateV1& state, uint32_t seq, uint32_t t_us) {
+void queuePendingStateLocked(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us) {
   const uint16_t next_head = (uint16_t)((g_pending_head + 1U) % kPendingStateDepth);
   if (next_head != g_pending_tail) {
     g_pending_states[g_pending_head].state = state;
@@ -72,7 +72,7 @@ void queuePendingStateLocked(const telem::TelemetryFullStateV1& state, uint32_t 
 bool queueReplayControl(uint16_t command_id, const void* payload, uint16_t payload_len) {
   if (payload_len > sizeof(telem::ReplayControlPayloadV1::payload)) return false;
 
-  telem::ReplayControlRecord160 record = {};
+  telem::ReplayControlRecord record = {};
   record.hdr.magic = telem::kReplayMagic;
   record.hdr.version = telem::kReplayVersion;
   record.hdr.kind = (uint8_t)telem::ReplayRecordKind::Control;
@@ -102,9 +102,9 @@ void servicePoll() {
 
   spi_bridge::poll();
   const bool standalone_bench = config_store::get().standalone_bench != 0U;
-  uint8_t record[sizeof(telem::TelemetryFullStateV1)] = {};
+  uint8_t record[sizeof(telem::TelemetryStateRecord)] = {};
   while (spi_bridge::popStateRecord(record, sizeof(record))) {
-    telem::TelemetryFullStateV1 tmp = {};
+    telem::TelemetryStateRecord tmp = {};
     memcpy(&tmp, record, sizeof(tmp));
     const bool replay_output = (tmp.flags & telem::kStateFlagReplayOutput) != 0U;
     uint32_t seq = ++g_local_state_seq;
@@ -133,9 +133,9 @@ void servicePoll() {
     state_records_drained++;
   }
 
-  uint8_t raw_record[sizeof(telem::ReplayInputRecord160)] = {};
+  uint8_t raw_record[sizeof(telem::ReplayInputRecord)] = {};
   while (spi_bridge::popRawRecord(raw_record, sizeof(raw_record))) {
-    telem::ReplayInputRecord160 replay = {};
+    telem::ReplayInputRecord replay = {};
     memcpy(&replay, raw_record, sizeof(replay));
     log_store::enqueueReplayInput(replay.hdr.seq, replay.hdr.t_us, replay);
     raw_records_drained++;
@@ -311,11 +311,11 @@ bool sendSetStreamRate(const telem::CmdSetStreamRateV1& cmd) {
   return ok;
 }
 
-bool sendReplayInputRecord(const telem::ReplayInputRecord160& record) {
+bool sendReplayInputRecord(const telem::ReplayInputRecord& record) {
   return spi_bridge::queueReplayRecord(reinterpret_cast<const uint8_t*>(&record), sizeof(record));
 }
 
-bool sendReplayControlRecord(const telem::ReplayControlRecord160& record) {
+bool sendReplayControlRecord(const telem::ReplayControlRecord& record) {
   return spi_bridge::queueReplayRecord(reinterpret_cast<const uint8_t*>(&record), sizeof(record));
 }
 

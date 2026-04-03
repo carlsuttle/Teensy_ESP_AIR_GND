@@ -725,6 +725,7 @@ void printCommandHelp() {
   Serial.println("  espcomtest - poll Serial3 for ESPTEST_ACK handshake");
   Serial.println("  spdtest    - stream benchmark line at 100 Hz");
   Serial.println("  showcrsfin - show CRSF RX frame stats");
+  Serial.println("  gpsstate   - print current GPS state");
   Serial.println("  x          - exit active mode");
   Serial.println("  stats      - start 2Hz summary stream");
   Serial.println("  quiet on/off/status - stop or resume unsolicited serial chatter");
@@ -886,6 +887,30 @@ void printSourceRateConfig() {
       (unsigned long)spi_stats.replay_rx_free_min,
       spi_stats.ready_high ? 1U : 0U);
   printLoopPerf();
+}
+
+void printGpsStateSummary() {
+  Serial.printf(
+      "GPSSTATE fix=%u sv=%u lat=%ld lon=%ld iTOW=%lu hMSL=%ld gSpeed=%ld headMot=%ld hAcc=%lu sAcc=%lu last_gps_ms=%lu gps_time=%04u-%02u-%02u %02u:%02u:%02u mirror_ok=%lu mirror_drop=%lu\r\n",
+      (unsigned)g_state.fixType,
+      (unsigned)g_state.numSV,
+      (long)g_state.lat,
+      (long)g_state.lon,
+      (unsigned long)g_state.iTOW,
+      (long)g_state.hMSL,
+      (long)g_state.gSpeed,
+      (long)g_state.headMot,
+      (unsigned long)g_state.hAcc,
+      (unsigned long)g_state.sAcc,
+      (unsigned long)g_state.last_gps_ms,
+      (unsigned)g_state.gps_year,
+      (unsigned)g_state.gps_month,
+      (unsigned)g_state.gps_day,
+      (unsigned)g_state.gps_hour,
+      (unsigned)g_state.gps_min,
+      (unsigned)g_state.gps_sec,
+      (unsigned long)g_state.mirror_tx_ok,
+      (unsigned long)g_state.mirror_drop_count);
 }
 
 void printSetImuCfgUsage() {
@@ -1216,6 +1241,8 @@ void processCommand(const char* cmd) {
     setMode(CommandMode::ShowImuData);
   } else if (strcmp(cmd, "showimuerror") == 0) {
     setMode(CommandMode::ShowImuError);
+  } else if (strcmp(cmd, "gpsstate") == 0) {
+    printGpsStateSummary();
   } else if (strcmp(cmd, "testimurot") == 0) {
     setMode(CommandMode::TestImuRot);
   } else if (strcmp(cmd, "espcomtest") == 0) {
@@ -1900,7 +1927,7 @@ void setup() {
 }
 
 void loop() {
-  static telem::ReplayInputRecord160 pending_raw_record = {};
+  static telem::ReplayInputRecord pending_raw_record = {};
   static bool have_pending_raw_record = false;
   const uint32_t loop_start_us = micros();
   uint32_t section_start_us = loop_start_us;
@@ -1945,7 +1972,7 @@ void loop() {
         raw_records_sent++;
       }
       while (!have_pending_raw_record) {
-        telem::ReplayInputRecord160 raw_record = {};
+        telem::ReplayInputRecord raw_record = {};
         if (!imu_fusion::takeRawReplayInput(raw_record)) break;
         if (!spi_bridge::pushRawRecord(reinterpret_cast<const uint8_t*>(&raw_record), sizeof(raw_record))) {
           pending_raw_record = raw_record;

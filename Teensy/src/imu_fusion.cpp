@@ -181,7 +181,7 @@ FusionReplayDebug g_replayDebugQueue[kReplayDebugQueueDepth] = {};
 uint8_t g_replayDebugHead = 0U;
 uint8_t g_replayDebugTail = 0U;
 uint8_t g_replayDebugCount = 0U;
-telem::ReplayInputRecord160 g_rawReplayQueue[kRawReplayQueueDepth] = {};
+telem::ReplayInputRecord g_rawReplayQueue[kRawReplayQueueDepth] = {};
 uint8_t g_rawReplayHead = 0U;
 uint8_t g_rawReplayTail = 0U;
 uint8_t g_rawReplayCount = 0U;
@@ -273,7 +273,7 @@ void clearRawReplayQueue() {
   g_rawReplayCount = 0U;
 }
 
-void queueRawReplayInput(const telem::ReplayInputRecord160& replay) {
+void queueRawReplayInput(const telem::ReplayInputRecord& replay) {
   if (g_rawReplayCount >= kRawReplayQueueDepth) {
     g_rawReplayTail = (uint8_t)((g_rawReplayTail + 1U) % kRawReplayQueueDepth);
     g_rawReplayCount--;
@@ -363,7 +363,7 @@ bool buildLiveReplayInputRecord(const State& s, const ImuFrame& f,
                                 const FusionVector& accelBody,
                                 const FusionVector& gyroBody,
                                 const FusionVector& magBody,
-                                telem::ReplayInputRecord160& replay) {
+                                telem::ReplayInputRecord& replay) {
   memset(&replay, 0, sizeof(replay));
   replay.hdr.magic = telem::kReplayMagic;
   replay.hdr.version = telem::kReplayVersion;
@@ -391,6 +391,16 @@ bool buildLiveReplayInputRecord(const State& s, const ImuFrame& f,
   replay.payload.mag_milli_uT[1] = (int32_t)lroundf(magBody.axis.y * 1000.0f);
   replay.payload.mag_milli_uT[2] = (int32_t)lroundf(magBody.axis.z * 1000.0f);
   replay.payload.iTOW_ms = s.iTOW;
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  {
+    replay.payload.gps_year = s.gps_year;
+    replay.payload.gps_month = s.gps_month;
+    replay.payload.gps_day = s.gps_day;
+    replay.payload.gps_hour = s.gps_hour;
+    replay.payload.gps_min = s.gps_min;
+    replay.payload.gps_sec = s.gps_sec;
+  }
+#endif
   replay.payload.fixType = s.fixType;
   replay.payload.numSV = s.numSV;
   replay.payload.gps_flags = 0U;
@@ -631,7 +641,7 @@ void applyFrameToState(const ImuFrame& f, State& s) {
   s.mag_heading = headingDeg;
   s.last_imu_ms = millis();
   if (!g_replayMode) {
-    telem::ReplayInputRecord160 replay = {};
+    telem::ReplayInputRecord replay = {};
     if (buildLiveReplayInputRecord(s, f, accelBody, gyro, magBody, replay)) {
       queueRawReplayInput(replay);
     }
@@ -725,7 +735,7 @@ bool takeReplayDebug(FusionReplayDebug& out) {
   return true;
 }
 
-bool takeRawReplayInput(telem::ReplayInputRecord160& out) {
+bool takeRawReplayInput(telem::ReplayInputRecord& out) {
   if (g_rawReplayCount == 0U) return false;
   out = g_rawReplayQueue[g_rawReplayTail];
   g_rawReplayTail = (uint8_t)((g_rawReplayTail + 1U) % kRawReplayQueueDepth);
