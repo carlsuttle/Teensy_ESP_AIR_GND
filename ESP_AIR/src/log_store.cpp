@@ -855,9 +855,12 @@ bool openCurrentLog() {
   if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
 
   const uint32_t t0 = millis();
-  if (!sd_api::exists(LOG_DIR)) (void)sd_api::mkdir(LOG_DIR);
   g_current_name = makeLogName(g_recorder.session_id);
   g_file = sd_api::open(g_current_name, sd_api::OpenMode::write);
+  if (!g_file) {
+    (void)sd_api::mkdir(LOG_DIR);
+    g_file = sd_api::open(g_current_name, sd_api::OpenMode::write);
+  }
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);

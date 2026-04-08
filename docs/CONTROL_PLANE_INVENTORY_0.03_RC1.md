@@ -52,6 +52,7 @@ Conclusion:
 
 File:
 - `ESP_AIR/src/main.cpp`
+- `ESP_AIR/src/serial_control.cpp`
 
 Main function:
 - `handleConsoleCommands()`
@@ -78,6 +79,23 @@ Migrated to shared control plane:
 - `tapi getfusion`
 - `tapi setfusion`
 
+Machine-readable serial adapter:
+
+- one-line JSON request -> AIR control-plane request
+- one-line JSON immediate result
+- one-line JSON final result for accepted requests
+- supported categories:
+  - `state`
+  - `recording`
+  - `replay`
+  - `file`
+  - `fusion`
+
+Current validation status:
+
+- this machine-readable serial adapter is now a valid RC2 runtime proof surface for functional control and mode gating
+- SD/file actions on this path no longer execute FATFS/VFS work on `loopTask`; they execute on the dedicated AIR `sd_worker` task
+
 Classification:
 
 | Path | Uses SD API | Uses shared backend | Bypasses control plane | Recommendation |
@@ -86,6 +104,7 @@ Classification:
 | serial replay start-by-file commands | n/a | yes | no | keep |
 | serial file / SD commands above | yes | yes | no | keep |
 | serial fusion get/set commands | n/a | yes | no | keep |
+| serial JSON control adapter | yes where relevant | yes | no | keep |
 
 Conclusion:
 
@@ -214,6 +233,8 @@ Files now using centralized control for the targeted categories:
   - `handleCommand(...)`
 - `ESP_AIR/src/main.cpp`
   - normal user-facing `handleConsoleCommands()` paths for record / replay start-by-file / file / SD / fusion
+- `ESP_AIR/src/serial_control.cpp`
+  - machine-readable serial request/result adapter for state / recording / replay / storage / file-list / fusion
 
 ---
 
@@ -223,6 +244,7 @@ Files now using centralized control for the targeted categories:
 
 - AIR radio adapter through the shared control plane
 - normal AIR console adapter through the shared control plane
+- machine-readable AIR serial adapter through the shared control plane
 - GND/browser forwarding into AIR radio control
 
 ### Keep Direct For Now
@@ -251,6 +273,7 @@ For the targeted runtime control categories:
 
 - AIR radio adapter: centralized
 - AIR normal console adapter: centralized
+- AIR machine-readable serial adapter: centralized
 - browser/GND path on AIR side: centralized
 
 Remaining bypasses are now mostly:
@@ -260,3 +283,9 @@ Remaining bypasses are now mostly:
 - low-level helper internals
 
 That means the main runtime control behavior is now converging on one AIR-owned control plane, while proof/test helper flows remain deliberately direct until a later focused cleanup pass.
+
+2026-04-08 update:
+
+- the targeted runtime control surface is now not just converging but proven in live use for RC2
+- remaining direct paths are intentionally outside the RC2 runtime proof surface and should stay documented as such
+- standalone replaybench remains a valid proof tool only when it skips radio poll/publish activity in `standalone_bench`

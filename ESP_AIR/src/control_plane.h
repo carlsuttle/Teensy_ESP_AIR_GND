@@ -77,6 +77,7 @@ enum class ControlCode : uint32_t {
 
 enum class RequestAction : uint8_t {
   None = 0U,
+  StateGet,
   RecordStart,
   RecordStop,
   RecordStatus,
@@ -234,6 +235,9 @@ inline const char* controlCodeText(uint32_t code) {
 void begin();
 bool submit(const Request& request, Result& out_result);
 StateSnapshot stateSnapshot(uint32_t now_ms);
+void fillStateSnapshot(uint32_t now_ms,
+                       StateSnapshot& out,
+                       const telem::StorageStatusPayloadV1* storage_hint = nullptr);
 ResultSnapshot lastResultSnapshot();
 telem::LogStatusPayloadV1 currentLogStatusPayload(uint32_t now_ms);
 const sd_file_api::FileListPage& lastFileListPage();

@@ -27,11 +27,13 @@ Adapters that should consume it:
 
 - AIR radio command handler in `ESP_AIR/src/radio_link.cpp`
 - AIR serial/console command handler in `ESP_AIR/src/main.cpp`
+- AIR machine-readable serial control adapter in `ESP_AIR/src/serial_control.cpp`
 - future websocket or other transport-facing handlers on AIR
 
 Underlying business backends owned elsewhere:
 
 - SD/file backend: `ESP_AIR/src/sd_file_api.*`
+- SD/FATFS worker isolation: `ESP_AIR/src/sd_worker.*`
 - logging backend: `ESP_AIR/src/log_store.*`
 - replay backend: `ESP_AIR/src/replay_bridge.*`
 - Teensy command transport / fusion settings: `ESP_AIR/src/teensy_link.*`
@@ -70,6 +72,7 @@ Rule:
 Current implementation note:
 
 - execution is still synchronous inside AIR in this phase
+- SD/FATFS operations are now isolated behind a dedicated AIR worker task so control-plane callers do not execute FATFS/VFS work on `loopTask`
 - the control plane still records the immediate and final phases separately so adapters do not collapse acceptance and completion semantics
 - only one pending request is supported at a time
 
@@ -149,6 +152,14 @@ Each completed request returns:
 
 ## Categories and Actions
 
+### State
+
+- `state_get`
+
+Backend:
+
+- control-plane state snapshot
+
 ### Recording
 
 - `record_start`
@@ -186,6 +197,11 @@ Backend:
 Backend:
 
 - `sd_file_api`
+
+Implementation note:
+
+- AIR file/storage actions still dispatch through the shared control plane
+- the actual FATFS/VFS work now runs in `sd_worker`, which solved the `loopTask` stack-pressure crash family seen on serial control paths
 
 ### Fusion
 
@@ -256,6 +272,17 @@ Explicitly out of scope for adapters after migration:
 - direct `sd_file_api::*`
 - direct `teensy_link::sendSetFusionSettings` for user-facing fusion control
 
+Serial-specific note:
+
+- the machine-readable AIR serial adapter accepts one-line JSON requests
+- it emits one-line JSON immediate/final results
+- it uses the same `req_id` / `status` / `code` semantics as the shared AIR control plane
+- legacy human console commands may remain for proof helpers, but new automation should prefer the serial control adapter
+
+Validation note:
+
+- the serial control adapter is now a valid RC2 proof surface for functional control, mode gating, and control-around-run performance validation
+
 ## Current Migration Target
 
 This phase migrates:
@@ -303,6 +330,13 @@ Implemented through the shared AIR control plane now:
   - `logstop`
   - `logprefix`
   - `csvfile`
+- AIR machine-readable serial control adapter for:
+  - state get
+  - recording start / stop / status
+  - replay start latest / start file / stop / status
+  - storage status
+  - file-list page
+  - fusion get / set
 
 Still direct by design in this phase:
 
@@ -313,6 +347,21 @@ Still direct by design in this phase:
 - stream-rate and radio-mode transport controls in `radio_link.cpp`
 
 These remaining direct paths are intentionally left for a later focused migration so this refactor does not disturb the validated replay/logging path.
+
+## 2026-04-08 Validation Update
+
+Current live evidence shows:
+
+- serial control functional path passes for recording, replay start-latest/stop, storage status, and fusion get/set/readback
+- AIR mode-gating passes for recording-vs-replay mutual exclusion and file-list rejection during active recording/replay
+- the FATFS crash family was resolved by executing SD/FATFS/VFS work on `sd_worker` instead of `loopTask`
+- standalone replaybench must skip AIR radio poll/publish activity so the benchmark does not incorrectly re-enter `radio_link::initEspNow()` while `standalone_bench` is active
+
+Valid RC2 performance method:
+
+- use the proven `tapi replaybench` operating point
+- issue serial control requests around the benchmark run on the same console path
+- do not attempt in-band same-port serial JSON injection during the benchmark itself, because the benchmark occupies the command loop until completion
 
 ## Extension Rule
 

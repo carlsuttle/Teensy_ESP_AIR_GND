@@ -14,7 +14,13 @@ enum class OpenMode : uint8_t {
 class File {
  public:
   File() = default;
-  explicit File(::File file);
+  File(const File& other);
+  File(File&& other) noexcept;
+  ~File();
+  explicit File(uint16_t handle);
+
+  File& operator=(const File& other);
+  File& operator=(File&& other) noexcept;
 
   explicit operator bool() const;
   bool isDirectory();
@@ -32,7 +38,15 @@ class File {
   File openNextFile();
 
  private:
-  ::File file_;
+  struct SharedHandle;
+
+  void release();
+  void retain(const File& other);
+  bool validHandle() const;
+  uint16_t handleValue() const;
+
+  SharedHandle* shared_ = nullptr;
+  mutable char name_cache_[128] = {};
 };
 
 bool begin(uint8_t cs_pin, SPIClass& spi, uint32_t hz);

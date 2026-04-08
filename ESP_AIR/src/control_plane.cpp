@@ -214,6 +214,15 @@ bool submit(const Request& request, Result& out_result) {
   recordDisposition(request, out_result.disposition, out_result.disposition_code);
 
   switch (request.action) {
+    case RequestAction::StateGet: {
+      out_result.completed = true;
+      out_result.completion = CompletionStatus::CompletedOk;
+      out_result.ok = true;
+      out_result.completion_code = (uint32_t)ControlCode::Ok;
+      out_result.code = out_result.completion_code;
+      recordCompletion(request, out_result.completion, out_result.completion_code);
+      return true;
+    }
     case RequestAction::RecordStart: {
       const uint32_t session_id = nextRecordingSessionId(request);
       const bool ok = log_store::startSession(session_id);
@@ -496,8 +505,10 @@ bool submit(const Request& request, Result& out_result) {
   }
 }
 
-StateSnapshot stateSnapshot(uint32_t now_ms) {
-  StateSnapshot out = {};
+void fillStateSnapshot(uint32_t now_ms,
+                       StateSnapshot& out,
+                       const telem::StorageStatusPayloadV1* storage_hint) {
+  out = {};
   out.system_mode = SystemMode::Idle;
   out.request_pending = g_state.request_pending;
   out.pending_request_id = g_state.pending_request_id;
@@ -536,7 +547,11 @@ StateSnapshot stateSnapshot(uint32_t now_ms) {
                                                : (out.file_list_valid ? FileListState::Valid : FileListState::Idle);
 
   telem::StorageStatusPayloadV1 storage = {};
-  (void)sd_file_api::getStorageStatus(storage);
+  if (storage_hint) {
+    storage = *storage_hint;
+  } else {
+    (void)sd_file_api::getStorageStatus(storage);
+  }
   out.sd_ready = (storage.flags & telem::kStorageStatusFlagBackendReady) != 0U;
   out.sd_mounted = (storage.flags & telem::kStorageStatusFlagMounted) != 0U;
   out.sd_media_present = (storage.flags & telem::kStorageStatusFlagMediaPresent) != 0U;
@@ -552,6 +567,11 @@ StateSnapshot stateSnapshot(uint32_t now_ms) {
   else if (out.replay_state == ActivityState::Active) out.system_mode = SystemMode::Replay;
   else if (out.recording_state == ActivityState::Busy) out.system_mode = SystemMode::RecordingBusy;
   else if (out.replay_state == ActivityState::Busy) out.system_mode = SystemMode::ReplayBusy;
+}
+
+StateSnapshot stateSnapshot(uint32_t now_ms) {
+  StateSnapshot out = {};
+  fillStateSnapshot(now_ms, out);
   return out;
 }
 

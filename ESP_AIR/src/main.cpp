@@ -12,18 +12,20 @@
 #include "sd_api.h"
 #include "sd_backend.h"
 #include "sd_capture_test.h"
+#include "sd_worker.h"
 #include "teensy_api.h"
 #include "teensy_link.h"
 #include "radio_link.h"
 #include "spi_bridge.h"
 #include "replay_bridge.h"
+#include "serial_control.h"
 #include "sd_file_api.h"
 #include "time_service.h"
 
 namespace {
 
 uint32_t g_last_stat_ms = 0;
-char g_console_line[96];
+char g_console_line[256];
 uint8_t g_console_idx = 0;
 bool g_stats_streaming = false;
 bool g_wait_getfusion_ack = false;
@@ -1895,6 +1897,13 @@ void handleConsoleCommands() {
       g_console_line[g_console_idx] = '\0';
       g_console_idx = 0;
 
+      char raw_console_line[sizeof(g_console_line)] = {};
+      strlcpy(raw_console_line, g_console_line, sizeof(raw_console_line));
+
+      if (serial_control::handleLine(raw_console_line, Serial)) {
+        continue;
+      }
+
       for (size_t i = 0; g_console_line[i] != '\0'; ++i) {
         g_console_line[i] = (char)tolower((unsigned char)g_console_line[i]);
       }
@@ -2709,6 +2718,7 @@ void setup() {
   }
 
   beginWifiStation();
+  sd_worker::begin();
 
   const bool air_file_logging_enabled = kEnableAirFileLogging;
 

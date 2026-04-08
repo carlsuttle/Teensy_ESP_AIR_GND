@@ -1,4 +1,4 @@
-# ChatGPT Handoff: Release 0.03 RC1
+# ChatGPT Handoff: Release 0.03 RC2
 
 Date:
 - 2026-04-02
@@ -10,7 +10,7 @@ Branch:
 - `teensy-source-rate-refactor`
 
 Status:
-- working `0.03 RC1` engineering state
+- working `0.03 RC2-worthy` engineering state
 - not a final release snapshot
 - current repo worktree is dirty and includes important uncommitted work
 
@@ -87,6 +87,14 @@ An AIR-owned SD API now exists and is the authoritative backend for:
 - mode-based inhibition decisions
 - explicit SD result codes
 
+Current implementation note:
+
+- SD/FATFS/VFS execution now runs on a dedicated AIR `sd_worker` task rather than on `loopTask`
+- this worker isolation resolved the serial-control crash family caused by FATFS stack pressure during:
+  - recording start
+  - replay start-latest
+  - storage status
+
 ### F. GPS-derived UTC time service
 
 An AIR-owned UTC wall-clock service now exists for:
@@ -99,6 +107,31 @@ Design intent:
 
 - use GPS as the authoritative UTC source when trusted
 - do not block startup, recording, or file operations on immediate GPS lock
+
+### G. AIR serial control proof surface
+
+The AIR machine-readable serial control path is now a valid `0.03 RC2` proof surface for:
+
+- recording start / stop / status
+- replay start-latest / stop / status
+- fusion get / set
+- storage status
+- mode-gating validation
+- control-around-run performance evidence
+
+Important method note:
+
+- the valid performance method is serial control activity immediately before and after `tapi replaybench`
+- injecting JSON control requests during `tapi replaybench` on the same AIR console port is not a valid method because the benchmark occupies the command loop until completion
+
+### H. Standalone replaybench radio rule
+
+When `standalone_bench` is enabled:
+
+- replaybench must skip AIR radio poll / publish activity
+- standalone replaybench must not try to re-enter `radio_link::initEspNow()`
+
+This was required to restore replaybench as a valid proof surface after the serial-control crash family was fixed.
 
 ---
 
@@ -260,6 +293,8 @@ Still incomplete:
 - some diagnostic/proof helpers
 - stream-rate / radio-mode control path
 
+These remaining direct paths are intentionally outside the RC2 runtime proof surface.
+
 ### C. Browser SD/control UX
 
 - functional pieces exist
@@ -335,14 +370,107 @@ These should be avoided unless explicitly requested:
 
 ## 11. Short Executive Summary
 
-`0.03 RC1` already has:
+`0.03 RC2-worthy` now has:
 
 - a proven Teensy DMA fast path
 - schema-defined bidirectional AIR/GND transport
 - validated single-client Stage 2 browser telemetry at `10 Hz` and `30 Hz`
 - an AIR-owned SD API
+- an AIR-owned SD worker that removes FATFS stack pressure from `loopTask`
 - an AIR-owned GPS-derived UTC time service
+- a machine-readable AIR serial control surface proven for functional, mode-gating, and control-around-run benchmark use
 - documented field, SD, time, and control-plane contracts
 
 The repo is not yet in a final release-clean state.
 The main remaining engineering direction is backend consolidation and cleanup, especially around the AIR-owned control plane and the nonessential-control paths layered over the already-proven record/replay/logging core.
+
+---
+
+## 12. 2026-04-08 RC2 Evidence Update
+
+### Functional proof logs
+
+- `scripts/air_serial_control_basic_20260408_154301.log`
+- `scripts/air_serial_control_storage_probe_20260408_154353.log`
+- `scripts/air_serial_control_replay_probe_20260408_154405.log`
+
+Observed result:
+
+- functional serial control checks passed `12/12`
+- recording start / stop passed
+- replay start-latest / stop passed
+- fusion get / set / readback passed
+- storage status passed
+
+### Mode-gating proof log
+
+- `scripts/air_serial_control_mode_gating_20260408_154459.log`
+
+Observed result:
+
+- mode-gating checks passed `3/3`
+- replay start during recording rejected with `busy_recording`
+- file-list request during recording rejected with `busy_recording`
+- recording start during replay rejected with `busy_replay`
+- file-list request during replay rejected with `busy_replay`
+
+### Performance proof logs
+
+Invalid pre-fix blocker:
+
+- `scripts/air_serial_control_perf_20260408_154419.log`
+
+Meaning:
+
+- standalone replaybench was incorrectly reaching `radio_link::initEspNow()`
+- this was a replaybench/radio startup defect, not a serial-control defect
+
+Valid post-fix comparison:
+
+- `scripts/air_serial_control_perf_manual_20260408_155219.log`
+
+Observed baseline:
+
+- `validated_rps=2392.3`
+- `outq_max=48`
+- `tx_overflows=100`
+- `rx_overflows=0`
+- `crc_err=0`
+- `type_err=0`
+- `state_tx_occ_max=89`
+- `state_tx_free_min=422`
+- `replay_rx_occ_max=48`
+- `replay_rx_free_min=463`
+
+Observed control-around-run result:
+
+- `validated_rps=2396.2`
+- `outq_max=48`
+- `tx_overflows=11127`
+- `rx_overflows=0`
+- `crc_err=0`
+- `type_err=0`
+- `state_tx_occ_max=511`
+- `state_tx_free_min=0`
+- `replay_rx_occ_max=48`
+- `replay_rx_free_min=463`
+
+Current interpretation:
+
+- the proven replay throughput envelope remains about `2400 rps`
+- no replay receive-side overflow, CRC, or type regression was observed
+- the valid RC2 benchmark method is control activity around the run, not in-band same-port injection during the benchmark
+
+### Remaining direct-control bypasses intentionally left outside RC2
+
+- `ESP_AIR/src/main.cpp`
+  - replay capture / replay compare proof helpers
+  - benchmark / soak / validation helper flows
+  - `handleTeensyApiConsoleCommand(...)` helper surface
+- `ESP_AIR/src/teensy_api.cpp`
+  - low-level fusion/helper transport helpers
+
+Recommendation:
+
+- the branch has enough engineering evidence to be labeled `0.03 RC2`
+- remaining direct helper paths should stay clearly documented as non-runtime proof helpers until a later focused migration pass

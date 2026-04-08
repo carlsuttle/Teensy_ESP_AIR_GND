@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "config_store.h"
 #include "radio_link.h"
 #include "replay_bridge.h"
 
@@ -76,10 +77,17 @@ void fillCarrySignatureRecord(uint32_t index, telem::ReplayInputRecord& replay) 
 }
 
 void serviceLiveLinkDuringBenchmark() {
-  radio_link::poll();
+  // Standalone replaybench explicitly disables WiFi/radio, so touching the
+  // radio link here would try to reinitialize ESPNOW in an invalid mode.
+  const bool standalone_bench = config_store::get().standalone_bench != 0U;
+  if (!standalone_bench) {
+    radio_link::poll();
+  }
   replay_bridge::poll();
   const auto snap = teensy_link::snapshot();
-  radio_link::publish(snap);
+  if (!standalone_bench) {
+    radio_link::publish(snap);
+  }
 }
 
 bool waitForCarrySignatureState(uint32_t expected_seq, uint32_t expected_t_us,
