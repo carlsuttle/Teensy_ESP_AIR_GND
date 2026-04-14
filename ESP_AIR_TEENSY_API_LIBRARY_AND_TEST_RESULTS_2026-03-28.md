@@ -214,6 +214,24 @@ These are the right indicators for maximum replay performance because they show 
 
 ## Replay Benchmark Results
 
+### Current Performance Baseline
+
+These are the current quick-reference baseline points for the `ESP_AIR` /
+Teensy SPI/DMA proof path as of the latest live bench runs.
+
+| Scenario | Command / Harness | Nominal Input Rate | Result | Key Outcome |
+|---|---|---:|---|---|
+| Standalone bidirectional clean point | `tapi replaybench 60000 100 16` | `1600 records/s` | `ok=1`, `sent=96000`, `recv=96000`, `timeout=0`, `validated_rps=1599.5` | Proven clean for `60 s` with zero loss |
+| Standalone bidirectional saturation point | `tapi replaybench 60000 200 16` | `3200 records/s` | `ok=0`, `sent=176916`, `recv=161972`, `timeout=14944`, `validated_rps=2612.5` | Sustained ceiling is about `2.6k validated records/s` |
+| Higher-stress standalone saturation check | `tapi replaybench 60000 400 16` | `6400 records/s` | `ok=0`, `sent=177250`, `recv=162251`, `timeout=14999`, `validated_rps=2617.0` | Confirms the link saturates near the same ceiling |
+| Short serial-control baseline | `run_air_serial_control_performance.ps1` case `post_integration_baseline` | `2400 records/s` (`50 x 48`) | `ok=1`, `sent=12000`, `recv=12000`, `timeout=0`, `validated_rps=2394.3` | Stable short-run baseline with no surrounding control traffic |
+| Short serial-control stress case | `run_air_serial_control_performance.ps1` case `with_serial_control_activity` | `2400 records/s` (`50 x 48`) | `ok=1`, `sent=12000`, `recv=12000`, `timeout=0`, `validated_rps=2396.2` | Control-plane activity did not reduce validated throughput in the hardened harness |
+
+Interpretation:
+- For long standalone bidirectional proof, `1600 records/s` is the currently proven clean `60 s` point.
+- The present standalone bidirectional ceiling is about `2615 validated records/s`.
+- The current short-run post-integration benchmark target of about `2400 records/s` is being met.
+
 ### Short Sweep
 
 `100 Hz` sweep:

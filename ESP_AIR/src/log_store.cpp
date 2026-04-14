@@ -939,6 +939,7 @@ bool recoverCurrentLogAfterWriteFailure() {
 
   if (g_file) {
     g_file.close();
+    g_file = File();
   }
 
   sd_backend::end();
@@ -1027,6 +1028,7 @@ void closeCurrentLog() {
   const uint32_t closed_session_id = g_recorder.session_id;
   g_file.flush();
   g_file.close();
+  g_file = File();
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_close_last_ms, g_stats.fs_close_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
@@ -1039,6 +1041,7 @@ void closeCurrentLog() {
 void abandonCurrentLog() {
   if (g_file) {
     g_file.close();
+    g_file = File();
   }
   g_current_name = "";
 }
@@ -1176,11 +1179,9 @@ void writerTask(void* param) {
       while (have) {
         {
           LockGuard lock(g_state_mutex);
-          if (g_recorder.active || g_bench_write_used != 0U) {
-            if (!appendBenchRecordLocked(record)) {
-              g_recorder.active = false;
-              g_close_pending = true;
-            }
+          if (!appendBenchRecordLocked(record)) {
+            g_recorder.active = false;
+            g_close_pending = true;
           }
         }
         have = benchRingPop(record, q_now);
@@ -1497,6 +1498,24 @@ void enqueueState(uint32_t seq, uint32_t t_us, const telem::TelemetryStateRecord
   record.seq = seq;
   record.t_us = t_us;
   memcpy(record.payload, &state, sizeof(state));
+  if (useSimpleBenchWriter()) {
+    uint32_t q_now = 0U;
+    if (!benchRingPush(record, q_now)) {
+      portENTER_CRITICAL(&g_stats_mux);
+      g_stats.dropped++;
+      g_stats.queue_cur = q_now;
+      if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
+      portEXIT_CRITICAL(&g_stats_mux);
+      return;
+    }
+    portENTER_CRITICAL(&g_stats_mux);
+    g_stats.enqueued++;
+    g_stats.queue_cur = q_now;
+    if (q_now > g_stats.queue_max) g_stats.queue_max = q_now;
+    portEXIT_CRITICAL(&g_stats_mux);
+    if (g_writer_task) xTaskNotifyGive(g_writer_task);
+    return;
+  }
   (void)enqueueRecord(record);
 }
 
@@ -1556,6 +1575,116 @@ struct ListedFileEntry {
   uint32_t stamp = 0U;
   bool parsed = false;
 };
+
+bool shouldIncludeListedFile(const String& short_name, bool logs_only);
+
+uint32_t fileNameStampKey(const char* short_name) {
+  if (!short_name || short_name[0] == '\0') return 0U;
+  const char* dot = strrchr(short_name, '.');
+  if (!dot || dot == short_name) return 0U;
+  const char* last_sep = dot;
+  while (last_sep > short_name && last_sep[-1] != '_') last_sep--;
+  if (last_sep <= short_name || last_sep[-1] != '_') return 0U;
+  return (uint32_t)strtoul(last_sep, nullptr, 10);
+}
+
+bool collectManagedFileInfos(telem::LogFileInfoV1*& out_files, uint16_t& out_count) {
+  out_files = nullptr;
+  out_count = 0U;
+
+  File dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) return false;
+
+  uint16_t count = 0U;
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String short_name = String(f.name());
+      if (short_name.startsWith("/logs/")) short_name = short_name.substring(6);
+      if (shouldIncludeListedFile(short_name, true) && count < 0xFFFFU) {
+        count++;
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  if (count == 0U) return true;
+
+  telem::LogFileInfoV1* files = new telem::LogFileInfoV1[count];
+  if (!files) return false;
+  memset(files, 0, sizeof(telem::LogFileInfoV1) * count);
+
+  dir = sd_api::open(LOG_DIR);
+  if (!dir || !dir.isDirectory()) {
+    delete[] files;
+    return false;
+  }
+
+  uint16_t index = 0U;
+  f = dir.openNextFile();
+  while (f && index < count) {
+    if (!f.isDirectory()) {
+      String short_name = String(f.name());
+      if (short_name.startsWith("/logs/")) short_name = short_name.substring(6);
+      if (shouldIncludeListedFile(short_name, true)) {
+        telem::LogFileInfoV1& entry = files[index++];
+        entry.size_bytes = (uint32_t)f.size();
+        const time_t last_write = f.getLastWrite();
+        entry.mtime_utc_s = last_write > 0 ? (uint32_t)last_write : 0U;
+        strncpy(entry.name, short_name.c_str(), sizeof(entry.name) - 1U);
+      }
+    }
+    f.close();
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  out_files = files;
+  out_count = index;
+  return true;
+}
+
+void sortManagedFileInfos(telem::LogFileInfoV1* entries,
+                          uint16_t count,
+                          FileSortKey sort_key,
+                          FileSortDirection sort_dir) {
+  if (!entries || count < 2U) return;
+  for (uint16_t i = 0U; i + 1U < count; ++i) {
+    for (uint16_t j = (uint16_t)(i + 1U); j < count; ++j) {
+      bool take_j = false;
+      switch (sort_key) {
+        case FileSortKey::size:
+          take_j = (sort_dir == FileSortDirection::ascending) ? (entries[j].size_bytes < entries[i].size_bytes)
+                                                              : (entries[j].size_bytes > entries[i].size_bytes);
+          if (entries[j].size_bytes == entries[i].size_bytes) {
+            take_j = strcmp(entries[j].name, entries[i].name) < 0;
+          }
+          break;
+        case FileSortKey::date: {
+          const uint32_t lhs = entries[i].mtime_utc_s != 0U ? entries[i].mtime_utc_s : fileNameStampKey(entries[i].name);
+          const uint32_t rhs = entries[j].mtime_utc_s != 0U ? entries[j].mtime_utc_s : fileNameStampKey(entries[j].name);
+          take_j = (sort_dir == FileSortDirection::ascending) ? (rhs < lhs) : (rhs > lhs);
+          if (rhs == lhs) {
+            take_j = strcmp(entries[j].name, entries[i].name) < 0;
+          }
+          break;
+        }
+        case FileSortKey::name:
+        default:
+          take_j = (sort_dir == FileSortDirection::ascending) ? (strcmp(entries[j].name, entries[i].name) < 0)
+                                                              : (strcmp(entries[j].name, entries[i].name) > 0);
+          break;
+      }
+      if (take_j) {
+        const telem::LogFileInfoV1 tmp = entries[i];
+        entries[i] = entries[j];
+        entries[j] = tmp;
+      }
+    }
+  }
+}
 
 bool shouldIncludeListedFile(const String& short_name, bool logs_only) {
   if (short_name.length() == 0U) return false;
@@ -1707,18 +1836,14 @@ bool listFiles(telem::LogFileInfoV1* out_files,
     return false;
   }
 
-  ListedFileEntry* entries = nullptr;
-  size_t count = 0U;
-  if (!collectListedFiles(entries, count, true, sort_key, sort_dir)) return false;
+  telem::LogFileInfoV1* entries = nullptr;
+  uint16_t count = 0U;
+  if (!collectManagedFileInfos(entries, count)) return false;
+  sortManagedFileInfos(entries, count, sort_key, sort_dir);
 
-  total_files = (count > 0xFFFFU) ? 0xFFFFU : (uint16_t)count;
-  for (size_t i = offset; i < count && returned_files < max_files; ++i) {
-    telem::LogFileInfoV1& entry = out_files[returned_files];
-    memset(&entry, 0, sizeof(entry));
-    entry.size_bytes = entries[i].size_bytes;
-    entry.mtime_utc_s = entries[i].mtime_utc_s;
-    strncpy(entry.name, entries[i].short_name.c_str(), sizeof(entry.name) - 1U);
-    returned_files++;
+  total_files = count;
+  for (uint16_t i = offset; i < count && returned_files < max_files; ++i) {
+    out_files[returned_files++] = entries[i];
   }
   delete[] entries;
   return true;
@@ -1737,11 +1862,12 @@ bool listFilesSnapshot(telem::LogFileInfoV1*& out_files,
     return false;
   }
 
-  ListedFileEntry* entries = nullptr;
-  size_t count = 0U;
-  if (!collectListedFiles(entries, count, true, sort_key, sort_dir)) return false;
+  telem::LogFileInfoV1* entries = nullptr;
+  uint16_t count = 0U;
+  if (!collectManagedFileInfos(entries, count)) return false;
+  sortManagedFileInfos(entries, count, sort_key, sort_dir);
 
-  total_files = (count > 0xFFFFU) ? 0xFFFFU : (uint16_t)count;
+  total_files = count;
   if (total_files == 0U) {
     delete[] entries;
     return true;
@@ -1753,12 +1879,7 @@ bool listFilesSnapshot(telem::LogFileInfoV1*& out_files,
     return false;
   }
 
-  for (uint16_t i = 0U; i < total_files; ++i) {
-    memset(&snapshot[i], 0, sizeof(snapshot[i]));
-    snapshot[i].size_bytes = entries[i].size_bytes;
-    snapshot[i].mtime_utc_s = entries[i].mtime_utc_s;
-    strncpy(snapshot[i].name, entries[i].short_name.c_str(), sizeof(snapshot[i].name) - 1U);
-  }
+  memcpy(snapshot, entries, sizeof(telem::LogFileInfoV1) * total_files);
 
   delete[] entries;
   out_files = snapshot;

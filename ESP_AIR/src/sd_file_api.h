@@ -54,7 +54,10 @@ telem::SdApiStatusCode getFileListPage(FileListHandle handle,
 telem::SdApiStatusCode getOrRefreshFileListPage(uint16_t offset,
                                                 uint16_t limit,
                                                 FileListPage& out_page,
-                                                bool force_refresh);
+                                                bool force_refresh,
+                                                log_store::FileSortKey sort_key = log_store::FileSortKey::date,
+                                                log_store::FileSortDirection sort_dir =
+                                                    log_store::FileSortDirection::descending);
 telem::SdApiStatusCode getFileInfo(const String& name, FileInfo& out_info);
 telem::SdApiStatusCode deleteFile(const String& name);
 telem::SdApiStatusCode renameFile(const String& src_name, const String& dst_name);

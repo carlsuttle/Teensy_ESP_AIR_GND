@@ -61,8 +61,127 @@ function New-ControlContext {
     Port = $Port
     Partial = ""
     Lines = [System.Collections.Generic.List[string]]::new()
+    JsonBuffer = ""
+    JsonMessages = [System.Collections.Generic.List[object]]::new()
     LogPath = $LogPath
   }
+}
+
+function Add-ControlJsonMessage {
+  param(
+    [hashtable]$Context,
+    [string]$RawJson,
+    $Parsed
+  )
+
+  $Context.JsonMessages.Add([pscustomobject]@{
+    Raw = $RawJson
+    Parsed = $Parsed
+  })
+  Write-ControlLog -Context $Context -Source "AIRJSON" -Text $RawJson
+}
+
+function Find-CompleteJsonObjectLength {
+  param([string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text) -or $Text[0] -ne '{') {
+    return -1
+  }
+
+  $depth = 0
+  $inString = $false
+  $escape = $false
+
+  for ($i = 0; $i -lt $Text.Length; $i++) {
+    $ch = $Text[$i]
+
+    if ($escape) {
+      $escape = $false
+      continue
+    }
+
+    if ($inString) {
+      if ($ch -eq '\') {
+        $escape = $true
+      } elseif ($ch -eq '"') {
+        $inString = $false
+      }
+      continue
+    }
+
+    if ($ch -eq '"') {
+      $inString = $true
+      continue
+    }
+
+    if ($ch -eq '{') {
+      $depth++
+      continue
+    }
+
+    if ($ch -eq '}') {
+      $depth--
+      if ($depth -eq 0) {
+        return ($i + 1)
+      }
+    }
+  }
+
+  return -1
+}
+
+function Extract-ControlJsonFromBuffer {
+  param([hashtable]$Context)
+
+  while (-not [string]::IsNullOrEmpty($Context.JsonBuffer)) {
+    $start = $Context.JsonBuffer.IndexOf('{')
+    if ($start -lt 0) {
+      if ($Context.JsonBuffer.Length -gt 4096) {
+        Write-ControlLog -Context $Context -Source "HARNESS" -Text ("json_extract discard_noise chars={0}" -f $Context.JsonBuffer.Length)
+        $Context.JsonBuffer = ""
+      }
+      break
+    }
+
+    if ($start -gt 0) {
+      $Context.JsonBuffer = $Context.JsonBuffer.Substring($start)
+    }
+
+    $objectLength = Find-CompleteJsonObjectLength -Text $Context.JsonBuffer
+    if ($objectLength -lt 0) {
+      break
+    }
+
+    $candidate = $Context.JsonBuffer.Substring(0, $objectLength)
+    $Context.JsonBuffer = $Context.JsonBuffer.Substring($objectLength)
+
+    $parsed = Try-ParseControlJson -Line $candidate
+    if ($null -ne $parsed) {
+      Add-ControlJsonMessage -Context $Context -RawJson $candidate -Parsed $parsed
+      continue
+    }
+
+    $snippet = if ($candidate.Length -gt 180) { $candidate.Substring(0, 180) + "..." } else { $candidate }
+    Write-ControlLog -Context $Context -Source "HARNESS" -Text ("json_extract parse_fail chars={0} sample={1}" -f $candidate.Length, $snippet)
+  }
+}
+
+function Write-ControlJsonTail {
+  param(
+    [hashtable]$Context,
+    [int]$MaxChars = 240
+  )
+
+  if ([string]::IsNullOrEmpty($Context.JsonBuffer)) {
+    Write-ControlLog -Context $Context -Source "HARNESS" -Text "json_tail=(empty)"
+    return
+  }
+
+  $tail = $Context.JsonBuffer
+  if ($tail.Length -gt $MaxChars) {
+    $tail = "..." + $tail.Substring($tail.Length - $MaxChars)
+  }
+  Write-ControlLog -Context $Context -Source "HARNESS" -Text ("json_tail={0}" -f $tail)
 }
 
 function Read-ControlPort {
@@ -70,6 +189,10 @@ function Read-ControlPort {
 
   $chunk = $Context.Port.ReadExisting()
   if (-not $chunk) { return }
+
+  $Context.JsonBuffer += $chunk
+  Extract-ControlJsonFromBuffer -Context $Context
+
   $Context.Partial += $chunk
   while ($true) {
     $m = [regex]::Match($Context.Partial, "^(.*?)(`r`n|`n|`r)")
@@ -129,7 +252,7 @@ function Invoke-AirControlRequest {
 
   $json = $Request | ConvertTo-Json -Compress
   Write-ControlLog -Context $Context -Source "REQ" -Text $json
-  $startIndex = $Context.Lines.Count
+  $startIndex = $Context.JsonMessages.Count
   $Context.Port.WriteLine($json)
 
   $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
@@ -137,9 +260,8 @@ function Invoke-AirControlRequest {
   $final = $null
   while ((Get-Date) -lt $deadline) {
     Read-ControlPort -Context $Context
-    for ($i = $startIndex; $i -lt $Context.Lines.Count; $i++) {
-      $parsed = Try-ParseControlJson -Line $Context.Lines[$i]
-      if ($null -eq $parsed) { continue }
+    for ($i = $startIndex; $i -lt $Context.JsonMessages.Count; $i++) {
+      $parsed = $Context.JsonMessages[$i].Parsed
       if ($parsed.type -ne "control_result") { continue }
       if ([uint32]$parsed.req_id -ne [uint32]$Request.req_id) { continue }
       if ($parsed.phase -eq "immediate" -and $null -eq $immediate) {
@@ -160,10 +282,11 @@ function Invoke-AirControlRequest {
         }
       }
     }
-    $startIndex = $Context.Lines.Count
+    $startIndex = $Context.JsonMessages.Count
     Start-Sleep -Milliseconds 25
   }
 
+  Write-ControlJsonTail -Context $Context
   throw ("Timed out waiting for AIR control response req_id={0}" -f $Request.req_id)
 }
 
@@ -240,6 +363,21 @@ function Assert-ControlRejectedCode {
 
   if ($Response.Immediate.status -ne "rejected") {
     throw ("{0}: expected rejected, got {1}/{2}" -f $Label, $Response.Immediate.status, $Response.Immediate.code)
+  }
+  if ($Response.Immediate.code -ne $ExpectedCode) {
+    throw ("{0}: expected code {1}, got {2}" -f $Label, $ExpectedCode, $Response.Immediate.code)
+  }
+}
+
+function Assert-ControlBusyCode {
+  param(
+    $Response,
+    [string]$ExpectedCode,
+    [string]$Label
+  )
+
+  if ($Response.Immediate.status -ne "busy") {
+    throw ("{0}: expected busy, got {1}/{2}" -f $Label, $Response.Immediate.status, $Response.Immediate.code)
   }
   if ($Response.Immediate.code -ne $ExpectedCode) {
     throw ("{0}: expected code {1}, got {2}" -f $Label, $ExpectedCode, $Response.Immediate.code)

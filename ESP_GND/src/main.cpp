@@ -10,6 +10,11 @@
 
 namespace {
 
+const IPAddress kApLocalIp(192, 168, 4, 1);
+const IPAddress kApGateway(192, 168, 4, 1);
+const IPAddress kApSubnet(255, 255, 255, 0);
+constexpr int kApMaxConnections = 4;
+
 uint8_t g_last_station_count = 0xFFU;
 uint32_t g_last_stat_ms = 0;
 uint32_t g_last_air_config_tx_ms = 0;
@@ -26,6 +31,96 @@ bool g_pending_radio_mode_apply = true;
 constexpr uint32_t kAirConfigRetryMs = 1000U;
 constexpr uint16_t kNormalDownlinkRateHz = 30U;
 constexpr uint16_t kNormalUiRateHz = 30U;
+
+IPAddress g_ap_ip = kApLocalIp;
+uint8_t g_ap_channel = telem::kRadioChannel;
+bool g_ap_hidden = false;
+
+void configureDhcpLeaseRange();
+void scheduleAirConfigApply();
+
+void printNetworkSummary(const char* prefix) {
+  const AppConfig& cfg = config_store::get();
+  Serial.printf("%s mode=AP_RADIO ip=%s ssid=%s channel=%u ap_hidden=%u\n",
+                prefix,
+                g_ap_ip.toString().c_str(),
+                cfg.ap_ssid,
+                (unsigned)g_ap_channel,
+                g_ap_hidden ? 1U : 0U);
+  Serial.printf("%s ws_url=http://%s/ ws_socket=ws://%s/ws\n",
+                prefix,
+                g_ap_ip.toString().c_str(),
+                g_ap_ip.toString().c_str());
+}
+
+bool configureSoftApAddress() {
+  if (WiFi.softAPIP() == kApLocalIp) return true;
+  if (WiFi.softAPConfig(kApLocalIp, kApGateway, kApSubnet)) return true;
+  Serial.println("NET softap_ip_config_failed");
+  return false;
+}
+
+bool startSoftAp(const AppConfig& cfg) {
+  configureSoftApAddress();
+  const bool ok = WiFi.softAP(cfg.ap_ssid, cfg.ap_pass, telem::kRadioChannel, 0, kApMaxConnections);
+  if (!ok) {
+    Serial.printf("NET softap_start_failed ssid=%s channel=%u\n",
+                  cfg.ap_ssid,
+                  (unsigned)telem::kRadioChannel);
+    return false;
+  }
+  configureDhcpLeaseRange();
+  g_ap_hidden = false;
+  g_ap_ip = WiFi.softAPIP();
+  g_ap_channel = (uint8_t)WiFi.channel();
+  Serial.printf("NET ap_started ssid=%s ip=%s channel=%u\n",
+                cfg.ap_ssid,
+                g_ap_ip.toString().c_str(),
+                (unsigned)g_ap_channel);
+  return true;
+}
+
+void configureNetwork(const AppConfig& cfg) {
+  WiFi.setSleep(false);
+  (void)esp_wifi_set_ps(WIFI_PS_NONE);
+  (void)esp_wifi_set_max_tx_power(78);
+  WiFi.mode(WIFI_AP);
+  if (!startSoftAp(cfg)) {
+    Serial.println("NET ap_start_failed");
+  }
+  Serial.printf("NET final mode=AP_RADIO ip=%s ssid=%s channel=%u ws=ws://%s/ws\n",
+                g_ap_ip.toString().c_str(),
+                cfg.ap_ssid,
+                (unsigned)g_ap_channel,
+                g_ap_ip.toString().c_str());
+}
+
+void configureServices(const AppConfig& cfg) {
+  Serial.println("NET radio enabled");
+  radio_link::begin(cfg);
+  g_last_configured_source_rate_hz = cfg.source_rate_hz;
+  g_last_configured_radio_state_only = cfg.radio_state_only;
+  g_last_configured_radio_lr_mode = cfg.radio_lr_mode;
+  scheduleAirConfigApply();
+}
+
+void printReadyBanner() {
+  Serial.printf("GND READY net=AP_RADIO ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
+                g_ap_ip.toString().c_str(),
+                (unsigned)g_ap_channel);
+  printNetworkSummary("GND NET");
+  Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
+  g_air_wait_announced = true;
+}
+
+void startWebServices() {
+  ws_server::begin();
+  Serial.printf("WEB server_started mode=AP ip=%s port=80\n", g_ap_ip.toString().c_str());
+}
+
+void printNetworkStatus() {
+  printNetworkSummary("NETSTAT");
+}
 
 void scheduleAirStreamRateApply() {
   g_pending_stream_rate_apply = true;
@@ -61,6 +156,7 @@ void printConsoleHelp() {
   Serial.println("  replaystop  - send replay-stop command to AIR");
   Serial.println("  replaystat  - request and print AIR replay status");
   Serial.println("  relink    - restart GND radio link state");
+  Serial.println("  netstat   - print startup network mode and IP");
   Serial.println("  seelink   - start 1Hz AIR link metadata stream");
   Serial.println("  stats     - start 1Hz status stream");
   Serial.println("  x         - stop status stream");
@@ -159,6 +255,8 @@ void handleConsoleCommands() {
         radio_link::restart(cfg);
         scheduleAirConfigApply();
         Serial.printf("RELINK target=%s\n", radio_link::targetSenderMac().c_str());
+      } else if (line.equalsIgnoreCase("netstat")) {
+        printNetworkStatus();
       } else if (line.equalsIgnoreCase("stats")) {
         g_stats_streaming = true;
         g_link_streaming = false;
@@ -333,49 +431,20 @@ void setup() {
   Serial.println("ESP_GND boot");
 
   config_store::begin();
+#if GND_FORCE_FACTORY_RESET_ON_BOOT
+  Serial.println("GND CONFIG forcing factory reset from compile-time defaults");
+  config_store::factoryReset();
+#endif
   const AppConfig& cfg = config_store::get();
-
-  const IPAddress local_ip(192, 168, 4, 1);
-  const IPAddress gateway(192, 168, 4, 1);
-  const IPAddress subnet(255, 255, 255, 0);
-  constexpr int kApChannel = 6;
-  constexpr int kApMaxConnections = 4;
-
-  WiFi.mode(WIFI_AP);
-  WiFi.setSleep(false);
-  (void)esp_wifi_set_ps(WIFI_PS_NONE);
-  (void)esp_wifi_set_max_tx_power(78);
-  if (!WiFi.softAPConfig(local_ip, gateway, subnet)) {
-    Serial.println("AP static IP config failed");
-  }
-  if (!WiFi.softAP(cfg.ap_ssid, cfg.ap_pass, kApChannel, 0, kApMaxConnections)) {
-    Serial.println("softAP start failed");
-  }
-  configureDhcpLeaseRange();
-
-  Serial.printf("AP ssid=%s ip=%s channel=%d ap_lr=%u air_lr_req=%u\n",
-                cfg.ap_ssid,
-                WiFi.softAPIP().toString().c_str(),
-                kApChannel,
-                0U,
-                (unsigned)(cfg.radio_lr_mode != 0U));
+  configureNetwork(cfg);
 
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
   }
 
-  radio_link::begin(cfg);
-  g_last_configured_source_rate_hz = cfg.source_rate_hz;
-  g_last_configured_radio_state_only = cfg.radio_state_only;
-  g_last_configured_radio_lr_mode = cfg.radio_lr_mode;
-  scheduleAirConfigApply();
-  Serial.printf("GND READY ap ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
-                WiFi.softAPIP().toString().c_str(),
-                (unsigned)kApChannel);
-  Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
-  g_air_wait_announced = true;
-
-  ws_server::begin();
+  configureServices(cfg);
+  printReadyBanner();
+  startWebServices();
   printConsoleHelp();
 }
 

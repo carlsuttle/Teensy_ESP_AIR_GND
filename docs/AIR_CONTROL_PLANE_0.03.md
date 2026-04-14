@@ -30,6 +30,12 @@ Adapters that should consume it:
 - AIR machine-readable serial control adapter in `ESP_AIR/src/serial_control.cpp`
 - future websocket or other transport-facing handlers on AIR
 
+Protocol documents defining the thin-adapter contract:
+
+- `docs/AIR_SERIAL_CONTROL_PROTOCOL_0.03.md`
+- `docs/AIR_TO_GND_PROTOCOL_0.03.md`
+- `docs/GND_TO_AIR_CONTROL_PROTOCOL_0.03.md`
+
 Underlying business backends owned elsewhere:
 
 - SD/file backend: `ESP_AIR/src/sd_file_api.*`

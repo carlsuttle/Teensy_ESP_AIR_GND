@@ -94,6 +94,7 @@ struct RemoteStorageStatus {
 };
 
 void begin(const AppConfig& cfg);
+void setNetworkReady(const char* reason);
 void reconfigure(const AppConfig& cfg);
 void restart(const AppConfig& cfg);
 void poll();

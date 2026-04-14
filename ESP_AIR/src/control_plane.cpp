@@ -6,6 +6,9 @@
 namespace control_plane {
 namespace {
 
+constexpr uint32_t kFusionGetTimeoutMs = 1000U;
+constexpr uint32_t kFusionGetPollMs = 5U;
+
 struct StateRegisters {
   bool request_pending = false;
   uint32_t pending_request_id = 0U;
@@ -33,6 +36,12 @@ StateRegisters g_state = {};
 sd_file_api::FileListPage g_last_file_list_page = {};
 
 uint32_t mapSdCode(telem::SdApiStatusCode code) { return (uint32_t)code; }
+
+bool isBusyCode(uint32_t code) {
+  return code == (uint32_t)ControlCode::BusyRecording ||
+         code == (uint32_t)ControlCode::BusyReplay ||
+         code == (uint32_t)ControlCode::BusyRequest;
+}
 
 void recordDisposition(const Request& request, DispositionStatus disposition, uint32_t code) {
   g_state.last_request_id = request.request_id;
@@ -149,6 +158,21 @@ telem::StorageStatusPayloadV1 currentStoragePayload() {
   return payload;
 }
 
+bool waitForFreshFusionSettings(uint32_t previous_fusion_seq,
+                                telem::FusionSettingsV1& out_fusion,
+                                uint32_t timeout_ms = kFusionGetTimeoutMs) {
+  const uint32_t started_ms = millis();
+  while ((uint32_t)(millis() - started_ms) < timeout_ms) {
+    const teensy_link::Snapshot snap = teensy_link::snapshot();
+    if (snap.has_fusion_settings && snap.fusion_rx_seq > previous_fusion_seq) {
+      out_fusion = snap.fusion_settings;
+      return true;
+    }
+    delay(kFusionGetPollMs);
+  }
+  return false;
+}
+
 }  // namespace
 
 void begin() {
@@ -191,10 +215,7 @@ bool submit(const Request& request, Result& out_result) {
 
   const uint32_t validate_code = validateRequest(request);
   if (validate_code != (uint32_t)ControlCode::Ok) {
-    out_result.disposition = (validate_code == (uint32_t)ControlCode::BusyRecording ||
-                              validate_code == (uint32_t)ControlCode::BusyReplay)
-                                 ? DispositionStatus::Rejected
-                                 : DispositionStatus::Rejected;
+    out_result.disposition = isBusyCode(validate_code) ? DispositionStatus::Busy : DispositionStatus::Rejected;
     out_result.disposition_code = validate_code;
     out_result.code = validate_code;
     recordDisposition(request, out_result.disposition, out_result.disposition_code);
@@ -306,11 +327,28 @@ bool submit(const Request& request, Result& out_result) {
       return true;
     }
     case RequestAction::ReplayPause: {
-      const bool ok = replay_bridge::pause();
+      const replay_bridge::Status replay = replay_bridge::status();
+      const bool replay_active = (replay.flags & telem::kReplayStatusFlagActive) != 0U;
+      const bool replay_file_open = (replay.flags & telem::kReplayStatusFlagFileOpen) != 0U;
+      const bool replay_at_eof = (replay.flags & telem::kReplayStatusFlagAtEof) != 0U;
+      const bool replay_paused = (replay.flags & telem::kReplayStatusFlagPaused) != 0U;
+
+      uint32_t completion_code = (uint32_t)ControlCode::Ok;
+      bool ok = false;
+      if (replay_active && replay_file_open) {
+        ok = replay_bridge::pause();
+        if (!ok) completion_code = (uint32_t)ControlCode::BackendFailed;
+      } else {
+        ok = false;
+        completion_code = (replay_at_eof || replay_paused || replay_file_open)
+                              ? (uint32_t)ControlCode::InvalidState
+                              : (uint32_t)ControlCode::BackendFailed;
+      }
+
       out_result.completed = true;
       out_result.completion = ok ? CompletionStatus::CompletedOk : CompletionStatus::CompletedError;
       out_result.ok = ok;
-      out_result.completion_code = ok ? (uint32_t)ControlCode::Ok : (uint32_t)ControlCode::BackendFailed;
+      out_result.completion_code = ok ? (uint32_t)ControlCode::Ok : completion_code;
       out_result.code = out_result.completion_code;
       out_result.has_replay_status = true;
       out_result.replay_status = currentReplayPayload();
@@ -482,15 +520,17 @@ bool submit(const Request& request, Result& out_result) {
       return true;
     }
     case RequestAction::FusionGet: {
-      const bool ok = teensy_link::sendGetFusionSettings();
+      const teensy_link::Snapshot before = teensy_link::snapshot();
+      const bool tx_ok = teensy_link::sendGetFusionSettings();
+      telem::FusionSettingsV1 fresh = {};
+      const bool ok = tx_ok && waitForFreshFusionSettings(before.fusion_rx_seq, fresh);
       out_result.completed = true;
       out_result.completion = ok ? CompletionStatus::CompletedOk : CompletionStatus::CompletedError;
       out_result.ok = ok;
       out_result.completion_code = ok ? (uint32_t)ControlCode::Ok : (uint32_t)ControlCode::BackendFailed;
       out_result.code = out_result.completion_code;
-      const teensy_link::Snapshot snap = teensy_link::snapshot();
-      out_result.has_fusion_settings = snap.has_fusion_settings;
-      if (snap.has_fusion_settings) out_result.fusion_settings = snap.fusion_settings;
+      out_result.has_fusion_settings = ok;
+      if (ok) out_result.fusion_settings = fresh;
       recordCompletion(request, out_result.completion, out_result.completion_code);
       return true;
     }
@@ -535,9 +575,13 @@ void fillStateSnapshot(uint32_t now_ms,
 
   const replay_bridge::Status replay = replay_bridge::status();
   const bool replay_active = (replay.flags & telem::kReplayStatusFlagActive) != 0U;
-  out.replay_state = replay_active ? ActivityState::Active : ActivityState::Idle;
+  const bool replay_file_open = (replay.flags & telem::kReplayStatusFlagFileOpen) != 0U;
+  // Replay state reports "active" only while records are being actively fed.
+  // A paused replay remains file-open and therefore system-occupying, so it is
+  // surfaced as Busy plus replay_paused=true rather than Active.
+  out.replay_state = replay_active ? ActivityState::Active : (replay_file_open ? ActivityState::Busy : ActivityState::Idle);
   out.replay_paused = (replay.flags & telem::kReplayStatusFlagPaused) != 0U;
-  out.replay_file_open = (replay.flags & telem::kReplayStatusFlagFileOpen) != 0U;
+  out.replay_file_open = replay_file_open;
   out.replay_last_command = replay.last_command;
   strlcpy(out.selected_file, replay.current_file, sizeof(out.selected_file));
 

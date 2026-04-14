@@ -157,11 +157,14 @@ Optional request field for `start`:
   `start` without `name` maps to `start_latest`
   `start` with `name` maps to `start_file`
 - `stop`
+- `pause`
+- `seek_relative`
 - `status`
 
 Optional request field:
 
 - `name`
+- `delta_records` for `seek_relative`
 
 ### `fusion`
 
@@ -183,11 +186,25 @@ Required `set` fields:
 - `list_page`
 - `list`
   `list` is an alias for `list_page`
+- `list_json`
+- `mount_media`
+- `eject_media`
+- `delete`
+- `rename`
+- `set_record_prefix`
 
 Optional `list_page` fields:
 
 - `offset`
 - `limit`
+
+Optional file fields:
+
+- `sort_key` = `name | size | date` for `list_json`
+- `sort_dir` = `ascending | descending | asc | desc` for `list_json`
+- `name` for `delete`
+- `name` and `aux_name` for `rename`
+- `prefix` for `set_record_prefix`
 
 ## Mode-Gating Rules
 
@@ -195,11 +212,35 @@ Mode gating is enforced only by the AIR control plane.
 
 Current required behavior:
 
-- replay start during recording returns immediate `rejected` with `code=busy_recording`
-- recording start during replay returns immediate `rejected` with `code=busy_replay`
-- file-list requests during recording return immediate `rejected` with `code=busy_recording`
-- file-list requests during replay return immediate `rejected` with `code=busy_replay`
+- replay start during recording returns immediate `busy` with `code=busy_recording`
+- recording start during replay returns immediate `busy` with `code=busy_replay`
+- file-list requests during recording return immediate `busy` with `code=busy_recording`
+- file-list requests during replay return immediate `busy` with `code=busy_replay`
 - storage status remains readable while recording or replay is active
+
+Replay state rule:
+
+- exported replay state must remain non-idle whenever replay file-open state would still block other requests
+
+Paused replay contract:
+
+- a successful `replay/pause` intentionally clears `replay.active`
+- paused replay remains operationally occupied via:
+  - `replay.paused = true`
+  - `replay.file_open = true`
+  - `replay.at_eof = false`
+  - state snapshot `replay_state = "busy"`
+  - state snapshot `mode = "replay_busy"`
+- this means `active` answers "is AIR currently feeding replay records?" and not
+  "does replay still own the subsystem?"
+- clients must treat `paused=true` plus `file_open=true` as a paused-but-still-open replay session
+- tests should prove replay was active before pause is issued, then expect the paused final state above
+
+Fusion get rule:
+
+- `fusion/get` final success means a fresh post-request fusion-settings sample was observed from Teensy
+- queueing the request alone is not sufficient for `completed_ok`
+- timeout or missing fresh response returns `completed_error`
 
 ## Validation Scripts
 

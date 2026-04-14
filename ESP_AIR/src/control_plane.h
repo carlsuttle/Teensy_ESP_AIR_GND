@@ -73,6 +73,7 @@ enum class ControlCode : uint32_t {
   AlreadyExists = 11U,
   BusyRequest = 12U,
   BackendFailed = 13U,
+  InvalidState = 14U,
 };
 
 enum class RequestAction : uint8_t {
@@ -228,6 +229,7 @@ inline const char* controlCodeText(uint32_t code) {
     case ControlCode::AlreadyExists: return "already_exists";
     case ControlCode::BusyRequest: return "busy_request";
     case ControlCode::BackendFailed: return "backend_failed";
+    case ControlCode::InvalidState: return "invalid_state";
     default: return "unknown";
   }
 }

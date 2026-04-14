@@ -20,6 +20,36 @@ struct LegacyAppConfigV1 {
   uint32_t max_log_bytes;
 };
 
+struct LegacyAppConfigV2 {
+  char ap_ssid[33];
+  char ap_pass[65];
+  uint16_t reserved_transport_port;
+  uint16_t source_rate_hz;
+  uint16_t ui_rate_hz;
+  uint16_t log_rate_hz;
+  uint8_t log_mode;
+  uint8_t radio_state_only;
+  uint8_t radio_lr_mode;
+  uint8_t reserved_flags0;
+  uint32_t max_log_bytes;
+};
+
+#ifndef GND_STA_ENABLE_DEFAULT
+#define GND_STA_ENABLE_DEFAULT 0
+#endif
+
+#ifndef GND_STA_TIMEOUT_MS_DEFAULT
+#define GND_STA_TIMEOUT_MS_DEFAULT 8000
+#endif
+
+#ifndef GND_STA_SSID_DEFAULT
+#define GND_STA_SSID_DEFAULT ""
+#endif
+
+#ifndef GND_STA_PASS_DEFAULT
+#define GND_STA_PASS_DEFAULT ""
+#endif
+
 template <typename T>
 T clampv(T v, T lo, T hi) {
   if (v < lo) return lo;
@@ -37,7 +67,11 @@ void setDefaults(AppConfig& c) {
   c.log_mode = 1;
   c.radio_state_only = 0;
   c.radio_lr_mode = 1;
+  c.sta_enable = GND_STA_ENABLE_DEFAULT ? 1U : 0U;
+  c.sta_connect_timeout_ms = GND_STA_TIMEOUT_MS_DEFAULT;
   c.max_log_bytes = 4UL * 1024UL * 1024UL;
+  strncpy(c.sta_ssid, GND_STA_SSID_DEFAULT, sizeof(c.sta_ssid) - 1);
+  strncpy(c.sta_pass, GND_STA_PASS_DEFAULT, sizeof(c.sta_pass) - 1);
 }
 
 void sanitize(AppConfig& c) {
@@ -47,11 +81,15 @@ void sanitize(AppConfig& c) {
   c.log_mode = 1;
   c.radio_state_only = c.radio_state_only ? 1U : 0U;
   c.radio_lr_mode = c.radio_lr_mode ? 1U : 0U;
+  c.sta_enable = c.sta_enable ? 1U : 0U;
+  c.sta_connect_timeout_ms = clampv<uint16_t>(c.sta_connect_timeout_ms, 1000U, 30000U);
   if (c.max_log_bytes < 512UL * 1024UL) c.max_log_bytes = 512UL * 1024UL;
   if (c.ap_ssid[0] == '\0') strncpy(c.ap_ssid, "Telemetry", sizeof(c.ap_ssid) - 1);
   if (c.ap_pass[0] == '\0') strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
   c.ap_ssid[sizeof(c.ap_ssid) - 1] = '\0';
   c.ap_pass[sizeof(c.ap_pass) - 1] = '\0';
+  c.sta_ssid[sizeof(c.sta_ssid) - 1] = '\0';
+  c.sta_pass[sizeof(c.sta_pass) - 1] = '\0';
 }
 
 void saveInternal() {
@@ -65,6 +103,21 @@ void begin() {
   g_prefs.begin("gnd_cfg", false);
   if (g_prefs.getBytesLength("cfg") == sizeof(g_cfg)) {
     g_prefs.getBytes("cfg", &g_cfg, sizeof(g_cfg));
+  } else if (g_prefs.getBytesLength("cfg") == sizeof(LegacyAppConfigV2)) {
+    LegacyAppConfigV2 legacy = {};
+    g_prefs.getBytes("cfg", &legacy, sizeof(legacy));
+    strlcpy(g_cfg.ap_ssid, legacy.ap_ssid, sizeof(g_cfg.ap_ssid));
+    strlcpy(g_cfg.ap_pass, legacy.ap_pass, sizeof(g_cfg.ap_pass));
+    g_cfg.reserved_transport_port = legacy.reserved_transport_port;
+    g_cfg.source_rate_hz = legacy.source_rate_hz;
+    g_cfg.ui_rate_hz = legacy.ui_rate_hz;
+    g_cfg.log_rate_hz = legacy.log_rate_hz;
+    g_cfg.log_mode = legacy.log_mode;
+    g_cfg.radio_state_only = legacy.radio_state_only;
+    g_cfg.radio_lr_mode = legacy.radio_lr_mode;
+    g_cfg.reserved_flags0 = legacy.reserved_flags0;
+    g_cfg.max_log_bytes = legacy.max_log_bytes;
+    saveInternal();
   } else if (g_prefs.getBytesLength("cfg") == sizeof(LegacyAppConfigV1)) {
     LegacyAppConfigV1 legacy = {};
     g_prefs.getBytes("cfg", &legacy, sizeof(legacy));

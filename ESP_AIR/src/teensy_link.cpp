@@ -24,6 +24,8 @@ uint32_t g_t_us = 0U;
 telem::FusionSettingsV1 g_fusion_settings = {};
 bool g_has_fusion_settings = false;
 uint32_t g_fusion_rx_seq = 0U;
+bool g_fusion_request_pending = false;
+uint32_t g_fusion_request_after_seq = 0U;
 RxStats g_stats = {};
 bool g_has_ack = false;
 uint32_t g_ack_rx_seq = 0U;
@@ -124,6 +126,10 @@ void servicePoll() {
     g_stats.frames_ok++;
     g_stats.last_rx_ms = millis();
     updateFusionFromStateLocked(tmp);
+    if (g_fusion_request_pending && g_fusion_rx_seq > g_fusion_request_after_seq) {
+      setAckLocked(telem::CMD_GET_FUSION_SETTINGS, true, 0U);
+      g_fusion_request_pending = false;
+    }
     queuePendingStateLocked(tmp, seq, t_us);
     portEXIT_CRITICAL(&g_mux);
 
@@ -177,6 +183,8 @@ void begin(const AppConfig& cfg) {
   g_fusion_settings = {};
   g_has_fusion_settings = false;
   g_fusion_rx_seq = 0U;
+  g_fusion_request_pending = false;
+  g_fusion_request_after_seq = 0U;
   g_stats = {};
   g_has_ack = false;
   g_ack_rx_seq = 0U;
@@ -269,16 +277,14 @@ bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
 }
 
 bool sendGetFusionSettings() {
+  const bool ok = queueReplayControl(telem::CMD_GET_FUSION_SETTINGS, nullptr, 0U);
+  if (!ok) return false;
+
   portENTER_CRITICAL(&g_mux);
-  const bool ok = g_has_state;
-  if (ok) {
-    updateFusionFromStateLocked(g_state);
-    setAckLocked(telem::CMD_GET_FUSION_SETTINGS, true, 0U);
-  } else {
-    setAckLocked(telem::CMD_GET_FUSION_SETTINGS, false, 1U);
-  }
+  g_fusion_request_pending = true;
+  g_fusion_request_after_seq = g_fusion_rx_seq;
   portEXIT_CRITICAL(&g_mux);
-  return ok;
+  return true;
 }
 
 bool sendSetCaptureSettings(const telem::CmdSetCaptureSettingsV1& cmd) {

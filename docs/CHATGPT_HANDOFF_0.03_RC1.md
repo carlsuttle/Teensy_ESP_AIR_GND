@@ -176,6 +176,9 @@ Defines:
 ### AIR control-plane design
 
 - [AIR_CONTROL_PLANE_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/AIR_CONTROL_PLANE_0.03.md)
+- [AIR_SERIAL_CONTROL_PROTOCOL_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/AIR_SERIAL_CONTROL_PROTOCOL_0.03.md)
+- [AIR_TO_GND_PROTOCOL_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/AIR_TO_GND_PROTOCOL_0.03.md)
+- [GND_TO_AIR_CONTROL_PROTOCOL_0.03.md](c:/Users/dell/Platformio/esp32_crsf_telemetry/Teensy_ESP_AIR_GND/docs/GND_TO_AIR_CONTROL_PROTOCOL_0.03.md)
 
 Defines:
 
@@ -183,6 +186,7 @@ Defines:
 - thin-adapter model
 - state / request / result register concepts
 - migration target for serial, radio, and future interfaces
+- the AIR-authored ESP-NOW instrumentation/control ownership boundary for GND
 
 ---
 

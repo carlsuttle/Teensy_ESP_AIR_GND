@@ -106,44 +106,178 @@ function Parse-TeensyPerf {
   }
 }
 
+function Clear-ControlLineHistory {
+  param([hashtable]$Context)
+
+  if ($Context.Lines.Count -gt 0) {
+    $Context.Lines.Clear()
+  }
+  $Context.Partial = ""
+}
+
+function Invoke-PreCaseDrain {
+  param(
+    [hashtable]$Context,
+    [string]$Label,
+    [int]$CaseId,
+    [int]$DrainMs = 300
+  )
+
+  $drainedChars = 0
+  $drainedLines = 0
+  try {
+    $Context.Port.DiscardInBuffer()
+  } catch {}
+
+  $deadline = (Get-Date).AddMilliseconds($DrainMs)
+  while ((Get-Date) -lt $deadline) {
+    $chunk = $Context.Port.ReadExisting()
+    if ($chunk) {
+      $drainedChars += $chunk.Length
+      foreach ($line in ($chunk -split "`r?`n")) {
+        if ($line.Trim()) { $drainedLines++ }
+      }
+    }
+    Start-Sleep -Milliseconds 25
+  }
+
+  Clear-ControlLineHistory -Context $Context
+  Write-ControlLog -Context $Context -Source "HARNESS" -Text (
+    "pre_case_drain label={0} case_id={1} drained_lines={2} drained_chars={3}" -f
+    $Label,
+    $CaseId,
+    $drainedLines,
+    $drainedChars
+  )
+}
+
+function Write-ReplayBenchBuffer {
+  param(
+    [hashtable]$Context,
+    [int]$CaseId,
+    [System.Text.StringBuilder]$Buffer
+  )
+
+  Write-ControlLog -Context $Context -Source "HARNESS" -Text ("REPLAYBENCH BUFFER BEGIN case_id={0}" -f $CaseId)
+  $text = $Buffer.ToString().Trim()
+  if ($text) {
+    foreach ($line in ($text -split "`r?`n")) {
+      if ($line.Trim()) {
+        Write-ControlLog -Context $Context -Source "HARNESS" -Text $line.TrimEnd()
+      }
+    }
+  } else {
+    Write-ControlLog -Context $Context -Source "HARNESS" -Text "(empty)"
+  }
+  Write-ControlLog -Context $Context -Source "HARNESS" -Text ("REPLAYBENCH BUFFER END case_id={0}" -f $CaseId)
+}
+
+function Invoke-PerfTimeoutForensics {
+  param(
+    [hashtable]$Context,
+    [System.IO.Ports.SerialPort]$TeensyPort,
+    [string]$Label,
+    [int]$CaseId
+  )
+
+  Write-ControlLog -Context $Context -Source "HARNESS" -Text (
+    "TIMEOUT FORENSICS case_id={0} label={1}" -f $CaseId, $Label
+  )
+
+  foreach ($request in @(
+    @{ category = "state"; action = "get" },
+    @{ category = "recording"; action = "status" },
+    @{ category = "replay"; action = "status" },
+    @{ category = "file"; action = "storage_status" },
+    @{ category = "fusion"; action = "get" }
+  )) {
+    try {
+      $resp = Invoke-AirControlRequest -Context $Context -Request $request -TimeoutMs 4000
+      if ($null -ne $resp.Final) {
+        Write-ControlLog -Context $Context -Source "FORENSIC" -Text (
+          "{0}/{1} final={2}/{3}" -f
+          $request.category,
+          $request.action,
+          $resp.Final.status,
+          $resp.Final.code
+        )
+      } elseif ($null -ne $resp.Immediate) {
+        Write-ControlLog -Context $Context -Source "FORENSIC" -Text (
+          "{0}/{1} immediate={2}/{3}" -f
+          $request.category,
+          $request.action,
+          $resp.Immediate.status,
+          $resp.Immediate.code
+        )
+      } else {
+        Write-ControlLog -Context $Context -Source "FORENSIC" -Text (
+          "{0}/{1} no_response" -f $request.category, $request.action
+        )
+      }
+    } catch {
+      Write-ControlLog -Context $Context -Source "FORENSIC" -Text (
+        "{0}/{1} error={2}" -f
+        $request.category,
+        $request.action,
+        $_.Exception.Message
+      )
+    }
+  }
+
+  try {
+    [void](Invoke-TextCommand -Port $TeensyPort -Command "showsource" -MatchRegex "SPI PERF" -TimeoutMs 4000 -LogContext $Context)
+  } catch {
+    Write-ControlLog -Context $Context -Source "FORENSIC" -Text ("showsource error={0}" -f $_.Exception.Message)
+  }
+}
+
 function Invoke-ReplayBenchCase {
   param(
     [hashtable]$AirContext,
     [System.IO.Ports.SerialPort]$TeensyPort,
     [string]$Label,
-    [bool]$InjectControl
+    [bool]$ControlAroundRun,
+    [int]$CaseId
   )
 
-  Write-ControlLog -Context $AirContext -Source "CASE" -Text ("START {0}" -f $Label)
+  $caseStart = Get-Date
+  $deadlineMs = $DurationMs + 12000
+  Write-ControlLog -Context $AirContext -Source "CASE" -Text (
+    "START label={0} case_id={1} duration_ms={2} deadline_ms={3}" -f
+    $Label,
+    $CaseId,
+    $DurationMs,
+    $deadlineMs
+  )
+  if ($ControlAroundRun) {
+    foreach ($request in @(
+      @{ category = "state"; action = "get" },
+      @{ category = "recording"; action = "status" },
+      @{ category = "replay"; action = "status" },
+      @{ category = "file"; action = "storage_status" },
+      @{ category = "fusion"; action = "get" }
+    )) {
+      $resp = Invoke-AirControlRequest -Context $AirContext -Request $request -TimeoutMs 3000
+      Assert-ControlCompletedOk -Response $resp -Label ("perf pre {0}/{1}" -f $request.category, $request.action)
+    }
+  }
+
   [void](Invoke-TextCommand -Port $TeensyPort -Command "resetloopperf" -MatchRegex "loop perf reset" -TimeoutMs 3000 -LogContext $AirContext)
+  Invoke-PreCaseDrain -Context $AirContext -Label $Label -CaseId $CaseId
 
   $benchCommand = "tapi replaybench $DurationMs $BatchHz $BatchRecords"
-  Write-ControlLog -Context $AirContext -Source "CMD" -Text $benchCommand
-  $AirContext.Port.DiscardInBuffer()
+  Write-ControlLog -Context $AirContext -Source "CMD" -Text ("case_id={0} {1}" -f $CaseId, $benchCommand)
   $scanIndex = $AirContext.Lines.Count
   $AirContext.Port.WriteLine($benchCommand)
 
-  $deadline = (Get-Date).AddMilliseconds($DurationMs + 12000)
+  $deadline = $caseStart.AddMilliseconds($deadlineMs)
   $benchBuffer = New-Object System.Text.StringBuilder
   $jsonCount = 0
-  $nextControlAt = (Get-Date)
+  if ($ControlAroundRun) {
+    $jsonCount += 5
+  }
 
   while ((Get-Date) -lt $deadline) {
-    if ($InjectControl -and (Get-Date) -ge $nextControlAt) {
-      foreach ($request in @(
-        @{ category = "state"; action = "get" },
-        @{ category = "recording"; action = "status" },
-        @{ category = "replay"; action = "status" },
-        @{ category = "file"; action = "storage_status" },
-        @{ category = "fusion"; action = "get" }
-      )) {
-        $resp = Invoke-AirControlRequest -Context $AirContext -Request $request -TimeoutMs 3000
-        Assert-ControlCompletedOk -Response $resp -Label ("perf {0}/{1}" -f $request.category, $request.action)
-        $jsonCount++
-      }
-      $nextControlAt = (Get-Date).AddMilliseconds($ControlPollMs)
-    }
-
     Read-ControlPort -Context $AirContext
     for ($i = $scanIndex; $i -lt $AirContext.Lines.Count; $i++) {
       $line = $AirContext.Lines[$i]
@@ -164,17 +298,52 @@ function Invoke-ReplayBenchCase {
   }
 
   if ($benchBuffer.ToString() -notmatch 'TAPI REPLAYBENCH RESULT') {
+    $elapsedMs = [int]((Get-Date) - $caseStart).TotalMilliseconds
+    Write-ReplayBenchBuffer -Context $AirContext -CaseId $CaseId -Buffer $benchBuffer
+    Invoke-PerfTimeoutForensics -Context $AirContext -TeensyPort $TeensyPort -Label $Label -CaseId $CaseId
+    Write-ControlLog -Context $AirContext -Source "CASE" -Text (
+      "END label={0} case_id={1} elapsed_ms={2} status=timeout" -f
+      $Label,
+      $CaseId,
+      $elapsedMs
+    )
     throw ("{0}: timed out waiting for TAPI REPLAYBENCH RESULT" -f $Label)
   }
 
+  # Sample Teensy perf immediately after replaybench completes so the counters
+  # represent the benchmark window, not post-benchmark live standalone traffic.
   $teensyResponse = Invoke-TextCommand -Port $TeensyPort -Command "showsource" -MatchRegex "SPI PERF" -TimeoutMs 4000 -LogContext $AirContext
+
+  if ($ControlAroundRun) {
+    foreach ($request in @(
+      @{ category = "state"; action = "get" },
+      @{ category = "recording"; action = "status" },
+      @{ category = "replay"; action = "status" },
+      @{ category = "file"; action = "storage_status" },
+      @{ category = "fusion"; action = "get" }
+    )) {
+      $resp = Invoke-AirControlRequest -Context $AirContext -Request $request -TimeoutMs 3000
+      Assert-ControlCompletedOk -Response $resp -Label ("perf post {0}/{1}" -f $request.category, $request.action)
+    }
+    $jsonCount += 5
+  }
+
   $airPerf = Parse-AirReplayBench -Response $benchBuffer.ToString()
   $teensyPerf = Parse-TeensyPerf -Response $teensyResponse
   if ($null -eq $airPerf) { throw ("{0}: unable to parse AIR replay benchmark output" -f $Label) }
   if ($null -eq $teensyPerf) { throw ("{0}: unable to parse Teensy perf output" -f $Label) }
 
+  $elapsedMs = [int]((Get-Date) - $caseStart).TotalMilliseconds
+  Write-ControlLog -Context $AirContext -Source "CASE" -Text (
+    "END label={0} case_id={1} elapsed_ms={2} status=ok" -f
+    $Label,
+    $CaseId,
+    $elapsedMs
+  )
+
   return [pscustomobject]@{
     label = $Label
+    case_id = $CaseId
     json_requests = $jsonCount
     air = $airPerf
     teensy = $teensyPerf
@@ -216,8 +385,8 @@ try {
   [void](Invoke-TextCommand -Port $airContext.Port -Command "quiet on" -MatchRegex "QUIET on" -TimeoutMs 2000 -LogContext $airContext)
   [void](Invoke-TextCommand -Port $teensyPort -Command "quiet on" -MatchRegex "QUIET enabled=1|QUIET on" -TimeoutMs 2000 -LogContext $airContext)
 
-  $baseline = Invoke-ReplayBenchCase -AirContext $airContext -TeensyPort $teensyPort -Label "post_integration_baseline" -InjectControl:$false
-  $withControl = Invoke-ReplayBenchCase -AirContext $airContext -TeensyPort $teensyPort -Label "with_serial_control_activity" -InjectControl:$true
+  $baseline = Invoke-ReplayBenchCase -AirContext $airContext -TeensyPort $teensyPort -Label "post_integration_baseline" -ControlAroundRun:$false -CaseId 1
+  $withControl = Invoke-ReplayBenchCase -AirContext $airContext -TeensyPort $teensyPort -Label "with_serial_control_activity" -ControlAroundRun:$true -CaseId 2
 
   Write-PerfSummary -Context $airContext -Case $baseline
   Write-PerfSummary -Context $airContext -Case $withControl

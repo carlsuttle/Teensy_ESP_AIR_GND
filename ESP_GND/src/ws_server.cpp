@@ -63,6 +63,52 @@ uint32_t g_max_ui_tx_latency_ms = 0U;
 uint32_t g_last_files_revision_sent = 0U;
 uint32_t g_last_storage_revision_sent = 0U;
 uint32_t g_last_storage_poll_ms = 0U;
+uint32_t g_http_root_gets = 0U;
+uint32_t g_http_asset_gets = 0U;
+uint32_t g_http_not_found = 0U;
+uint32_t g_ws_connects = 0U;
+uint32_t g_ws_disconnects = 0U;
+uint32_t g_ws_snapshots_sent = 0U;
+uint32_t g_ws_live_updates_sent = 0U;
+uint32_t g_ws_send_failures = 0U;
+uint32_t g_ws_control_rx = 0U;
+uint32_t g_ws_control_tx_air = 0U;
+uint32_t g_ws_control_ack = 0U;
+uint32_t g_ws_control_tx = 0U;
+uint32_t g_last_ws_connect_ms = 0U;
+uint32_t g_last_ws_send_ms = 0U;
+uint32_t g_last_ws_live_log_ms = 0U;
+
+const char* sendStatusText(AsyncWebSocket::SendStatus status) {
+  switch (status) {
+    case AsyncWebSocket::ENQUEUED: return "enqueued";
+    case AsyncWebSocket::PARTIALLY_ENQUEUED: return "partial";
+    case AsyncWebSocket::DISCARDED:
+    default:
+      return "discarded";
+  }
+}
+
+void logHttpRequest(const char* kind, AsyncWebServerRequest* request, const char* path) {
+  const String ip = request ? request->client()->remoteIP().toString() : String("-");
+  Serial.printf("WEB %s path=%s from=%s\n",
+                kind ? kind : "http_get",
+                path ? path : "-",
+                ip.c_str());
+}
+
+void serveLoggedFile(AsyncWebServerRequest* request, const char* path, const char* content_type, bool root_request) {
+  if (root_request) {
+    g_http_root_gets++;
+    logHttpRequest("http_get", request, path);
+  } else {
+    g_http_asset_gets++;
+    logHttpRequest("http_asset", request, path);
+  }
+  AsyncWebServerResponse* response = request->beginResponse(LittleFS, path, content_type);
+  response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  request->send(response);
+}
 
 const char* opText(PendingOp op) {
   switch (op) {
@@ -96,10 +142,15 @@ uint16_t expectedAckCommand(PendingOp op) {
   }
 }
 
-void sendJson(const JsonDocument& doc) {
+AsyncWebSocket::SendStatus sendJson(const JsonDocument& doc) {
   String text;
   serializeJson(doc, text);
-  g_ws.textAll(text);
+  const AsyncWebSocket::SendStatus status = g_ws.textAll(text);
+  g_last_ws_send_ms = millis();
+  if (status != AsyncWebSocket::ENQUEUED) {
+    g_ws_send_failures++;
+  }
+  return status;
 }
 
 void sendAck(PendingOp op, uint32_t req_id, bool ok, uint32_t code, const char* detail = "") {
@@ -110,7 +161,14 @@ void sendAck(PendingOp op, uint32_t req_id, bool ok, uint32_t code, const char* 
   doc["ok"] = ok;
   doc["code"] = code;
   if (detail && detail[0] != '\0') doc["detail"] = detail;
-  sendJson(doc);
+  const AsyncWebSocket::SendStatus status = sendJson(doc);
+  g_ws_control_tx++;
+  Serial.printf("CTRL tx_to_ws op=%s req_id=%lu ok=%u code=%lu send=%s\n",
+                opText(op),
+                (unsigned long)req_id,
+                ok ? 1U : 0U,
+                (unsigned long)code,
+                sendStatusText(status));
 }
 
 void sendHello(AsyncWebSocketClient* client) {
@@ -129,7 +187,16 @@ void sendHello(AsyncWebSocketClient* client) {
   fusion["actions"] = "set";
   String text;
   serializeJson(doc, text);
-  if (client) client->text(text);
+  if (client) {
+    const bool ok = client->text(text);
+    g_last_ws_send_ms = millis();
+    if (!ok) g_ws_send_failures++;
+    Serial.printf("WEB ws_hello client=%u ip=%s ok=%u bytes=%u\n",
+                  client->id(),
+                  client->remoteIP().toString().c_str(),
+                  ok ? 1U : 0U,
+                  (unsigned)text.length());
+  }
 }
 
 void sendFiles(uint32_t req_id = 0U) {
@@ -138,7 +205,10 @@ void sendFiles(uint32_t req_id = 0U) {
   if (deserializeJson(doc, payload)) return;
   doc["type"] = "files";
   if (req_id != 0U) doc["req_id"] = req_id;
-  sendJson(doc);
+  const AsyncWebSocket::SendStatus status = sendJson(doc);
+  Serial.printf("WEB ws_files req_id=%lu send=%s\n",
+                (unsigned long)req_id,
+                sendStatusText(status));
   g_last_files_revision_sent = radio_link::remoteFilesStatus().revision;
 }
 
@@ -148,7 +218,10 @@ void sendStorage(uint32_t req_id = 0U) {
   if (deserializeJson(doc, payload)) return;
   doc["type"] = "storage";
   if (req_id != 0U) doc["req_id"] = req_id;
-  sendJson(doc);
+  const AsyncWebSocket::SendStatus status = sendJson(doc);
+  Serial.printf("WEB ws_storage req_id=%lu send=%s\n",
+                (unsigned long)req_id,
+                sendStatusText(status));
   g_last_storage_revision_sent = radio_link::remoteStorageStatus().revision;
 }
 
@@ -205,15 +278,6 @@ void maybeBroadcastSnapshot() {
   doc["recording_busy"] = (snap.log_status.flags & telem::kLogStatusFlagBusy) != 0U;
   doc["recording_session_id"] = snap.log_status.session_id;
   doc["recording_bytes_written"] = snap.log_status.bytes_written;
-  doc["time_state"] = telem::timeStateText(snap.live_status.time_state);
-  doc["time_source"] = telem::timeSourceText(snap.live_status.time_source);
-  doc["gps_calendar_present"] =
-      (snap.live_status.time_flags & telem::kTimeStatusFlagGpsCalendarPresent) != 0U;
-  doc["gps_time_valid"] = (snap.live_status.time_flags & telem::kTimeStatusFlagGpsTimeValid) != 0U;
-  doc["system_time_set"] = (snap.live_status.time_flags & telem::kTimeStatusFlagSystemTimeSet) != 0U;
-  doc["system_time_utc_s"] = snap.live_status.system_time_utc_s;
-  doc["time_last_set_age_ms"] = snap.live_status.time_last_set_age_ms;
-  doc["time_sync_count"] = snap.live_status.time_sync_count;
   doc["replay_active"] = (snap.replay_status.flags & telem::kReplayStatusFlagActive) != 0U;
   doc["replay_paused"] = (snap.replay_status.flags & telem::kReplayStatusFlagPaused) != 0U;
   doc["replay_file_open"] = (snap.replay_status.flags & telem::kReplayStatusFlagFileOpen) != 0U;
@@ -225,7 +289,6 @@ void maybeBroadcastSnapshot() {
   doc["replay_last_error"] = snap.replay_status.last_error;
   doc["replay_last_command"] = snap.replay_status.last_command;
   doc["replay_current_file"] = snap.replay_status.current_file;
-  doc["has_state"] = snap.has_state;
   doc["roll_deg"] = snap.state.roll_deg;
   doc["pitch_deg"] = snap.state.pitch_deg;
   doc["yaw_deg"] = snap.state.yaw_deg;
@@ -257,18 +320,19 @@ void maybeBroadcastSnapshot() {
   doc["gps_hour"] = gps_time.hour;
   doc["gps_min"] = gps_time.minute;
   doc["gps_sec"] = gps_time.second;
-  if (gps_calendar_valid) {
-    JsonObject calendar = doc["gps_calendar"].to<JsonObject>();
-    calendar["year"] = gps_time.year;
-    calendar["month"] = gps_time.month;
-    calendar["day"] = gps_time.day;
-    calendar["hour"] = gps_time.hour;
-    calendar["min"] = gps_time.minute;
-    calendar["sec"] = gps_time.second;
-  }
 
   updateTxStats(snap, now_ms);
-  sendJson(doc);
+  const AsyncWebSocket::SendStatus status = sendJson(doc);
+  g_ws_snapshots_sent++;
+  g_ws_live_updates_sent++;
+  if (g_last_ws_live_log_ms == 0U || (uint32_t)(now_ms - g_last_ws_live_log_ms) >= 1000U) {
+    Serial.printf("WEB ws_live clients=%u bytes=%u seq=%lu send=%s\n",
+                  (unsigned)g_ws.count(),
+                  (unsigned)measureJson(doc),
+                  (unsigned long)snap.seq,
+                  sendStatusText(status));
+    g_last_ws_live_log_ms = now_ms;
+  }
   g_last_state_broadcast_ms = now_ms;
 }
 
@@ -278,7 +342,7 @@ void clearPending() {
 
 bool enqueuePending(const PendingCommand& next) {
   if (g_pending.op != PendingOp::None) {
-    Serial.printf("WSCTL enqueue_busy op=%s req=%lu pending=%s\r\n",
+    Serial.printf("CTRL enqueue_busy op=%s req_id=%lu pending=%s\n",
                   opText(next.op),
                   (unsigned long)next.req_id,
                   opText(g_pending.op));
@@ -286,14 +350,14 @@ bool enqueuePending(const PendingCommand& next) {
   }
   g_pending = next;
   g_pending.started_ms = millis();
-  Serial.printf("WSCTL enqueue op=%s req=%lu\r\n",
+  Serial.printf("CTRL enqueue op=%s req_id=%lu\n",
                 opText(next.op),
                 (unsigned long)next.req_id);
   return true;
 }
 
 void finalizePending(bool ok, uint32_t code, const char* detail = "") {
-  Serial.printf("WSCTL finalize op=%s req=%lu ok=%u code=%lu detail=%s\r\n",
+  Serial.printf("CTRL finalize op=%s req_id=%lu ok=%u code=%lu detail=%s\n",
                 opText(g_pending.op),
                 (unsigned long)g_pending.req_id,
                 ok ? 1U : 0U,
@@ -355,6 +419,11 @@ void processPending() {
 
     if (!tx_ok) {
       finalizePending(false, 1U, "tx_failed");
+    } else {
+      g_ws_control_tx_air++;
+      Serial.printf("CTRL tx_to_air op=%s req_id=%lu ok=1\n",
+                    opText(g_pending.op),
+                    (unsigned long)g_pending.req_id);
     }
     return;
   }
@@ -366,6 +435,12 @@ void processPending() {
         snap.ack_command == expected &&
         snap.ack_rx_seq != 0U &&
         snap.ack_rx_seq != g_pending.ack_baseline) {
+      g_ws_control_ack++;
+      Serial.printf("CTRL ack_from_air op=%s req_id=%lu ok=%u code=%lu\n",
+                    opText(g_pending.op),
+                    (unsigned long)g_pending.req_id,
+                    snap.ack_ok ? 1U : 0U,
+                    (unsigned long)snap.ack_code);
       if (g_pending.op == PendingOp::SetFusion && snap.ack_ok) {
         (void)radio_link::sendGetFusionSettings();
       }
@@ -400,6 +475,12 @@ void processPending() {
         snap.ack_command == telem::CMD_GET_LOG_FILE_LIST &&
         snap.ack_rx_seq != 0U &&
         snap.ack_rx_seq != g_pending.ack_baseline) {
+      g_ws_control_ack++;
+      Serial.printf("CTRL ack_from_air op=%s req_id=%lu ok=%u code=%lu\n",
+                    opText(g_pending.op),
+                    (unsigned long)g_pending.req_id,
+                    snap.ack_ok ? 1U : 0U,
+                    (unsigned long)snap.ack_code);
       g_pending.ack_baseline = snap.ack_rx_seq;
       if (!snap.ack_ok) {
         finalizePending(false, snap.ack_code, rejectDetailText(g_pending.op, snap.ack_code));
@@ -426,13 +507,9 @@ void processPending() {
 }
 
 void handleWsMessage(const char* text, size_t len) {
-  Serial.printf("WSCTL rx len=%u text=%.*s\r\n",
-                (unsigned)len,
-                (int)len,
-                text ? text : "");
   JsonDocument doc;
   if (deserializeJson(doc, text, len)) {
-    Serial.println("WSCTL parse_error");
+    Serial.println("WEB ws_parse_error");
     return;
   }
 
@@ -440,8 +517,13 @@ void handleWsMessage(const char* text, size_t len) {
   const uint32_t req_id = doc["req_id"] | 0U;
 
   if (strcmp(type, "control") == 0) {
+    g_ws_control_rx++;
     const char* category = doc["category"] | "";
     const char* action = doc["action"] | "";
+    Serial.printf("CTRL rx_from_ws req_id=%lu category=%s action=%s\n",
+                  (unsigned long)req_id,
+                  category,
+                  action);
 
     if (strcmp(category, "recording") == 0) {
       PendingCommand next = {};
@@ -512,7 +594,7 @@ void handleWsMessage(const char* text, size_t len) {
     err["ok"] = false;
     err["code"] = 4U;
     err["detail"] = "unsupported_control";
-    Serial.printf("WSCTL unsupported_control req=%lu category=%s action=%s\r\n",
+    Serial.printf("CTRL unsupported_control req_id=%lu category=%s action=%s\n",
                   (unsigned long)req_id,
                   category,
                   action);
@@ -526,7 +608,7 @@ void handleWsMessage(const char* text, size_t len) {
   err["ok"] = false;
   err["code"] = 4U;
   err["detail"] = "unsupported";
-  Serial.printf("WSCTL unsupported_message req=%lu type=%s\r\n",
+  Serial.printf("WEB ws_unsupported_message req_id=%lu type=%s\n",
                 (unsigned long)req_id,
                 type);
   sendJson(err);
@@ -540,14 +622,31 @@ void onWsEvent(AsyncWebSocket* server,
                size_t len) {
   (void)server;
   if (type == WS_EVT_CONNECT) {
-    Serial.printf("WSCTL connect client=%u total=%u\r\n",
+    g_ws_connects++;
+    g_last_ws_connect_ms = millis();
+    Serial.printf("WEB ws_open client=%u ip=%s total=%u\n",
                   client ? client->id() : 0U,
+                  client ? client->remoteIP().toString().c_str() : "-",
                   (unsigned)g_ws.count());
     sendHello(client);
     sendFiles();
     sendStorage();
     (void)radio_link::sendGetStorageStatus();
     (void)radio_link::sendGetReplayStatus();
+    return;
+  }
+  if (type == WS_EVT_DISCONNECT) {
+    g_ws_disconnects++;
+    Serial.printf("WEB ws_close client=%u total=%u\n",
+                  client ? client->id() : 0U,
+                  (unsigned)g_ws.count());
+    return;
+  }
+  if (type == WS_EVT_ERROR) {
+    g_ws_send_failures++;
+    Serial.printf("WEB ws_error client=%u total=%u\n",
+                  client ? client->id() : 0U,
+                  (unsigned)g_ws.count());
     return;
   }
   if (type != WS_EVT_DATA || !arg || !data || len == 0U) return;
@@ -562,10 +661,24 @@ void onWsEvent(AsyncWebSocket* server,
 void begin() {
   g_ws.onEvent(onWsEvent);
   g_server.addHandler(&g_ws);
+  g_server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    serveLoggedFile(request, "/index.html", "text/html", true);
+  });
+  g_server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest* request) {
+    serveLoggedFile(request, "/style.css", "text/css", false);
+  });
+  g_server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest* request) {
+    serveLoggedFile(request, "/app.js", "application/javascript", false);
+  });
   g_server.serveStatic("/", LittleFS, "/")
       .setDefaultFile("index.html")
       .setTryGzipFirst(false)
       .setCacheControl("no-cache, no-store, must-revalidate");
+  g_server.onNotFound([](AsyncWebServerRequest* request) {
+    g_http_not_found++;
+    logHttpRequest("http_404", request, request ? request->url().c_str() : "-");
+    request->send(404, "text/plain", "Not found");
+  });
   g_server.begin();
 }
 
@@ -603,6 +716,20 @@ Stats stats() {
   out.last_ui_tx_ms = g_last_ui_tx_ms;
   out.last_ui_tx_latency_ms = g_last_ui_tx_latency_ms;
   out.max_ui_tx_latency_ms = g_max_ui_tx_latency_ms;
+  out.http_root_gets = g_http_root_gets;
+  out.http_asset_gets = g_http_asset_gets;
+  out.http_not_found = g_http_not_found;
+  out.ws_connects = g_ws_connects;
+  out.ws_disconnects = g_ws_disconnects;
+  out.ws_snapshots_sent = g_ws_snapshots_sent;
+  out.ws_live_updates_sent = g_ws_live_updates_sent;
+  out.ws_send_failures = g_ws_send_failures;
+  out.ws_control_rx = g_ws_control_rx;
+  out.ws_control_tx_air = g_ws_control_tx_air;
+  out.ws_control_ack = g_ws_control_ack;
+  out.ws_control_tx = g_ws_control_tx;
+  out.last_ws_connect_ms = g_last_ws_connect_ms;
+  out.last_ws_send_ms = g_last_ws_send_ms;
   return out;
 }
 
@@ -615,6 +742,21 @@ void resetCounters() {
   g_last_ui_tx_ms = 0U;
   g_last_ui_tx_latency_ms = 0U;
   g_max_ui_tx_latency_ms = 0U;
+  g_http_root_gets = 0U;
+  g_http_asset_gets = 0U;
+  g_http_not_found = 0U;
+  g_ws_connects = 0U;
+  g_ws_disconnects = 0U;
+  g_ws_snapshots_sent = 0U;
+  g_ws_live_updates_sent = 0U;
+  g_ws_send_failures = 0U;
+  g_ws_control_rx = 0U;
+  g_ws_control_tx_air = 0U;
+  g_ws_control_ack = 0U;
+  g_ws_control_tx = 0U;
+  g_last_ws_connect_ms = 0U;
+  g_last_ws_send_ms = 0U;
+  g_last_ws_live_log_ms = 0U;
   g_last_files_revision_sent = 0U;
   g_last_storage_revision_sent = 0U;
   g_last_storage_poll_ms = 0U;

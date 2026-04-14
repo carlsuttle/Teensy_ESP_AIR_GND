@@ -1013,6 +1013,44 @@ void printTimeStatus(const char* tag) {
                 (unsigned)ts.last_trusted_gps.second);
 }
 
+bool printManagedFilesViaSdApiPaged() {
+  bool first = true;
+  Serial.print("[");
+  for (uint16_t offset = 0U;;) {
+    control_plane::Request request = {};
+    request.category = control_plane::RequestCategory::FileSd;
+    request.action = control_plane::RequestAction::FileListPage;
+    request.command_id = telem::CMD_GET_LOG_FILE_LIST;
+    request.offset = offset;
+    request.limit = 32U;
+    const control_plane::Result result = submitConsoleRequest(request);
+    if (!result.ok || !result.has_file_list_page) {
+      Serial.println("]");
+      Serial.printf("AIRLOG files_ok=0 code=%s offset=%u\r\n",
+                    telem::sdApiStatusText(result.code),
+                    (unsigned)offset);
+      return false;
+    }
+
+    const sd_file_api::FileListPage& page = control_plane::lastFileListPage();
+    for (uint16_t i = 0U; i < page.returned_files; ++i) {
+      if (!first) Serial.print(",");
+      first = false;
+      Serial.print("{\"name\":\"");
+      Serial.print(page.entries[i].name);
+      Serial.print("\",\"size_bytes\":");
+      Serial.print(page.entries[i].size_bytes);
+      Serial.print(",\"mtime_utc_s\":");
+      Serial.print(page.entries[i].mtime_utc_s);
+      Serial.print("}");
+    }
+    if (!page.has_more) break;
+    offset = (uint16_t)(offset + page.returned_files);
+  }
+  Serial.println("]");
+  return true;
+}
+
 bool waitForLogStoreIdle(uint32_t timeout_ms) {
   const uint32_t started_ms = millis();
   while (log_store::busy()) {
@@ -2157,14 +2195,10 @@ void handleConsoleCommands() {
           if (strcmp(dir_buf, "asc") == 0) sort_dir = log_store::FileSortDirection::ascending;
           else if (strcmp(dir_buf, "desc") == 0) sort_dir = log_store::FileSortDirection::descending;
         }
-        control_plane::Request request = {};
-        request.category = control_plane::RequestCategory::FileSd;
-        request.action = control_plane::RequestAction::FileListJson;
-        request.command_id = telem::CMD_GET_LOG_FILE_LIST;
-        request.sort_key = sort_key;
-        request.sort_dir = sort_dir;
-        const control_plane::Result result = submitConsoleRequest(request);
-        Serial.println(result.has_files_json ? result.files_json : String("[]"));
+        if (sort_key != log_store::FileSortKey::date || sort_dir != log_store::FileSortDirection::descending) {
+          Serial.println("AIRLOG files_note=paged_sd_api_unsorted");
+        }
+        (void)printManagedFilesViaSdApiPaged();
       } else if (strncmp(g_console_line, "logprefix", 9) == 0) {
         char prefix_buf[24] = {};
         if (sscanf(g_console_line + 9, "%23s", prefix_buf) == 1) {

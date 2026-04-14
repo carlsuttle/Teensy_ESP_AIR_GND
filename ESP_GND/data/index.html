@@ -6,847 +6,117 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
-  <title>Telemetry V2 Control Monitor</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #09111a;
-      --panel: #111c28;
-      --panel-2: #162434;
-      --line: #284057;
-      --ink: #e7f0f7;
-      --muted: #8fa8bc;
-      --good: #5ee28a;
-      --warn: #ffd166;
-      --bad: #ff6b6b;
-      --accent: #59c3ff;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background:
-        radial-gradient(circle at top, rgba(89, 195, 255, 0.12), transparent 30%),
-        linear-gradient(180deg, #081019 0%, #09111a 100%);
-      color: var(--ink);
-      font: 14px/1.45 "Segoe UI", Tahoma, sans-serif;
-    }
-    main {
-      max-width: 1180px;
-      margin: 0 auto;
-      padding: 18px;
-      display: grid;
-      gap: 16px;
-    }
-    .panel {
-      background: rgba(17, 28, 40, 0.92);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 16px;
-      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22);
-      backdrop-filter: blur(8px);
-    }
-    .hero {
-      display: grid;
-      gap: 14px;
-      grid-template-columns: 2fr 1fr;
-      align-items: start;
-    }
-    .title {
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-    }
-    .subtitle {
-      color: var(--muted);
-      margin-top: 6px;
-    }
-    .badges, .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 12px;
-    }
-    .badge, button {
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 8px 12px;
-      background: var(--panel-2);
-      color: var(--ink);
-      font: inherit;
-    }
-    .badge.good { color: var(--good); }
-    .badge.warn { color: var(--warn); }
-    .badge.bad { color: var(--bad); }
-    button {
-      cursor: pointer;
-    }
-    .grid {
-      display: grid;
-      gap: 14px;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    }
-    .metric {
-      background: var(--panel-2);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px;
-    }
-    .metric-label {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-    }
-    .metric-value {
-      font-size: 28px;
-      font-weight: 700;
-      margin-top: 4px;
-    }
-    .section-title {
-      font-size: 15px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      margin: 0 0 12px;
-    }
-    details.panel {
-      padding-top: 0;
-    }
-    details.panel > summary {
-      list-style: none;
-      cursor: pointer;
-      padding: 16px;
-      margin: 0 -16px 12px;
-      user-select: none;
-    }
-    details.panel > summary::-webkit-details-marker {
-      display: none;
-    }
-    details.panel > summary .section-title {
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    details.panel > summary .section-title::after {
-      content: "Hide";
-      font-size: 12px;
-      letter-spacing: 0.04em;
-      text-transform: none;
-      color: var(--accent);
-    }
-    details.panel:not([open]) > summary {
-      margin-bottom: 0;
-    }
-    details.panel:not([open]) > summary .section-title::after {
-      content: "Show";
-    }
-    details.panel > .panel-body {
-      display: grid;
-      gap: 12px;
-    }
-    .fields {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-    }
-    .field {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: rgba(22, 36, 52, 0.82);
-      border: 1px solid rgba(40, 64, 87, 0.9);
-    }
-    .field-key {
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    .field-value {
-      text-align: right;
-      font-family: Consolas, "SFMono-Regular", monospace;
-      word-break: break-word;
-    }
-    pre {
-      margin: 0;
-      padding: 14px;
-      border-radius: 12px;
-      border: 1px solid var(--line);
-      background: #0b141d;
-      color: #bfe6ff;
-      overflow: auto;
-      font: 12px/1.45 Consolas, "SFMono-Regular", monospace;
-    }
-    @media (max-width: 860px) {
-      .hero { grid-template-columns: 1fr; }
-    }
-  </style>
+  <title>Telemetry GND Unit</title>
+  <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <main>
-    <section class="panel hero">
-      <div>
-        <div class="title">Telemetry V2 Control Monitor</div>
-        <div class="subtitle">Simple ESP_GND Stage 2 page for live telemetry plus narrow recording, file, and fusion validation against the current websocket contract. Build: 2026-04-02 control-debug-2.</div>
-        <div class="badges">
-          <div id="socketBadge" class="badge">Socket connecting</div>
-          <div id="freshBadge" class="badge">Freshness unknown</div>
-          <div id="schemaBadge" class="badge">Schema --</div>
-          <div id="fixBadge" class="badge">Fix --</div>
-        </div>
-        <div class="actions">
-          <button id="reconnectBtn" type="button">Reconnect</button>
-          <button id="disconnectBtn" type="button">Disconnect</button>
-          <button id="clearBtn" type="button">Clear</button>
-        </div>
-      </div>
-      <div class="grid">
-        <div class="metric">
-          <div class="metric-label">Delta Ms</div>
-          <div id="deltaMsMetric" class="metric-value">-</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Derived Hz</div>
-          <div id="hzMetric" class="metric-value">-</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Radio RTT Ms</div>
-          <div id="rttMetric" class="metric-value">-</div>
-        </div>
-        <div class="metric">
-          <div class="metric-label">Age Ms</div>
-          <div id="ageMetric" class="metric-value">-</div>
-        </div>
-      </div>
-    </section>
+  <div id="appShellFrame" class="app-shell-frame">
+    <div id="appShell" class="app-shell">
+      <header class="top">
+        <div class="title-row"><span class="title">Telemetry GND Unit</span><span id="status">Loading</span><span id="rec" class="rec unknown">REC --</span></div>
+        <div id="stats">web_fps: -- | dqi: -- | avg ping: -- ms</div>
+      </header>
 
-    <details class="panel" open>
-      <summary><h2 class="section-title">Controls</h2></summary>
-      <div class="panel-body">
-      <div class="fields">
-        <div class="field">
-          <div class="field-key">Recording</div>
-          <div class="field-value">
-            <button id="recordStartBtn" type="button">Start</button>
-            <button id="recordStopBtn" type="button">Stop</button>
+      <nav class="tabs">
+        <button data-tab="pfd" class="active">PFD</button>
+        <button data-tab="position">Position</button>
+        <button data-tab="att">Attitude</button>
+        <button data-tab="link">Radio</button>
+        <button data-tab="logs">Logs</button>
+      </nav>
+
+      <main>
+        <section id="tab-pfd" class="tab active">
+          <div class="pfd-wrap">
+            <canvas id="pfdCanvas" class="pfd-canvas" width="390" height="680"></canvas>
           </div>
-        </div>
-        <div class="field">
-          <div class="field-key">Files / SD</div>
-          <div class="field-value">
-            <select id="fileSelect" style="width:180px;"></select>
-            <button id="filesRefreshBtn" type="button">Refresh</button>
-            <button id="fileDeleteBtn" type="button">Delete Selected</button>
-            <button id="fileExportBtn" type="button">Export Selected CSV</button>
+        </section>
+        <section id="tab-position" class="tab">
+          <div class="position-stack">
+            <pre id="gps"></pre>
+            <pre id="baro"></pre>
           </div>
-        </div>
-      </div>
-      <div class="fields" style="margin-top:12px;">
-        <div class="field">
-          <div class="field-key">Fusion Gain</div>
-          <div class="field-value"><input id="fusionGainInput" type="number" step="0.001" style="width:110px;" /></div>
-        </div>
-        <div class="field">
-          <div class="field-key">Accel Reject</div>
-          <div class="field-value"><input id="fusionAccelInput" type="number" step="0.001" style="width:110px;" /></div>
-        </div>
-        <div class="field">
-          <div class="field-key">Mag Reject</div>
-          <div class="field-value"><input id="fusionMagInput" type="number" step="0.001" style="width:110px;" /></div>
-        </div>
-        <div class="field">
-          <div class="field-key">Recovery Period</div>
-          <div class="field-value"><input id="fusionRecoveryInput" type="number" step="1" style="width:110px;" /></div>
-        </div>
-        <div class="field">
-          <div class="field-key">Fusion Apply</div>
-          <div class="field-value"><button id="fusionApplyBtn" type="button">Apply</button></div>
-        </div>
-      </div>
-      <div class="subtitle" style="margin-top:12px;">Replay is read-only in the current browser contract. Replay start/stop remains backend-driven for this validation pass.</div>
-      </div>
-    </details>
+        </section>
+        <section id="tab-att" class="tab">
+          <pre id="att"></pre>
+          <h3>Fusion Settings</h3>
+          <div class="fusion-indicators">
+            <div class="fusion-indicator">
+              <span id="fusionAngularLight" class="fusion-light off"></span>
+              <span>Angular Recovery</span>
+            </div>
+            <div class="fusion-indicator">
+              <span id="fusionAccelLight" class="fusion-light off"></span>
+              <span>Acceleration Recovery</span>
+            </div>
+            <div class="fusion-indicator">
+              <span id="fusionMagLight" class="fusion-light off"></span>
+              <span>Magnetic Recovery</span>
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>gain</span><span id="gainValue">-</span></div>
+            <div class="fusion-row">
+              <input id="gainSlider" type="range" min="0.02" max="0.20" step="0.01" value="0.06" />
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>accelerationRejection (deg)</span><span id="accelRejValue">-</span></div>
+            <div class="fusion-row">
+              <input id="accelRejSlider" type="range" min="10" max="45" step="1" value="20" />
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>magneticRejection (deg)</span><span id="magRejValue">-</span></div>
+            <div class="fusion-row">
+              <input id="magRejSlider" type="range" min="20" max="120" step="5" value="60" />
+            </div>
+          </div>
+          <div class="fusion-control">
+            <div class="fusion-head"><span>recoveryTriggerPeriod (s / samples)</span><span id="recoveryValue">-</span></div>
+            <div class="fusion-row">
+              <input id="recoverySlider" type="range" min="1.0" max="8.0" step="0.1" value="3.0" />
+            </div>
+          </div>
+          <div class="logs-actions">
+            <button id="fusionApplyBtn" type="button">Apply Fusion</button>
+          </div>
+        </section>
+        <section id="tab-link" class="tab">
+          <pre id="link"></pre>
+          <h3>Stream</h3>
+          <div class="row"><label>Capture / Log Hz</label><input id="sourceHz" type="number" min="1" max="400" step="1" value="50" /></div>
+          <div class="row"><label>Download Hz</label><span>30 (fixed)</span></div>
+          <div class="row"><label>UI Hz</label><span>30 (fixed)</span></div>
+          <div class="row"><label>AIR Recorder</label><span id="airLoggerText">Checking AIR recorder...</span></div>
+          <button id="applyRate" type="button" disabled>Apply Capture Hz</button>
+        </section>
+        <section id="tab-logs" class="tab">
+          <pre id="logs"></pre>
+          <h3>Recorder</h3>
+          <div class="logs-actions">
+            <button id="refreshLogStatus" type="button">Refresh Log Status</button>
+            <button id="startLog" type="button">Start Session</button>
+            <button id="stopLog" type="button">Stop Session</button>
+          </div>
+          <h3>Diagnostics</h3>
+          <div class="logs-actions">
+            <button id="resetAirNetwork" type="button" disabled>Reset AIR Link</button>
+            <button id="downloadDiag" type="button" disabled>Download Diag CSV</button>
+            <button id="downloadWsEvents" type="button" disabled>Download WS Event CSV</button>
+            <button id="downloadClientEvents" type="button" disabled>Download Client Event CSV</button>
+            <button id="resetCounters" type="button" disabled>Reset Counters</button>
+          </div>
+          <details style="margin-top:12px;">
+            <summary>Debug</summary>
+            <pre id="eventLog">(no events yet)</pre>
+            <pre id="filesJson">[]</pre>
+          </details>
+        </section>
+      </main>
+    </div>
+  </div>
 
-    <details class="panel" open>
-      <summary><h2 class="section-title">Mode / Storage</h2></summary>
-      <div class="panel-body">
-        <div id="statusFields" class="fields"></div>
-      </div>
-    </details>
-
-    <details class="panel" open>
-      <summary><h2 class="section-title">Files</h2></summary>
-      <div class="panel-body">
-        <div id="fileFields" class="fields"></div>
-        <pre id="filesJson">[]</pre>
-      </div>
-    </details>
-
-    <details class="panel">
-      <summary><h2 class="section-title">Performance</h2></summary>
-      <div class="panel-body">
-        <div id="performanceFields" class="fields"></div>
-      </div>
-    </details>
-
-    <details class="panel">
-      <summary><h2 class="section-title">GPS / Nav</h2></summary>
-      <div class="panel-body">
-        <div id="gpsFields" class="fields"></div>
-      </div>
-    </details>
-
-    <details class="panel">
-      <summary><h2 class="section-title">Attitude / Baro / Fusion</h2></summary>
-      <div class="panel-body">
-        <div id="stateFields" class="fields"></div>
-      </div>
-    </details>
-
-    <details class="panel">
-      <summary><h2 class="section-title">Sensors / Flags</h2></summary>
-      <div class="panel-body">
-        <div id="sensorFields" class="fields"></div>
-      </div>
-    </details>
-
-    <details class="panel">
-      <summary><h2 class="section-title">Events / Ack</h2></summary>
-      <div class="panel-body">
-        <pre id="eventLog">(no events yet)</pre>
-      </div>
-    </details>
-
-    <details class="panel">
-      <summary><h2 class="section-title">Latest Snapshot</h2></summary>
-      <div class="panel-body">
-        <pre id="rawJson">{}</pre>
-      </div>
-    </details>
-  </main>
-
-  <script>
-    const socketBadgeEl = document.getElementById('socketBadge');
-    const freshBadgeEl = document.getElementById('freshBadge');
-    const schemaBadgeEl = document.getElementById('schemaBadge');
-    const fixBadgeEl = document.getElementById('fixBadge');
-    const deltaMsMetricEl = document.getElementById('deltaMsMetric');
-    const hzMetricEl = document.getElementById('hzMetric');
-    const rttMetricEl = document.getElementById('rttMetric');
-    const ageMetricEl = document.getElementById('ageMetric');
-    const performanceFieldsEl = document.getElementById('performanceFields');
-    const statusFieldsEl = document.getElementById('statusFields');
-    const gpsFieldsEl = document.getElementById('gpsFields');
-    const stateFieldsEl = document.getElementById('stateFields');
-    const sensorFieldsEl = document.getElementById('sensorFields');
-    const fileFieldsEl = document.getElementById('fileFields');
-    const filesJsonEl = document.getElementById('filesJson');
-    const eventLogEl = document.getElementById('eventLog');
-    const rawJsonEl = document.getElementById('rawJson');
-    const reconnectBtn = document.getElementById('reconnectBtn');
-    const disconnectBtn = document.getElementById('disconnectBtn');
-    const clearBtn = document.getElementById('clearBtn');
-    const recordStartBtn = document.getElementById('recordStartBtn');
-    const recordStopBtn = document.getElementById('recordStopBtn');
-    const filesRefreshBtn = document.getElementById('filesRefreshBtn');
-    const fileDeleteBtn = document.getElementById('fileDeleteBtn');
-    const fileExportBtn = document.getElementById('fileExportBtn');
-    const fileSelect = document.getElementById('fileSelect');
-    const fusionGainInput = document.getElementById('fusionGainInput');
-    const fusionAccelInput = document.getElementById('fusionAccelInput');
-    const fusionMagInput = document.getElementById('fusionMagInput');
-    const fusionRecoveryInput = document.getElementById('fusionRecoveryInput');
-    const fusionApplyBtn = document.getElementById('fusionApplyBtn');
-
-    let ws = null;
-    let reconnectTimer = null;
-    let reconnectGeneration = 0;
-    let manualDisconnect = false;
-    let lastMessageMs = 0;
-    let latestSnapshot = null;
-    let latestFiles = null;
-    let latestStorage = null;
-    let reqId = 1;
-    let selectedFileName = '';
-    let fusionInitialized = false;
-    let pendingControl = null;
-    const controlStatus = {
-      recording: { tx: '-', ack: '-', detail: '-', reqId: '-' },
-      file: { tx: '-', ack: '-', detail: '-', reqId: '-' },
-      fusion: { tx: '-', ack: '-', detail: '-', reqId: '-' }
-    };
-    const eventLines = [];
-
-    function appendEvent(text) {
-      const stamp = new Date().toLocaleTimeString();
-      eventLines.unshift(`[${stamp}] ${text}`);
-      while (eventLines.length > 40) eventLines.pop();
-      eventLogEl.textContent = eventLines.join('\n');
-    }
-
-    function fmtNumber(value, digits = 3) {
-      if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
-      return Number(value).toFixed(digits);
-    }
-
-    function fmtInt(value) {
-      if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
-      return String(Math.round(Number(value)));
-    }
-
-    function fmtText(value) {
-      if (value === null || value === undefined || value === '') return '-';
-      return String(value);
-    }
-
-    function setBadge(el, text, mode = '') {
-      el.textContent = text;
-      el.className = 'badge' + (mode ? ` ${mode}` : '');
-    }
-
-    function fieldHtml(key, value) {
-      return `<div class="field"><div class="field-key">${key}</div><div class="field-value">${value}</div></div>`;
-    }
-
-    function renderFields(target, entries) {
-      target.innerHTML = entries.map(([key, value]) => fieldHtml(key, value)).join('');
-    }
-
-    function gpsDateTimeText(snapshot) {
-      if (!snapshot || !snapshot.gps_calendar_valid) return 'Unavailable';
-      const yyyy = fmtInt(snapshot.gps_year);
-      const mm = String(snapshot.gps_month).padStart(2, '0');
-      const dd = String(snapshot.gps_day).padStart(2, '0');
-      const hh = String(snapshot.gps_hour).padStart(2, '0');
-      const mi = String(snapshot.gps_min).padStart(2, '0');
-      const ss = String(snapshot.gps_sec).padStart(2, '0');
-      return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
-    }
-
-    function boolText(value) {
-      return value ? 'true' : 'false';
-    }
-
-    function setControlsEnabled(enabled) {
-      const hasSocket = enabled && ws && ws.readyState === WebSocket.OPEN;
-      recordStartBtn.disabled = !hasSocket;
-      recordStopBtn.disabled = !hasSocket;
-      filesRefreshBtn.disabled = !hasSocket;
-      fileDeleteBtn.disabled = !hasSocket || !selectedFileName;
-      fileExportBtn.disabled = !hasSocket || !selectedFileName;
-      fusionApplyBtn.disabled = !hasSocket;
-    }
-
-    function updateControlStatus(category, txText, ackText, detailText, reqIdValue) {
-      const bucket = controlStatus[category];
-      if (!bucket) return;
-      if (txText !== undefined) bucket.tx = txText;
-      if (ackText !== undefined) bucket.ack = ackText;
-      if (detailText !== undefined) bucket.detail = detailText;
-      if (reqIdValue !== undefined) bucket.reqId = reqIdValue;
-    }
-
-    function recordPending(category, action, reqIdValue) {
-      pendingControl = `${category}/${action} req=${reqIdValue}`;
-      updateControlStatus(category, `tx ${action}`, 'pending', 'waiting for backend', reqIdValue);
-      if (latestSnapshot) renderSnapshot(latestSnapshot, null);
-      else renderFilesState();
-    }
-
-    function applyAck(msg) {
-      const op = String(msg.op || '');
-      let category = '';
-      if (op.includes('record')) category = 'recording';
-      else if (op.includes('file')) category = 'file';
-      else if (op.includes('fusion')) category = 'fusion';
-      if (!category) return;
-      pendingControl = null;
-      updateControlStatus(
-        category,
-        undefined,
-        msg.ok ? 'ok' : 'rejected',
-        `${fmtText(msg.detail)} (code ${fmtInt(msg.code)})`,
-        fmtInt(msg.req_id)
-      );
-    }
-
-    function nextReqId() {
-      const value = reqId;
-      reqId += 1;
-      return value;
-    }
-
-    function sendControl(message) {
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        appendEvent('control blocked: websocket not open');
-        return;
-      }
-      ws.send(JSON.stringify(message));
-      appendEvent(`tx ${message.category}/${message.action} req=${message.req_id}`);
-    }
-
-    function renderFilesState(files, storage) {
-      latestFiles = files || latestFiles;
-      latestStorage = storage || latestStorage;
-      const fileItems = latestFiles && Array.isArray(latestFiles.files) ? latestFiles.files : [];
-      if (!selectedFileName && fileItems.length > 0) selectedFileName = fileItems[0].name;
-      if (selectedFileName && !fileItems.some((item) => item.name === selectedFileName)) {
-        selectedFileName = fileItems.length > 0 ? fileItems[0].name : '';
-      }
-      fileSelect.innerHTML = fileItems.map((item) => {
-        const selected = item.name === selectedFileName ? ' selected' : '';
-        return `<option value="${item.name.replace(/"/g, '&quot;')}"${selected}>${item.name} (${fmtInt(item.size_bytes)} B)</option>`;
-      }).join('');
-      if (fileItems.length === 0) {
-        fileSelect.innerHTML = '<option value="">(no files)</option>';
-      }
-      const selectedInfo = fileItems.find((item) => item.name === selectedFileName) || null;
-      filesJsonEl.textContent = JSON.stringify(fileItems, null, 2);
-      renderFields(fileFieldsEl, [
-        ['pending_control', fmtText(pendingControl)],
-        ['files_complete', latestFiles ? boolText(latestFiles.complete) : '-'],
-        ['refresh_inflight', latestFiles ? boolText(latestFiles.refresh_inflight) : '-'],
-        ['files_revision', latestFiles ? fmtInt(latestFiles.revision) : '-'],
-        ['stored_files', latestFiles ? fmtInt(latestFiles.stored_files) : '-'],
-        ['total_files', latestFiles ? fmtInt(latestFiles.total_files) : '-'],
-        ['selected_file', fmtText(selectedFileName)],
-        ['selected_size', selectedInfo ? fmtInt(selectedInfo.size_bytes) : '-'],
-        ['storage_known', latestStorage ? boolText(latestStorage.known) : '-'],
-        ['storage_busy', latestStorage ? boolText(latestStorage.busy) : '-'],
-        ['backend_ready', latestStorage ? boolText(latestStorage.backend_ready) : '-'],
-        ['media_present', latestStorage ? boolText(latestStorage.media_present) : '-'],
-        ['mounted', latestStorage ? boolText(latestStorage.mounted) : '-'],
-        ['file_count', latestStorage ? fmtInt(latestStorage.file_count) : '-'],
-        ['record_prefix', latestStorage ? fmtText(latestStorage.record_prefix) : '-'],
-        ['next_record_name', latestStorage ? fmtText(latestStorage.next_record_name) : '-'],
-        ['file_last_tx', fmtText(controlStatus.file.tx)],
-        ['file_last_ack', fmtText(controlStatus.file.ack)],
-        ['file_detail', fmtText(controlStatus.file.detail)],
-        ['file_req_id', fmtText(controlStatus.file.reqId)]
-      ]);
-      setControlsEnabled(true);
-    }
-
-    function renderSnapshot(snapshot, deltaMs) {
-      latestSnapshot = snapshot;
-      rawJsonEl.textContent = JSON.stringify(snapshot, null, 2);
-
-      const hz = deltaMs && deltaMs > 0 ? (1000 / deltaMs) : null;
-      deltaMsMetricEl.textContent = deltaMs ? fmtInt(deltaMs) : '-';
-      hzMetricEl.textContent = hz ? fmtNumber(hz, 2) : '-';
-      rttMetricEl.textContent = fmtInt(snapshot.radio_rtt_ms);
-      ageMetricEl.textContent = fmtInt(snapshot.age_ms);
-
-      setBadge(socketBadgeEl, 'Socket open', 'good');
-      setBadge(freshBadgeEl,
-               snapshot.fresh ? `Fresh ${fmtInt(snapshot.age_ms)} ms` : `Stale ${fmtInt(snapshot.age_ms)} ms`,
-               snapshot.fresh ? 'good' : 'warn');
-      setBadge(schemaBadgeEl, `Schema ${fmtInt(snapshot.schema_id)} v${fmtInt(snapshot.schema_version)}`);
-      const hasFix = Number(snapshot.gps_fix_type || 0) >= 2;
-      setBadge(fixBadgeEl,
-               `Fix ${fmtInt(snapshot.gps_fix_type)} / SV ${fmtInt(snapshot.gps_num_sv)}`,
-               hasFix ? 'good' : 'warn');
-
-      renderFields(performanceFieldsEl, [
-        ['ws_seq', fmtInt(snapshot.ws_seq)],
-        ['seq', fmtInt(snapshot.seq)],
-        ['source_t_us', fmtInt(snapshot.source_t_us)],
-        ['replay_source_seq', fmtInt(snapshot.replay_source_seq)],
-        ['replay_source_t_us', fmtInt(snapshot.replay_source_t_us)],
-        ['radio_rtt_ms', fmtInt(snapshot.radio_rtt_ms)],
-        ['age_ms', fmtInt(snapshot.age_ms)],
-        ['drop', fmtInt(snapshot.drop)],
-        ['len_err', fmtInt(snapshot.len_err)],
-        ['unknown_msg', fmtInt(snapshot.unknown_msg)],
-        ['state_gap', fmtInt(snapshot.state_gap)],
-        ['state_rewind', fmtInt(snapshot.state_rewind)],
-        ['fresh', snapshot.fresh ? 'true' : 'false'],
-        ['has_state', snapshot.has_state ? 'true' : 'false'],
-        ['has_fix', hasFix ? 'true' : 'false'],
-        ['recording_active', snapshot.recording_active ? 'true' : 'false'],
-        ['recording_busy', snapshot.recording_busy ? 'true' : 'false'],
-        ['recording_session_id', fmtInt(snapshot.recording_session_id)],
-        ['recording_bytes_written', fmtInt(snapshot.recording_bytes_written)]
-      ]);
-
-      renderFields(statusFieldsEl, [
-        ['pending_control', fmtText(pendingControl)],
-        ['time_state', fmtText(snapshot.time_state)],
-        ['time_source', fmtText(snapshot.time_source)],
-        ['gps_calendar_present', boolText(snapshot.gps_calendar_present)],
-        ['gps_time_valid', boolText(snapshot.gps_time_valid)],
-        ['system_time_set', boolText(snapshot.system_time_set)],
-        ['system_time_utc_s', fmtInt(snapshot.system_time_utc_s)],
-        ['time_last_set_age_ms', fmtInt(snapshot.time_last_set_age_ms)],
-        ['time_sync_count', fmtInt(snapshot.time_sync_count)],
-        ['replay_active', boolText(snapshot.replay_active)],
-        ['replay_paused', boolText(snapshot.replay_paused)],
-        ['replay_file_open', boolText(snapshot.replay_file_open)],
-        ['replay_at_eof', boolText(snapshot.replay_at_eof)],
-        ['replay_teensy_seen', boolText(snapshot.replay_teensy_seen)],
-        ['replay_session_id', fmtInt(snapshot.replay_session_id)],
-        ['replay_records_sent', fmtInt(snapshot.replay_records_sent)],
-        ['replay_records_total', fmtInt(snapshot.replay_records_total)],
-        ['replay_last_error', fmtInt(snapshot.replay_last_error)],
-        ['replay_last_command', fmtInt(snapshot.replay_last_command)],
-        ['replay_current_file', fmtText(snapshot.replay_current_file)],
-        ['recording_last_tx', fmtText(controlStatus.recording.tx)],
-        ['recording_last_ack', fmtText(controlStatus.recording.ack)],
-        ['recording_detail', fmtText(controlStatus.recording.detail)],
-        ['recording_req_id', fmtText(controlStatus.recording.reqId)],
-        ['fusion_last_tx', fmtText(controlStatus.fusion.tx)],
-        ['fusion_last_ack', fmtText(controlStatus.fusion.ack)],
-        ['fusion_detail', fmtText(controlStatus.fusion.detail)],
-        ['fusion_req_id', fmtText(controlStatus.fusion.reqId)]
-      ]);
-
-      renderFields(gpsFieldsEl, [
-        ['gps_datetime_utc', gpsDateTimeText(snapshot)],
-        ['gps_itow_ms', fmtInt(snapshot.gps_itow_ms)],
-        ['lat_1e7', fmtInt(snapshot.lat_1e7)],
-        ['lon_1e7', fmtInt(snapshot.lon_1e7)],
-        ['lat_deg', fmtNumber(Number(snapshot.lat_1e7 || 0) / 1e7, 7)],
-        ['lon_deg', fmtNumber(Number(snapshot.lon_1e7 || 0) / 1e7, 7)],
-        ['hMSL_mm', fmtInt(snapshot.hMSL_mm)],
-        ['alt_m', fmtNumber(Number(snapshot.hMSL_mm || 0) / 1000, 3)],
-        ['gSpeed_mms', fmtInt(snapshot.gSpeed_mms)],
-        ['groundspeed_mps', fmtNumber(Number(snapshot.gSpeed_mms || 0) / 1000, 3)],
-        ['headMot_1e5deg', fmtInt(snapshot.headMot_1e5deg)],
-        ['course_deg', fmtNumber(Number(snapshot.headMot_1e5deg || 0) / 100000, 3)],
-        ['hAcc_mm', fmtInt(snapshot.hAcc_mm)],
-        ['sAcc_mms', fmtInt(snapshot.sAcc_mms)],
-        ['gps_fix_type', fmtInt(snapshot.gps_fix_type)],
-        ['gps_num_sv', fmtInt(snapshot.gps_num_sv)]
-      ]);
-
-      renderFields(stateFieldsEl, [
-        ['roll_deg', fmtNumber(snapshot.roll_deg, 3)],
-        ['pitch_deg', fmtNumber(snapshot.pitch_deg, 3)],
-        ['yaw_deg', fmtNumber(snapshot.yaw_deg, 3)],
-        ['mag_heading_deg', fmtNumber(snapshot.mag_heading_deg, 3)],
-        ['baro_temp_c', fmtNumber(snapshot.baro_temp_c, 3)],
-        ['baro_press_hpa', fmtNumber(snapshot.baro_press_hpa, 3)],
-        ['baro_alt_m', fmtNumber(snapshot.baro_alt_m, 3)],
-        ['baro_vsi_mps', fmtNumber(snapshot.baro_vsi_mps, 3)],
-        ['fusion_gain', fmtNumber(snapshot.fusion_gain, 3)],
-        ['fusion_accel_rej', fmtNumber(snapshot.fusion_accel_rej, 3)],
-        ['fusion_mag_rej', fmtNumber(snapshot.fusion_mag_rej, 3)],
-        ['fusion_recovery_period', fmtInt(snapshot.fusion_recovery_period)]
-      ]);
-
-      renderFields(sensorFieldsEl, [
-        ['flags', fmtInt(snapshot.flags)],
-        ['raw_present_mask', fmtInt(snapshot.raw_present_mask)]
-      ]);
-
-      if (!fusionInitialized) {
-        fusionGainInput.value = Number(snapshot.fusion_gain || 0).toFixed(3);
-        fusionAccelInput.value = Number(snapshot.fusion_accel_rej || 0).toFixed(3);
-        fusionMagInput.value = Number(snapshot.fusion_mag_rej || 0).toFixed(3);
-        fusionRecoveryInput.value = String(Math.round(Number(snapshot.fusion_recovery_period || 0)));
-        fusionInitialized = true;
-      }
-
-      renderFilesState();
-    }
-
-    function clearReconnectTimer() {
-      if (!reconnectTimer) return;
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-
-    function scheduleReconnect(expectedGeneration) {
-      if (reconnectTimer) return;
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (expectedGeneration !== reconnectGeneration) return;
-        connect(false);
-      }, 1000);
-    }
-
-    function disconnectSocket(manual) {
-      manualDisconnect = manual;
-      clearReconnectTimer();
-      reconnectGeneration += 1;
-      const socket = ws;
-      ws = null;
-      if (socket) {
-        socket.onopen = null;
-        socket.onmessage = null;
-        socket.onclose = null;
-        socket.onerror = null;
-        try { socket.close(); } catch (_) {}
-      }
-      setBadge(socketBadgeEl, manual ? 'Socket closed' : 'Socket disconnected', manual ? 'warn' : 'bad');
-      setControlsEnabled(false);
-    }
-
-    function connect(forced) {
-      disconnectSocket(false);
-      manualDisconnect = false;
-      reconnectGeneration += 1;
-      const generation = reconnectGeneration;
-      setBadge(socketBadgeEl, forced ? 'Socket reconnecting' : 'Socket connecting');
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const socket = new WebSocket(`${proto}//${location.host}/ws`);
-      ws = socket;
-
-      socket.onopen = () => {
-        if (ws !== socket || generation !== reconnectGeneration) return;
-        setBadge(socketBadgeEl, 'Socket open', 'good');
-        appendEvent('socket open');
-        setControlsEnabled(true);
-      };
-
-      socket.onmessage = (event) => {
-        if (ws !== socket || generation !== reconnectGeneration) return;
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'snapshot') {
-            const nowMs = Date.now();
-            const deltaMs = lastMessageMs ? (nowMs - lastMessageMs) : null;
-            lastMessageMs = nowMs;
-            renderSnapshot(msg, deltaMs);
-            return;
-          }
-          if (msg.type === 'hello') {
-            appendEvent(`hello snapshot_hz=${fmtInt(msg.snapshot_hz)}`);
-            return;
-          }
-          if (msg.type === 'ack') {
-            applyAck(msg);
-            appendEvent(`ack op=${fmtText(msg.op)} req=${fmtInt(msg.req_id)} ok=${boolText(msg.ok)} code=${fmtInt(msg.code)} detail=${fmtText(msg.detail)}`);
-            if (latestSnapshot) renderSnapshot(latestSnapshot, null);
-            else renderFilesState();
-            return;
-          }
-          if (msg.type === 'files') {
-            appendEvent(`files req=${fmtInt(msg.req_id)} stored=${fmtInt(msg.stored_files)} total=${fmtInt(msg.total_files)} complete=${boolText(msg.complete)}`);
-            renderFilesState(msg, null);
-            return;
-          }
-          if (msg.type === 'storage') {
-            appendEvent(`storage req=${fmtInt(msg.req_id)} ready=${boolText(msg.backend_ready)} busy=${boolText(msg.busy)} files=${fmtInt(msg.file_count)}`);
-            renderFilesState(null, msg);
-            return;
-          }
-          appendEvent(`rx ${fmtText(msg.type)}`);
-        } catch (err) {
-          rawJsonEl.textContent = `JSON parse error\n\n${String(err)}\n\n${event.data}`;
-        }
-      };
-
-      socket.onclose = () => {
-        if (ws === socket) ws = null;
-        if (generation !== reconnectGeneration) return;
-        setBadge(socketBadgeEl, 'Socket closed', 'warn');
-        appendEvent('socket closed');
-        setControlsEnabled(false);
-        if (!manualDisconnect) scheduleReconnect(generation);
-      };
-
-      socket.onerror = () => {
-        if (ws !== socket || generation !== reconnectGeneration) return;
-        setBadge(socketBadgeEl, 'Socket error', 'bad');
-        appendEvent('socket error');
-      };
-    }
-
-    reconnectBtn.addEventListener('click', () => connect(true));
-    disconnectBtn.addEventListener('click', () => disconnectSocket(true));
-    clearBtn.addEventListener('click', () => {
-      latestSnapshot = null;
-      lastMessageMs = 0;
-      rawJsonEl.textContent = '{}';
-      deltaMsMetricEl.textContent = '-';
-      hzMetricEl.textContent = '-';
-      rttMetricEl.textContent = '-';
-      ageMetricEl.textContent = '-';
-      renderFields(performanceFieldsEl, []);
-      renderFields(statusFieldsEl, []);
-      renderFields(gpsFieldsEl, []);
-      renderFields(stateFieldsEl, []);
-      renderFields(sensorFieldsEl, []);
-      renderFields(fileFieldsEl, []);
-      filesJsonEl.textContent = '[]';
-      eventLines.length = 0;
-      eventLogEl.textContent = '(no events yet)';
-      latestFiles = null;
-      latestStorage = null;
-      selectedFileName = '';
-      pendingControl = null;
-      updateControlStatus('recording', '-', '-', '-', '-');
-      updateControlStatus('file', '-', '-', '-', '-');
-      updateControlStatus('fusion', '-', '-', '-', '-');
-      fileSelect.innerHTML = '<option value="">(no files)</option>';
-      fusionInitialized = false;
-      setBadge(freshBadgeEl, 'Freshness unknown');
-      setBadge(schemaBadgeEl, 'Schema --');
-      setBadge(fixBadgeEl, 'Fix --');
-      setControlsEnabled(true);
-    });
-
-    recordStartBtn.addEventListener('click', () => {
-      const req = nextReqId();
-      recordPending('recording', 'start', req);
-      sendControl({ type: 'control', req_id: req, category: 'recording', action: 'start' });
-    });
-
-    recordStopBtn.addEventListener('click', () => {
-      const req = nextReqId();
-      recordPending('recording', 'stop', req);
-      sendControl({ type: 'control', req_id: req, category: 'recording', action: 'stop' });
-    });
-
-    filesRefreshBtn.addEventListener('click', () => {
-      const req = nextReqId();
-      recordPending('file', 'refresh', req);
-      sendControl({ type: 'control', req_id: req, category: 'file', action: 'refresh' });
-    });
-
-    fileDeleteBtn.addEventListener('click', () => {
-      if (!selectedFileName) {
-        appendEvent('delete blocked: no selected file');
-        return;
-      }
-      const req = nextReqId();
-      recordPending('file', `delete ${selectedFileName}`, req);
-      sendControl({ type: 'control', req_id: req, category: 'file', action: 'delete', name: selectedFileName });
-    });
-
-    fileExportBtn.addEventListener('click', () => {
-      if (!selectedFileName) {
-        appendEvent('export blocked: no selected file');
-        return;
-      }
-      const req = nextReqId();
-      recordPending('file', `export_csv ${selectedFileName}`, req);
-      sendControl({ type: 'control', req_id: req, category: 'file', action: 'export_csv', name: selectedFileName });
-    });
-
-    fileSelect.addEventListener('change', () => {
-      selectedFileName = fileSelect.value || '';
-      renderFilesState();
-    });
-
-    fusionApplyBtn.addEventListener('click', () => {
-      const req = nextReqId();
-      recordPending('fusion', 'set', req);
-      sendControl({
-        type: 'control',
-        req_id: req,
-        category: 'fusion',
-        action: 'set',
-        gain: Number(fusionGainInput.value),
-        accelerationRejection: Number(fusionAccelInput.value),
-        magneticRejection: Number(fusionMagInput.value),
-        recoveryTriggerPeriod: Number(fusionRecoveryInput.value)
-      });
-    });
-
-    connect(false);
-  </script>
+  <script src="/app.js?v=20260409b"></script>
 </body>
 </html>

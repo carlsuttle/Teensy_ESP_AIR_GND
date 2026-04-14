@@ -43,6 +43,7 @@ enum class Op : uint8_t {
 struct Command {
   Op op = Op::FsCardType;
   TaskHandle_t reply_task = nullptr;
+  volatile bool done = false;
   bool ok = false;
   uint8_t u8 = 0U;
   uint16_t handle = kInvalidFileHandle;
@@ -218,11 +219,14 @@ bool submit(Command& cmd) {
     return cmd.ok;
   }
   cmd.reply_task = xTaskGetCurrentTaskHandle();
+  cmd.done = false;
   Command* queued = &cmd;
   if (xQueueSend(g_queue, &queued, portMAX_DELAY) != pdTRUE) {
     return false;
   }
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  while (!cmd.done) {
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
   return cmd.ok;
 }
 
@@ -232,7 +236,7 @@ void workerTask(void* param) {
     Command* cmd = nullptr;
     if (xQueueReceive(g_queue, &cmd, portMAX_DELAY) != pdTRUE || !cmd) continue;
     process(*cmd);
-    xTaskNotifyGive(cmd->reply_task);
+    cmd->done = true;
   }
 }
 

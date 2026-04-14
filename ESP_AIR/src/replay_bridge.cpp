@@ -775,6 +775,10 @@ bool resume() {
 
 bool pause() {
   if ((g_status.flags & telem::kReplayStatusFlagActive) == 0U || !g_file) return false;
+  // Paused replay is intentionally modeled as "not actively feeding records"
+  // while still holding replay occupancy via FileOpen + Paused. That lets
+  // control-plane clients distinguish an actively running replay from a
+  // paused-but-still-open replay session.
   g_status.flags &= (uint8_t)~telem::kReplayStatusFlagActive;
   g_status.flags |= telem::kReplayStatusFlagPaused;
   g_status.last_command = telem::CMD_REPLAY_PAUSE;

@@ -13,7 +13,11 @@ struct AppConfig {
   uint8_t radio_state_only;  // Reuses reserved config byte: 0=mixed protocol, 1=state-only stress mode.
   uint8_t radio_lr_mode;     // 0=normal protocol, 1=LR protocol enabled for ESP-NOW testing.
   uint8_t reserved_flags0;
+  uint8_t sta_enable;
+  uint16_t sta_connect_timeout_ms;
   uint32_t max_log_bytes;
+  char sta_ssid[33];
+  char sta_pass[65];
 };
 
 namespace config_store {

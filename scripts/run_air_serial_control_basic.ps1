@@ -16,6 +16,8 @@ if (-not $LogPath) {
 $context = $null
 $passed = 0
 $failed = 0
+$replayPauseTestFile = $null
+$replayPauseTestRecordsTotal = 0
 
 function Invoke-Check {
   param(
@@ -32,6 +34,39 @@ function Invoke-Check {
     Write-ControlLog -Context $script:context -Source "CHECK" -Text ("FAIL {0} :: {1}" -f $Label, $_.Exception.Message)
     throw
   }
+}
+
+function Get-ReplayStatus {
+  param(
+    [hashtable]$Context,
+    [int]$TimeoutMs = 3000
+  )
+
+  $resp = Invoke-AirControlRequest -Context $Context -Request @{
+    category = "replay"
+    action = "status"
+  } -TimeoutMs $TimeoutMs
+  Assert-ControlCompletedOk -Response $resp -Label "replay status"
+  return $resp.Final.replay
+}
+
+function Wait-ReplayStatus {
+  param(
+    [hashtable]$Context,
+    [scriptblock]$Predicate,
+    [int]$TimeoutMs = 6000,
+    [int]$PollMs = 150
+  )
+
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  while ((Get-Date) -lt $deadline) {
+    $replay = Get-ReplayStatus -Context $Context -TimeoutMs 3000
+    if (& $Predicate $replay) {
+      return $replay
+    }
+    Start-Sleep -Milliseconds $PollMs
+  }
+  throw "Timed out waiting for replay status predicate"
 }
 
 try {
@@ -110,19 +145,106 @@ try {
     }
   }
 
-  Invoke-Check -Label "replay_start_latest" -Action {
+  Invoke-Check -Label "file_list_json" -Action {
     $resp = Invoke-AirControlRequest -Context $context -Request @{
-      category = "replay"
-      action = "start_latest"
-    } -TimeoutMs 5000
-    Assert-ControlCompletedOk -Response $resp -Label "replay start latest"
-    [void](Wait-AirControlState -Context $context -Predicate {
-      param($s)
-      return $s.replay_active -or $s.replay_file_open
-    } -TimeoutMs 6000 -PollMs 250)
+      category = "file"
+      action = "list_json"
+      sort_key = "date"
+      sort_dir = "descending"
+    } -TimeoutMs 8000
+    Assert-ControlCompletedOk -Response $resp -Label "file list json"
+    if ($null -eq $resp.Final.files_json) {
+      throw "file list json returned no files_json payload"
+    }
+    if (-not $resp.Final.files_json.truncated) {
+      throw "file list json expected truncated=true for temporary capped response"
+    }
   }
 
-  Start-Sleep -Milliseconds 1000
+  Invoke-Check -Label "replay_select_pause_file" -Action {
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "file"
+      action = "list_json"
+      sort_key = "size"
+      sort_dir = "descending"
+    } -TimeoutMs 8000
+    Assert-ControlCompletedOk -Response $resp -Label "file list json size descending"
+    if ($null -eq $resp.Final.files_json -or $null -eq $resp.Final.files_json.files) {
+      throw "size-sorted file list returned no files payload"
+    }
+
+    $candidate = $null
+    foreach ($file in $resp.Final.files_json.files) {
+      if ($null -eq $file.name) { continue }
+      $sizeBytes = 0
+      if ($null -ne $file.size_bytes) {
+        $sizeBytes = [int64]$file.size_bytes
+      }
+      if ($sizeBytes -gt 1024) {
+        $candidate = $file
+        break
+      }
+    }
+
+    if ($null -eq $candidate) {
+      throw "no replay file larger than 1024 bytes was available for deterministic pause test"
+    }
+
+    $script:replayPauseTestFile = [string]$candidate.name
+    Write-ControlLog -Context $context -Source "CHECK" -Text (
+      "selected replay pause file name={0} size_bytes={1}" -f
+      $script:replayPauseTestFile,
+      [int64]$candidate.size_bytes
+    )
+  }
+
+  Invoke-Check -Label "replay_start_file" -Action {
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "start_file"
+      name = $script:replayPauseTestFile
+    } -TimeoutMs 5000
+    Assert-ControlCompletedOk -Response $resp -Label "replay start file"
+    if (-not $resp.Final.replay.active) {
+      throw "replay start file did not report active=true"
+    }
+    if (-not $resp.Final.replay.file_open) {
+      throw "replay start file did not report file_open=true"
+    }
+  }
+
+  Invoke-Check -Label "replay_wait_active" -Action {
+    $replay = Wait-ReplayStatus -Context $context -Predicate {
+      param($r)
+      return $r.active -and (-not $r.at_eof)
+    } -TimeoutMs 5000 -PollMs 100
+    if ($replay.paused) {
+      throw "replay wait active observed paused=true before pause request"
+    }
+  }
+
+  Invoke-Check -Label "replay_pause" -Action {
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "pause"
+    } -TimeoutMs 4000
+    Assert-ControlCompletedOk -Response $resp -Label "replay pause"
+    if ($resp.Final.replay.active) {
+      throw "replay pause should report active=false once paused"
+    }
+    if (-not $resp.Final.replay.paused) {
+      throw "replay pause did not report paused=true"
+    }
+    if ($resp.Final.replay.at_eof) {
+      throw "replay pause unexpectedly reported at_eof=true"
+    }
+    if (-not $resp.Final.replay.file_open) {
+      throw "replay pause did not report file_open=true"
+    }
+    if ($resp.Final.state.replay_state -eq "idle") {
+      throw "replay pause reported idle state despite replay occupancy"
+    }
+  }
 
   Invoke-Check -Label "replay_status" -Action {
     $resp = Invoke-AirControlRequest -Context $context -Request @{
@@ -130,9 +252,27 @@ try {
       action = "status"
     } -TimeoutMs 3000
     Assert-ControlCompletedOk -Response $resp -Label "replay status"
+    if ($resp.Final.replay.active) {
+      throw "replay status should report active=false while paused"
+    }
     if (-not $resp.Final.replay.file_open) {
       throw "replay status did not report file_open=true"
     }
+    if (-not $resp.Final.replay.paused) {
+      throw "replay status did not report paused=true"
+    }
+    if ($resp.Final.replay.at_eof) {
+      throw "replay status unexpectedly reported at_eof=true while paused"
+    }
+  }
+
+  Invoke-Check -Label "replay_seek_relative" -Action {
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "seek_relative"
+      delta_records = 25
+    } -TimeoutMs 4000
+    Assert-ControlCompletedOk -Response $resp -Label "replay seek relative"
   }
 
   Invoke-Check -Label "replay_stop" -Action {
@@ -141,6 +281,64 @@ try {
       action = "stop"
     } -TimeoutMs 4000
     Assert-ControlCompletedOk -Response $resp -Label "replay stop"
+    [void](Wait-AirControlState -Context $context -Predicate {
+      param($s)
+      return (-not $s.replay_active) -and (-not $s.replay_file_open)
+    } -TimeoutMs 10000 -PollMs 250)
+  }
+
+  Invoke-Check -Label "replay_start_file_eof_case" -Action {
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "start_file"
+      name = $script:replayPauseTestFile
+    } -TimeoutMs 5000
+    Assert-ControlCompletedOk -Response $resp -Label "replay start file eof case"
+    $script:replayPauseTestRecordsTotal = [int]$resp.Final.replay.records_total
+    if ($script:replayPauseTestRecordsTotal -le 0) {
+      throw "replay start file eof case did not report a positive records_total"
+    }
+    [void](Wait-ReplayStatus -Context $context -Predicate {
+      param($r)
+      return $r.file_open
+    } -TimeoutMs 4000 -PollMs 100)
+
+    $seekResp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "seek_relative"
+      delta_records = $script:replayPauseTestRecordsTotal
+    } -TimeoutMs 4000
+    Assert-ControlCompletedOk -Response $seekResp -Label "replay seek near eof"
+  }
+
+  Invoke-Check -Label "replay_pause_after_eof" -Action {
+    [void](Wait-ReplayStatus -Context $context -Predicate {
+      param($r)
+      return (-not $r.active) -and $r.at_eof
+    } -TimeoutMs 8000 -PollMs 100)
+
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "pause"
+    } -TimeoutMs 4000
+    Assert-ControlAccepted -Response $resp -Label "replay pause after eof"
+    if ($null -eq $resp.Final) {
+      throw "replay pause after eof: missing final response"
+    }
+    if ($resp.Final.status -ne "completed_error") {
+      throw ("replay pause after eof: expected completed_error, got {0}/{1}" -f $resp.Final.status, $resp.Final.code)
+    }
+    if ($resp.Final.code -ne "invalid_state") {
+      throw ("replay pause after eof: expected invalid_state, got {0}" -f $resp.Final.code)
+    }
+  }
+
+  Invoke-Check -Label "replay_stop_after_eof" -Action {
+    $resp = Invoke-AirControlRequest -Context $context -Request @{
+      category = "replay"
+      action = "stop"
+    } -TimeoutMs 4000
+    Assert-ControlCompletedOk -Response $resp -Label "replay stop after eof"
     [void](Wait-AirControlState -Context $context -Predicate {
       param($s)
       return (-not $s.replay_active) -and (-not $s.replay_file_open)

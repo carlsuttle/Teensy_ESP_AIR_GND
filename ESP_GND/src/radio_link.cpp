@@ -116,12 +116,11 @@ uint8_t desiredProtocol() {
   return g_radio_lr_mode ? (uint8_t)(kNormalMask | WIFI_PROTOCOL_LR) : kNormalMask;
 }
 
-void applyRadioProtocol() {
+bool applyRadioProtocol() {
   // Keep the user-facing SoftAP on standard Wi-Fi rates so phones/tablets
-  // can still see and join the telemetry network. GND currently runs ESP-NOW
-  // over the AP interface, so LR on GND has to wait for a cleaner AP/STA split.
-  (void)esp_wifi_set_protocol(WIFI_IF_AP, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
-  (void)esp_wifi_set_protocol(WIFI_IF_STA, desiredProtocol());
+  // can still see and join the telemetry network.
+  const uint8_t ap_protocol = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  return esp_wifi_set_protocol(WIFI_IF_AP, ap_protocol) == ESP_OK;
 }
 
 bool isBroadcastMac(const uint8_t* mac) {
@@ -256,7 +255,8 @@ bool ensurePeer(const uint8_t* mac) {
   peer.channel = telem::kRadioChannel;
   peer.ifidx = WIFI_IF_AP;
   peer.encrypt = false;
-  if (esp_now_is_peer_exist(mac)) {
+  const bool exists = esp_now_is_peer_exist(mac);
+  if (exists) {
     return esp_now_mod_peer(&peer) == ESP_OK;
   }
   return esp_now_add_peer(&peer) == ESP_OK;
@@ -333,6 +333,7 @@ bool initEspNow() {
   if (g_espnow_ready) return true;
 
   if (esp_now_init() != ESP_OK) {
+    Serial.println("RADIO espnow_init_failed");
     return false;
   }
   if (esp_now_register_recv_cb(onDataRecv) != ESP_OK) {
@@ -347,8 +348,10 @@ bool initEspNow() {
     esp_now_deinit();
     return false;
   }
-
-  applyRadioProtocol();
+  if (!applyRadioProtocol()) {
+    esp_now_deinit();
+    return false;
+  }
   g_espnow_ready = true;
   return true;
 }
@@ -874,16 +877,41 @@ void begin(const AppConfig& cfg) {
   memset(&g_snapshot, 0, sizeof(g_snapshot));
   clearPeerState();
   g_espnow_ready = false;
+  g_network_ready_for_radio = false;
   g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_tx_seq = 0U;
   g_session_id = esp_random();
   g_last_hello_tx_ms = 0U;
+}
+
+void setNetworkReady(const char* reason) {
+  if (g_network_ready_for_radio) return;
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  const esp_err_t mode_err = esp_wifi_get_mode(&mode);
+  Serial.println("RADIO nr_step enter");
+  if (mode_err == ESP_OK) {
+    Serial.printf("RADIO nr_step wifi_mode=%s reason=%s local_ip=%s sta_ip=%s ap_ip=%s\n",
+                  wifiModeText(mode),
+                  reason ? reason : "net_ready",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.printf("RADIO nr_step wifi_mode=ERR err=%d reason=%s local_ip=%s sta_ip=%s ap_ip=%s\n",
+                  (int)mode_err,
+                  reason ? reason : "net_ready",
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.localIP().toString().c_str(),
+                  WiFi.softAPIP().toString().c_str());
+  }
+  g_network_ready_for_radio = true;
+  Serial.printf("NET radio_init starting reason=%s\n", reason ? reason : "net_ready");
   (void)initEspNow();
 }
 
 void reconfigure(const AppConfig& cfg) {
   g_radio_lr_mode = cfg.radio_lr_mode != 0U;
-  applyRadioProtocol();
+  (void)applyRadioProtocol();
   if (!initEspNow()) return;
   if (cfg.radio_state_only) {
     resetRadioRttTracking();
@@ -1059,8 +1087,6 @@ String remoteFilesJson(bool refresh_requested) {
     json += jsonEscape(g_remote_files[i].name);
     json += "\",\"size_bytes\":";
     json += String(g_remote_files[i].size_bytes);
-    json += ",\"mtime_utc_s\":";
-    json += String(g_remote_files[i].mtime_utc_s);
     json += "}";
   }
   json += "]}";

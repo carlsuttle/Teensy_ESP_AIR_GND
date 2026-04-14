@@ -10,6 +10,8 @@
 namespace sd_file_api {
 namespace {
 
+constexpr uint16_t kFilesJsonMaxEntries = 20U;
+
 telem::LogFileInfoV1* g_snapshot_files = nullptr;
 uint16_t g_snapshot_total_files = 0U;
 uint32_t g_snapshot_generation = 0U;
@@ -69,10 +71,9 @@ void fillStoragePayload(telem::StorageStatusPayloadV1& out_payload) {
     out_payload.total_bytes = (total_bytes > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)total_bytes;
   }
 
-  telem::LogFileInfoV1 scratch[1] = {};
   uint16_t total_files = 0U;
-  uint16_t returned_files = 0U;
-  if (log_store::listFiles(scratch, 1U, 0U, total_files, returned_files)) {
+  // Storage status only needs a count, so avoid the sorted listing path here.
+  if (log_store::enumerateManagedLogFiles(nullptr, nullptr, total_files)) {
     out_payload.file_count = total_files;
   }
 
@@ -119,10 +120,12 @@ telem::SdApiStatusCode buildSnapshot(FileListHandle& out_handle,
 telem::SdApiStatusCode ensureSnapshotForPage(uint16_t offset,
                                              uint16_t limit,
                                              FileListPage& out_page,
-                                             bool force_refresh) {
+                                             bool force_refresh,
+                                             log_store::FileSortKey sort_key = log_store::FileSortKey::date,
+                                             log_store::FileSortDirection sort_dir = log_store::FileSortDirection::descending) {
   FileListHandle handle = currentFileListHandle();
   if (force_refresh || !handle.valid()) {
-    const telem::SdApiStatusCode refresh_code = refreshFileList(handle);
+    const telem::SdApiStatusCode refresh_code = refreshFileList(handle, sort_key, sort_dir);
     if (refresh_code != telem::SdApiStatusCode::OK && refresh_code != telem::SdApiStatusCode::NO_FILES) {
       return refresh_code;
     }
@@ -195,10 +198,13 @@ telem::SdApiStatusCode getFileListPage(FileListHandle handle,
 telem::SdApiStatusCode getOrRefreshFileListPage(uint16_t offset,
                                                 uint16_t limit,
                                                 FileListPage& out_page,
-                                                bool force_refresh) {
-  telem::SdApiStatusCode code = ensureSnapshotForPage(offset, limit, out_page, force_refresh || offset == 0U);
+                                                bool force_refresh,
+                                                log_store::FileSortKey sort_key,
+                                                log_store::FileSortDirection sort_dir) {
+  telem::SdApiStatusCode code =
+      ensureSnapshotForPage(offset, limit, out_page, force_refresh || offset == 0U, sort_key, sort_dir);
   if (code == telem::SdApiStatusCode::INVALID_HANDLE && offset != 0U) {
-    code = ensureSnapshotForPage(offset, limit, out_page, true);
+    code = ensureSnapshotForPage(offset, limit, out_page, true, sort_key, sort_dir);
   }
   return code;
 }
@@ -208,7 +214,8 @@ telem::SdApiStatusCode getFileInfo(const String& name, FileInfo& out_info) {
   if (!log_store::isSafeName(name)) return telem::SdApiStatusCode::INVALID_ARGUMENT;
 
   FileListPage page = {};
-  telem::SdApiStatusCode code = getOrRefreshFileListPage(0U, 32U, page, false);
+  telem::SdApiStatusCode code = getOrRefreshFileListPage(
+      0U, 32U, page, false, log_store::FileSortKey::date, log_store::FileSortDirection::descending);
   if (code != telem::SdApiStatusCode::OK && code != telem::SdApiStatusCode::NO_FILES) return code;
   if (code == telem::SdApiStatusCode::NO_FILES) return telem::SdApiStatusCode::NO_FILES;
 
@@ -303,31 +310,36 @@ String filesJson(log_store::FileSortKey sort_key, log_store::FileSortDirection s
   FileListHandle handle = {};
   const telem::SdApiStatusCode refresh_code = refreshFileList(handle, sort_key, sort_dir);
   if (refresh_code != telem::SdApiStatusCode::OK && refresh_code != telem::SdApiStatusCode::NO_FILES) {
-    return "[]";
+    return "{\"total_files\":0,\"returned_files\":0,\"truncated\":false,\"files\":[]}";
   }
 
-  String out = "[";
-  FileListPage page = {};
-  uint16_t offset = 0U;
+  const uint16_t total_files = g_snapshot_total_files;
+  const uint16_t target_count = (total_files < kFilesJsonMaxEntries) ? total_files : kFilesJsonMaxEntries;
+  const bool truncated = total_files > target_count;
+
+  String out = "{\"total_files\":";
+  out += String(total_files);
+  out += ",\"returned_files\":";
+  out += String(target_count);
+  out += ",\"truncated\":";
+  out += truncated ? "true" : "false";
+  out += ",\"files\":[";
   bool first = true;
-  while (offset < g_snapshot_total_files) {
-    const telem::SdApiStatusCode page_code = getFileListPage(handle, offset, 32U, page);
-    if (page_code != telem::SdApiStatusCode::OK) break;
-    for (uint16_t i = 0U; i < page.returned_files; ++i) {
+  if (handle.valid() && g_snapshot_valid && g_snapshot_files != nullptr) {
+    for (uint16_t i = 0U; i < target_count; ++i) {
+      const telem::LogFileInfoV1& entry = g_snapshot_files[i];
       if (!first) out += ',';
       first = false;
       out += "{\"name\":\"";
-      out += page.entries[i].name;
+      out += entry.name;
       out += "\",\"size_bytes\":";
-      out += String(page.entries[i].size_bytes);
+      out += String(entry.size_bytes);
       out += ",\"mtime_utc_s\":";
-      out += String(page.entries[i].mtime_utc_s);
+      out += String(entry.mtime_utc_s);
       out += "}";
     }
-    if (!page.has_more) break;
-    offset = (uint16_t)(offset + page.returned_files);
   }
-  out += "]";
+  out += "]}";
   return out;
 }
 

@@ -55,7 +55,7 @@ try {
       category = "replay"
       action = "start_latest"
     } -TimeoutMs 3000
-    Assert-ControlRejectedCode -Response $replay -ExpectedCode "busy_recording" -Label "replay start during recording"
+    Assert-ControlBusyCode -Response $replay -ExpectedCode "busy_recording" -Label "replay start during recording"
 
     $list = Invoke-AirControlRequest -Context $context -Request @{
       category = "file"
@@ -63,7 +63,7 @@ try {
       offset = 0
       limit = 1
     } -TimeoutMs 3000
-    Assert-ControlRejectedCode -Response $list -ExpectedCode "busy_recording" -Label "file list during recording"
+    Assert-ControlBusyCode -Response $list -ExpectedCode "busy_recording" -Label "file list during recording"
 
     $stop = Invoke-AirControlRequest -Context $context -Request @{
       category = "recording"
@@ -93,7 +93,7 @@ try {
       category = "recording"
       action = "start"
     } -TimeoutMs 3000
-    Assert-ControlRejectedCode -Response $record -ExpectedCode "busy_replay" -Label "recording start during replay"
+    Assert-ControlBusyCode -Response $record -ExpectedCode "busy_replay" -Label "recording start during replay"
 
     $list = Invoke-AirControlRequest -Context $context -Request @{
       category = "file"
@@ -101,7 +101,7 @@ try {
       offset = 0
       limit = 1
     } -TimeoutMs 3000
-    Assert-ControlRejectedCode -Response $list -ExpectedCode "busy_replay" -Label "file list during replay"
+    Assert-ControlBusyCode -Response $list -ExpectedCode "busy_replay" -Label "file list during replay"
 
     $replayStop = Invoke-AirControlRequest -Context $context -Request @{
       category = "replay"

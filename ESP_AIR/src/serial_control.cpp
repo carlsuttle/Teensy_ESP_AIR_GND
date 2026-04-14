@@ -209,6 +209,34 @@ bool parseJsonFloat(const String& json, const char* key, float& out) {
   return !(end_ptr == token.c_str() || *end_ptr != '\0');
 }
 
+bool parseSortKey(const String& value, log_store::FileSortKey& out) {
+  if (value == "name") {
+    out = log_store::FileSortKey::name;
+    return true;
+  }
+  if (value == "size") {
+    out = log_store::FileSortKey::size;
+    return true;
+  }
+  if (value == "date") {
+    out = log_store::FileSortKey::date;
+    return true;
+  }
+  return false;
+}
+
+bool parseSortDirection(const String& value, log_store::FileSortDirection& out) {
+  if (value == "asc" || value == "ascending") {
+    out = log_store::FileSortDirection::ascending;
+    return true;
+  }
+  if (value == "desc" || value == "descending") {
+    out = log_store::FileSortDirection::descending;
+    return true;
+  }
+  return false;
+}
+
 void writeJsonEscaped(Stream& io, const String& value) {
   io.print('"');
   for (size_t i = 0; i < value.length(); ++i) {
@@ -469,6 +497,12 @@ void emitImmediate(Stream& io, const control_plane::Request& request, const cont
 void emitFinal(Stream& io, const control_plane::Request& request, const control_plane::Result& result) {
   const telem::StorageStatusPayloadV1* storage_hint = result.has_storage_status ? &result.storage_status : nullptr;
   control_plane::fillStateSnapshot(millis(), g_state_scratch, storage_hint);
+  if (request.action == control_plane::RequestAction::FusionGet) {
+    g_state_scratch.has_fusion_settings = result.has_fusion_settings;
+    if (result.has_fusion_settings) {
+      g_state_scratch.fusion_settings = result.fusion_settings;
+    }
+  }
   const control_plane::StateSnapshot& state = g_state_scratch;
   writeResultEnvelopeStart(io,
                            request,
@@ -497,12 +531,21 @@ void emitFinal(Stream& io, const control_plane::Request& request, const control_
     io.print(",");
     writeFileListPayload(io, control_plane::lastFileListPage());
   }
+  if (result.has_files_json) {
+    io.print(",\"files_json\":");
+    if (result.files_json.length() > 0U) {
+      io.print(result.files_json);
+    } else {
+      io.print("[]");
+    }
+  }
   if (result.has_fusion_settings) {
     io.print(",\"has_fusion_settings\":true,");
     writeFusionSettings(io, result.fusion_settings);
   } else {
+    const bool expose_cached_fusion = request.action != control_plane::RequestAction::FusionGet;
     io.print(",\"has_fusion_settings\":");
-    io.print(state.has_fusion_settings ? "true" : "false");
+    io.print(expose_cached_fusion && state.has_fusion_settings ? "true" : "false");
   }
   io.println("}");
 }
@@ -585,6 +628,18 @@ bool buildRequest(const String& json, control_plane::Request& request, uint32_t&
       request.action = control_plane::RequestAction::ReplayStop;
       return true;
     }
+    if (action == "pause") {
+      request.action = control_plane::RequestAction::ReplayPause;
+      return true;
+    }
+    if (action == "seek_relative") {
+      request.action = control_plane::RequestAction::ReplaySeekRelative;
+      if (!parseJsonInt32(json, "delta_records", request.delta_records)) {
+        error = "missing_delta_records";
+        return false;
+      }
+      return true;
+    }
     if (action == "status") {
       request.action = control_plane::RequestAction::ReplayStatus;
       return true;
@@ -617,6 +672,63 @@ bool buildRequest(const String& json, control_plane::Request& request, uint32_t&
       request.action = control_plane::RequestAction::FileListPage;
       (void)parseJsonUInt16(json, "offset", request.offset);
       (void)parseJsonUInt16(json, "limit", request.limit);
+      return true;
+    }
+    if (action == "list_json") {
+      request.action = control_plane::RequestAction::FileListJson;
+      String sortKey;
+      if (parseJsonString(json, "sort_key", sortKey) &&
+          !parseSortKey(sortKey, request.sort_key)) {
+        error = "invalid_sort_key";
+        return false;
+      }
+      String sortDir;
+      if (parseJsonString(json, "sort_dir", sortDir) &&
+          !parseSortDirection(sortDir, request.sort_dir)) {
+        error = "invalid_sort_dir";
+        return false;
+      }
+      return true;
+    }
+    if (action == "mount_media") {
+      request.action = control_plane::RequestAction::MountMedia;
+      return true;
+    }
+    if (action == "eject_media") {
+      request.action = control_plane::RequestAction::EjectMedia;
+      return true;
+    }
+    if (action == "delete") {
+      String name;
+      if (!parseJsonString(json, "name", name) || name.length() == 0U) {
+        error = "missing_name";
+        return false;
+      }
+      request.action = control_plane::RequestAction::DeleteFile;
+      strlcpy(request.name, name.c_str(), sizeof(request.name));
+      return true;
+    }
+    if (action == "rename") {
+      String name;
+      String auxName;
+      if (!parseJsonString(json, "name", name) || name.length() == 0U ||
+          !parseJsonString(json, "aux_name", auxName) || auxName.length() == 0U) {
+        error = "missing_name";
+        return false;
+      }
+      request.action = control_plane::RequestAction::RenameFile;
+      strlcpy(request.name, name.c_str(), sizeof(request.name));
+      strlcpy(request.aux_name, auxName.c_str(), sizeof(request.aux_name));
+      return true;
+    }
+    if (action == "set_record_prefix") {
+      String prefix;
+      if (!parseJsonString(json, "prefix", prefix) || prefix.length() == 0U) {
+        error = "missing_prefix";
+        return false;
+      }
+      request.action = control_plane::RequestAction::SetRecordPrefix;
+      strlcpy(request.prefix, prefix.c_str(), sizeof(request.prefix));
       return true;
     }
   }
