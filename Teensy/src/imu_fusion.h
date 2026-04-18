@@ -54,7 +54,9 @@ struct ImuConfig {
 };
 
 struct CaptureSettings {
-  uint16_t sourceRateHz = 0U;
+  uint16_t gyroOdrHz = 0U;
+  uint16_t accelOdrHz = 0U;
+  uint16_t exportDecimation = 1U;
 };
 
 struct SourcePerfSnapshot {
@@ -119,9 +121,16 @@ bool getCaptureSettings(CaptureSettings& cfg);
 bool setCaptureSettings(const CaptureSettings& cfg, uint16_t* applied_hz = nullptr);
 bool loadPersistedCaptureSettings();
 bool savePersistedCaptureSettings();
+void getDefaultCaptureSettings(CaptureSettings& cfg);
 bool getImuConfig(ImuConfig& cfg);
 bool setImuConfig(const ImuConfig& cfg);
 bool getImuSampleRates(float& accHz, float& gyrHz);
+uint16_t configuredGyroOdrHz();
+uint16_t configuredAccelOdrHz();
+uint16_t exportDecimation();
+uint16_t stateExportRateHz();
+uint32_t stateExportPeriodUs();
+uint16_t recordsPerSpiTransaction();
 
 void setAccelGyroOffsets(const float offsets6[6]);
 void setAccelScale(float scale);

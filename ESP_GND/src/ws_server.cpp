@@ -4,6 +4,7 @@
 #include <ESPAsyncWebServer.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <math.h>
 
 #include "config_store.h"
 #include "radio_link.h"
@@ -17,9 +18,14 @@ AsyncWebSocket g_ws("/ws");
 
 constexpr uint16_t kSnapshotRateHz = 30U;
 constexpr uint32_t kSnapshotPeriodMs = 1000U / kSnapshotRateHz;
+constexpr uint32_t kSnapshotFreshMs = 300U;
 constexpr uint32_t kAckTimeoutMs = 2000U;
 constexpr uint32_t kFilesTimeoutMs = 15000U;
 constexpr uint32_t kStoragePollMs = 2000U;
+constexpr bool kAutoWsLogsEnabled = false;
+constexpr uint32_t kSyntheticSourcePeriodMs = 33U;
+constexpr int32_t kSyntheticBaseLat1e7 = 372282000;
+constexpr int32_t kSyntheticBaseLon1e7 = -1218882700;
 
 enum class PendingOp : uint8_t {
   None = 0,
@@ -34,6 +40,7 @@ enum class PendingOp : uint8_t {
 enum class PendingPhase : uint8_t {
   None = 0,
   AwaitAck,
+  AwaitApply,
   AwaitFiles,
 };
 
@@ -44,6 +51,7 @@ struct PendingCommand {
   uint32_t started_ms = 0U;
   uint32_t deadline_ms = 0U;
   uint32_t ack_baseline = 0U;
+  uint32_t expected_control_gen = 0U;
   uint32_t files_revision_baseline = 0U;
   uint16_t file_offset = 0U;
   uint16_t file_limit = 32U;
@@ -78,6 +86,69 @@ uint32_t g_ws_control_tx = 0U;
 uint32_t g_last_ws_connect_ms = 0U;
 uint32_t g_last_ws_send_ms = 0U;
 uint32_t g_last_ws_live_log_ms = 0U;
+uint32_t g_last_ws_backpressure_log_ms = 0U;
+uint32_t g_ws_sum_count = 0U;
+uint32_t g_ws_sum_last_seq = 0U;
+uint32_t g_ws_sum_last_age_ms = 0U;
+bool g_synthetic_live_mode = false;
+uint32_t g_synthetic_live_seq = 0U;
+
+float triangleWaveDegrees(uint32_t now_ms, uint32_t period_ms, float amplitude, uint32_t phase_ms = 0U) {
+  if (period_ms == 0U) return 0.0f;
+  const uint32_t phase = (now_ms + phase_ms) % period_ms;
+  const float norm = (float)phase / (float)period_ms;
+  const float tri = norm < 0.5f ? (-1.0f + 4.0f * norm) : (3.0f - 4.0f * norm);
+  return tri * amplitude;
+}
+
+int32_t triangleWaveE7(uint32_t now_ms, uint32_t period_ms, int32_t amplitude_e7, uint32_t phase_ms = 0U) {
+  return (int32_t)lroundf(triangleWaveDegrees(now_ms, period_ms, (float)amplitude_e7, phase_ms));
+}
+
+void fillSyntheticState(uint32_t now_ms, telem::TelemetryStateRecord& state, uint32_t& seq, uint32_t& t_us) {
+  seq = ++g_synthetic_live_seq;
+  t_us = now_ms * 1000U;
+  state = {};
+  const float roll_deg = triangleWaveDegrees(now_ms, 4000U, 45.0f);
+  const float pitch_deg = triangleWaveDegrees(now_ms, 7000U, 10.0f, 1200U);
+  const float yaw_deg = (float)((now_ms % 12000U) * (360.0 / 12000.0));
+  const float altitude_m = 120.0f + triangleWaveDegrees(now_ms, 9000U, 25.0f, 800U);
+  const float vsi_mps = triangleWaveDegrees(now_ms, 3000U, 4.0f, 300U);
+
+  state.roll_deg = roll_deg;
+  state.pitch_deg = pitch_deg;
+  state.yaw_deg = yaw_deg;
+  state.mag_heading_deg = yaw_deg;
+  state.iTOW_ms = now_ms;
+  state.fixType = 3U;
+  state.numSV = 12U;
+  state.lat_1e7 = kSyntheticBaseLat1e7 + triangleWaveE7(now_ms, 8000U, 2200, 0U);
+  state.lon_1e7 = kSyntheticBaseLon1e7 + triangleWaveE7(now_ms, 10000U, 3200, 1500U);
+  state.hMSL_mm = (int32_t)lroundf(altitude_m * 1000.0f);
+  state.gSpeed_mms = 18000;
+  state.headMot_1e5deg = (int32_t)lroundf(yaw_deg * 100000.0f);
+  state.hAcc_mm = 1200U;
+  state.sAcc_mms = 600U;
+  state.last_gps_ms = now_ms;
+  state.last_imu_ms = now_ms;
+  state.last_baro_ms = now_ms;
+  state.baro_alt_m = altitude_m;
+  state.baro_vsi_mps = vsi_mps;
+  state.fusion_gain = 0.50f;
+  state.fusion_accel_rej = 10.0f;
+  state.fusion_mag_rej = 10.0f;
+  state.fusion_recovery_period = 400U;
+  state.flags = telem::kStateFlagGpsFix3d;
+  state.raw_present_mask = (uint16_t)(telem::kSensorPresentImu | telem::kSensorPresentGps | telem::kSensorPresentBaro);
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  state.gps_year = 2026U;
+  state.gps_month = 4U;
+  state.gps_day = 18U;
+  state.gps_hour = 12U;
+  state.gps_min = (uint8_t)((now_ms / 60000U) % 60U);
+  state.gps_sec = (uint8_t)((now_ms / 1000U) % 60U);
+#endif
+}
 
 const char* sendStatusText(AsyncWebSocket::SendStatus status) {
   switch (status) {
@@ -90,6 +161,7 @@ const char* sendStatusText(AsyncWebSocket::SendStatus status) {
 }
 
 void logHttpRequest(const char* kind, AsyncWebServerRequest* request, const char* path) {
+  if (!kAutoWsLogsEnabled) return;
   const String ip = request ? request->client()->remoteIP().toString() : String("-");
   Serial.printf("WEB %s path=%s from=%s\n",
                 kind ? kind : "http_get",
@@ -163,12 +235,14 @@ void sendAck(PendingOp op, uint32_t req_id, bool ok, uint32_t code, const char* 
   if (detail && detail[0] != '\0') doc["detail"] = detail;
   const AsyncWebSocket::SendStatus status = sendJson(doc);
   g_ws_control_tx++;
-  Serial.printf("CTRL tx_to_ws op=%s req_id=%lu ok=%u code=%lu send=%s\n",
-                opText(op),
-                (unsigned long)req_id,
-                ok ? 1U : 0U,
-                (unsigned long)code,
-                sendStatusText(status));
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("CTRL tx_to_ws op=%s req_id=%lu ok=%u code=%lu send=%s\n",
+                  opText(op),
+                  (unsigned long)req_id,
+                  ok ? 1U : 0U,
+                  (unsigned long)code,
+                  sendStatusText(status));
+  }
 }
 
 void sendHello(AsyncWebSocketClient* client) {
@@ -191,11 +265,13 @@ void sendHello(AsyncWebSocketClient* client) {
     const bool ok = client->text(text);
     g_last_ws_send_ms = millis();
     if (!ok) g_ws_send_failures++;
-    Serial.printf("WEB ws_hello client=%u ip=%s ok=%u bytes=%u\n",
-                  client->id(),
-                  client->remoteIP().toString().c_str(),
-                  ok ? 1U : 0U,
-                  (unsigned)text.length());
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("WEB ws_hello client=%u ip=%s ok=%u bytes=%u\n",
+                    client->id(),
+                    client->remoteIP().toString().c_str(),
+                    ok ? 1U : 0U,
+                    (unsigned)text.length());
+    }
   }
 }
 
@@ -206,9 +282,11 @@ void sendFiles(uint32_t req_id = 0U) {
   doc["type"] = "files";
   if (req_id != 0U) doc["req_id"] = req_id;
   const AsyncWebSocket::SendStatus status = sendJson(doc);
-  Serial.printf("WEB ws_files req_id=%lu send=%s\n",
-                (unsigned long)req_id,
-                sendStatusText(status));
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("WEB ws_files req_id=%lu send=%s\n",
+                  (unsigned long)req_id,
+                  sendStatusText(status));
+  }
   g_last_files_revision_sent = radio_link::remoteFilesStatus().revision;
 }
 
@@ -219,17 +297,20 @@ void sendStorage(uint32_t req_id = 0U) {
   doc["type"] = "storage";
   if (req_id != 0U) doc["req_id"] = req_id;
   const AsyncWebSocket::SendStatus status = sendJson(doc);
-  Serial.printf("WEB ws_storage req_id=%lu send=%s\n",
-                (unsigned long)req_id,
-                sendStatusText(status));
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("WEB ws_storage req_id=%lu send=%s\n",
+                  (unsigned long)req_id,
+                  sendStatusText(status));
+  }
   g_last_storage_revision_sent = radio_link::remoteStorageStatus().revision;
 }
 
 void updateTxStats(const radio_link::Snapshot& snap, uint32_t now_ms) {
+  const bool use_synth = g_synthetic_live_mode;
   const uint32_t freshness_ms =
-      snap.stats.last_state_apply_ms != 0U ? snap.stats.last_state_apply_ms : snap.stats.last_rx_ms;
-  g_last_state_seq_sent = snap.seq;
-  g_last_source_t_us_sent = snap.t_us;
+      use_synth ? now_ms : (snap.stats.last_state_apply_ms != 0U ? snap.stats.last_state_apply_ms : snap.stats.last_rx_ms);
+  g_last_state_seq_sent = use_synth ? g_synthetic_live_seq : snap.seq;
+  g_last_source_t_us_sent = use_synth ? (now_ms * 1000U) : snap.t_us;
   g_last_radio_rx_ms_seen = freshness_ms;
   g_last_ui_tx_ms = now_ms;
   g_last_ui_tx_latency_ms =
@@ -239,34 +320,34 @@ void updateTxStats(const radio_link::Snapshot& snap, uint32_t now_ms) {
   }
 }
 
-void maybeBroadcastSnapshot() {
-  if (g_ws.count() == 0U) return;
-  const uint32_t now_ms = millis();
-  if (g_last_state_broadcast_ms != 0U &&
-      (uint32_t)(now_ms - g_last_state_broadcast_ms) < kSnapshotPeriodMs) {
-    return;
+void fillSnapshotDoc(JsonDocument& doc, const radio_link::Snapshot& snap, uint32_t now_ms) {
+  telem::TelemetryStateRecord state = snap.state;
+  uint32_t seq = snap.seq;
+  uint32_t source_t_us = snap.t_us;
+  uint32_t freshness_ms =
+      snap.stats.last_state_apply_ms != 0U ? snap.stats.last_state_apply_ms : snap.stats.last_rx_ms;
+  if (g_synthetic_live_mode) {
+    fillSyntheticState(now_ms, state, seq, source_t_us);
+    freshness_ms = now_ms;
   }
 
-  const radio_link::Snapshot snap = radio_link::snapshot();
-  const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(snap.state);
+  const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(state);
   const bool gps_calendar_valid =
       gps_time.year != 0U && gps_time.month != 0U && gps_time.day != 0U;
-  const uint32_t freshness_ms =
-      snap.stats.last_state_apply_ms != 0U ? snap.stats.last_state_apply_ms : snap.stats.last_rx_ms;
   uint32_t replay_source_seq = 0U;
   uint32_t replay_source_t_us = 0U;
-  telem::decodeReplaySourceStamp(snap.state, replay_source_seq, replay_source_t_us);
+  telem::decodeReplaySourceStamp(state, replay_source_seq, replay_source_t_us);
 
-  JsonDocument doc;
   doc["type"] = "snapshot";
   doc["schema_id"] = telem::kActiveSchema.schema_id;
   doc["schema_version"] = telem::kActiveSchema.schema_version;
   doc["ws_seq"] = ++g_ws_state_seq;
-  doc["seq"] = snap.seq;
-  doc["source_t_us"] = snap.t_us;
+  doc["seq"] = seq;
+  doc["state_seq"] = seq;
+  doc["source_t_us"] = source_t_us;
   doc["replay_source_seq"] = replay_source_seq;
   doc["replay_source_t_us"] = replay_source_t_us;
-  doc["fresh"] = freshness_ms != 0U && (uint32_t)(now_ms - freshness_ms) <= 3000U;
+  doc["fresh"] = freshness_ms != 0U && (uint32_t)(now_ms - freshness_ms) <= kSnapshotFreshMs;
   doc["age_ms"] = freshness_ms != 0U ? (uint32_t)(now_ms - freshness_ms) : 0xFFFFFFFFUL;
   doc["radio_rtt_ms"] = snap.radio_rtt_ms;
   doc["drop"] = snap.stats.drop;
@@ -289,30 +370,33 @@ void maybeBroadcastSnapshot() {
   doc["replay_last_error"] = snap.replay_status.last_error;
   doc["replay_last_command"] = snap.replay_status.last_command;
   doc["replay_current_file"] = snap.replay_status.current_file;
-  doc["roll_deg"] = snap.state.roll_deg;
-  doc["pitch_deg"] = snap.state.pitch_deg;
-  doc["yaw_deg"] = snap.state.yaw_deg;
-  doc["mag_heading_deg"] = snap.state.mag_heading_deg;
-  doc["lat_1e7"] = snap.state.lat_1e7;
-  doc["lon_1e7"] = snap.state.lon_1e7;
-  doc["hMSL_mm"] = snap.state.hMSL_mm;
-  doc["gSpeed_mms"] = snap.state.gSpeed_mms;
-  doc["headMot_1e5deg"] = snap.state.headMot_1e5deg;
-  doc["gps_itow_ms"] = snap.state.iTOW_ms;
-  doc["gps_fix_type"] = snap.state.fixType;
-  doc["gps_num_sv"] = snap.state.numSV;
-  doc["hAcc_mm"] = snap.state.hAcc_mm;
-  doc["sAcc_mms"] = snap.state.sAcc_mms;
-  doc["baro_temp_c"] = snap.state.baro_temp_c;
-  doc["baro_press_hpa"] = snap.state.baro_press_hpa;
-  doc["baro_alt_m"] = snap.state.baro_alt_m;
-  doc["baro_vsi_mps"] = snap.state.baro_vsi_mps;
-  doc["fusion_gain"] = snap.state.fusion_gain;
-  doc["fusion_accel_rej"] = snap.state.fusion_accel_rej;
-  doc["fusion_mag_rej"] = snap.state.fusion_mag_rej;
-  doc["fusion_recovery_period"] = snap.state.fusion_recovery_period;
-  doc["flags"] = snap.state.flags;
-  doc["raw_present_mask"] = snap.state.raw_present_mask;
+  doc["roll_deg"] = state.roll_deg;
+  doc["pitch_deg"] = state.pitch_deg;
+  doc["yaw_deg"] = state.yaw_deg;
+  doc["mag_heading_deg"] = state.mag_heading_deg;
+  doc["lat_1e7"] = state.lat_1e7;
+  doc["lon_1e7"] = state.lon_1e7;
+  doc["hMSL_mm"] = state.hMSL_mm;
+  doc["gSpeed_mms"] = state.gSpeed_mms;
+  doc["headMot_1e5deg"] = state.headMot_1e5deg;
+  doc["gps_itow_ms"] = state.iTOW_ms;
+  doc["gps_fix_type"] = state.fixType;
+  doc["gps_num_sv"] = state.numSV;
+  doc["hAcc_mm"] = state.hAcc_mm;
+  doc["sAcc_mms"] = state.sAcc_mms;
+  doc["baro_temp_c"] = state.baro_temp_c;
+  doc["baro_press_hpa"] = state.baro_press_hpa;
+  doc["baro_alt_m"] = state.baro_alt_m;
+  doc["baro_vsi_mps"] = state.baro_vsi_mps;
+  doc["fusion_gain"] = state.fusion_gain;
+  doc["fusion_accel_rej"] = state.fusion_accel_rej;
+  doc["fusion_mag_rej"] = state.fusion_mag_rej;
+  doc["fusion_recovery_period"] = state.fusion_recovery_period;
+  doc["desired_control_gen"] = snap.desired_control_gen;
+  doc["applied_control_gen"] = snap.applied_control_gen;
+  doc["control_code"] = snap.control_code;
+  doc["flags"] = state.flags;
+  doc["raw_present_mask"] = state.raw_present_mask;
   doc["gps_calendar_valid"] = gps_calendar_valid;
   doc["gps_year"] = gps_time.year;
   doc["gps_month"] = gps_time.month;
@@ -320,17 +404,55 @@ void maybeBroadcastSnapshot() {
   doc["gps_hour"] = gps_time.hour;
   doc["gps_min"] = gps_time.minute;
   doc["gps_sec"] = gps_time.second;
+}
+
+void logWsTrace(const JsonDocument& doc) {
+  Serial.printf("WSTRACE ws_seq=%lu state_seq=%lu roll=%.2f pitch=%.2f yaw=%.2f lat=%ld lon=%ld\r\n",
+                (unsigned long)(doc["ws_seq"] | 0U),
+                (unsigned long)(doc["state_seq"] | 0U),
+                (double)(doc["roll_deg"] | 0.0),
+                (double)(doc["pitch_deg"] | 0.0),
+                (double)(doc["yaw_deg"] | 0.0),
+                (long)(doc["lat_1e7"] | 0L),
+                (long)(doc["lon_1e7"] | 0L));
+}
+
+void maybeBroadcastSnapshot() {
+  if (g_ws.count() == 0U) return;
+  const uint32_t now_ms = millis();
+  if (g_last_state_broadcast_ms != 0U &&
+      (uint32_t)(now_ms - g_last_state_broadcast_ms) < kSnapshotPeriodMs) {
+    return;
+  }
+  if (!g_ws.availableForWriteAll()) {
+    if (g_last_ws_backpressure_log_ms == 0U ||
+        (uint32_t)(now_ms - g_last_ws_backpressure_log_ms) >= 1000U) {
+      if (kAutoWsLogsEnabled) {
+        Serial.printf("WEB ws_live backpressure clients=%u last_seq=%lu\n",
+                      (unsigned)g_ws.count(),
+                      (unsigned long)g_last_state_seq_sent);
+      }
+      g_last_ws_backpressure_log_ms = now_ms;
+    }
+  }
+
+  const radio_link::Snapshot snap = radio_link::snapshot();
+  if (!g_synthetic_live_mode && !snap.has_state) {
+    return;
+  }
+  JsonDocument doc;
+  fillSnapshotDoc(doc, snap, now_ms);
+  logWsTrace(doc);
 
   updateTxStats(snap, now_ms);
-  const AsyncWebSocket::SendStatus status = sendJson(doc);
+  (void)sendJson(doc);
   g_ws_snapshots_sent++;
   g_ws_live_updates_sent++;
+  g_ws_sum_count++;
+  g_ws_sum_last_seq = doc["seq"] | 0U;
+  g_ws_sum_last_age_ms = doc["age_ms"] | 0U;
   if (g_last_ws_live_log_ms == 0U || (uint32_t)(now_ms - g_last_ws_live_log_ms) >= 1000U) {
-    Serial.printf("WEB ws_live clients=%u bytes=%u seq=%lu send=%s\n",
-                  (unsigned)g_ws.count(),
-                  (unsigned)measureJson(doc),
-                  (unsigned long)snap.seq,
-                  sendStatusText(status));
+    g_ws_sum_count = 0U;
     g_last_ws_live_log_ms = now_ms;
   }
   g_last_state_broadcast_ms = now_ms;
@@ -342,27 +464,33 @@ void clearPending() {
 
 bool enqueuePending(const PendingCommand& next) {
   if (g_pending.op != PendingOp::None) {
-    Serial.printf("CTRL enqueue_busy op=%s req_id=%lu pending=%s\n",
-                  opText(next.op),
-                  (unsigned long)next.req_id,
-                  opText(g_pending.op));
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("CTRL enqueue_busy op=%s req_id=%lu pending=%s\n",
+                    opText(next.op),
+                    (unsigned long)next.req_id,
+                    opText(g_pending.op));
+    }
     return false;
   }
   g_pending = next;
   g_pending.started_ms = millis();
-  Serial.printf("CTRL enqueue op=%s req_id=%lu\n",
-                opText(next.op),
-                (unsigned long)next.req_id);
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("CTRL enqueue op=%s req_id=%lu\n",
+                  opText(next.op),
+                  (unsigned long)next.req_id);
+  }
   return true;
 }
 
 void finalizePending(bool ok, uint32_t code, const char* detail = "") {
-  Serial.printf("CTRL finalize op=%s req_id=%lu ok=%u code=%lu detail=%s\n",
-                opText(g_pending.op),
-                (unsigned long)g_pending.req_id,
-                ok ? 1U : 0U,
-                (unsigned long)code,
-                detail ? detail : "");
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("CTRL finalize op=%s req_id=%lu ok=%u code=%lu detail=%s\n",
+                  opText(g_pending.op),
+                  (unsigned long)g_pending.req_id,
+                  ok ? 1U : 0U,
+                  (unsigned long)code,
+                  detail ? detail : "");
+  }
   sendAck(g_pending.op, g_pending.req_id, ok, code, detail);
   clearPending();
 }
@@ -409,7 +537,8 @@ void processPending() {
         break;
       case PendingOp::SetFusion:
         tx_ok = radio_link::sendSetFusionSettings(g_pending.fusion);
-        g_pending.phase = PendingPhase::AwaitAck;
+        g_pending.expected_control_gen = radio_link::desiredControlGen();
+        g_pending.phase = PendingPhase::AwaitApply;
         g_pending.deadline_ms = now_ms + kAckTimeoutMs;
         break;
       default:
@@ -421,9 +550,11 @@ void processPending() {
       finalizePending(false, 1U, "tx_failed");
     } else {
       g_ws_control_tx_air++;
-      Serial.printf("CTRL tx_to_air op=%s req_id=%lu ok=1\n",
-                    opText(g_pending.op),
-                    (unsigned long)g_pending.req_id);
+      if (kAutoWsLogsEnabled) {
+        Serial.printf("CTRL tx_to_air op=%s req_id=%lu ok=1\n",
+                      opText(g_pending.op),
+                      (unsigned long)g_pending.req_id);
+      }
     }
     return;
   }
@@ -436,11 +567,13 @@ void processPending() {
         snap.ack_rx_seq != 0U &&
         snap.ack_rx_seq != g_pending.ack_baseline) {
       g_ws_control_ack++;
-      Serial.printf("CTRL ack_from_air op=%s req_id=%lu ok=%u code=%lu\n",
-                    opText(g_pending.op),
-                    (unsigned long)g_pending.req_id,
-                    snap.ack_ok ? 1U : 0U,
-                    (unsigned long)snap.ack_code);
+      if (kAutoWsLogsEnabled) {
+        Serial.printf("CTRL ack_from_air op=%s req_id=%lu ok=%u code=%lu\n",
+                      opText(g_pending.op),
+                      (unsigned long)g_pending.req_id,
+                      snap.ack_ok ? 1U : 0U,
+                      (unsigned long)snap.ack_code);
+      }
       if (g_pending.op == PendingOp::SetFusion && snap.ack_ok) {
         (void)radio_link::sendGetFusionSettings();
       }
@@ -469,6 +602,28 @@ void processPending() {
     return;
   }
 
+  if (g_pending.phase == PendingPhase::AwaitApply) {
+    const radio_link::Snapshot snap = radio_link::snapshot();
+    if (snap.applied_control_gen != 0U && snap.applied_control_gen >= g_pending.expected_control_gen) {
+      g_ws_control_ack++;
+      if (kAutoWsLogsEnabled) {
+        Serial.printf("CTRL apply_from_air op=%s req_id=%lu gen=%lu code=%lu\n",
+                      opText(g_pending.op),
+                      (unsigned long)g_pending.req_id,
+                      (unsigned long)snap.applied_control_gen,
+                      (unsigned long)snap.control_code);
+      }
+      finalizePending(snap.control_code == 0U,
+                      snap.control_code,
+                      snap.control_code == 0U ? "applied" : rejectDetailText(g_pending.op, snap.control_code));
+      return;
+    }
+    if ((int32_t)(now_ms - g_pending.deadline_ms) >= 0) {
+      finalizePending(false, 3U, "timeout");
+    }
+    return;
+  }
+
   if (g_pending.phase == PendingPhase::AwaitFiles) {
     const radio_link::Snapshot snap = radio_link::snapshot();
     if (snap.has_ack &&
@@ -476,11 +631,13 @@ void processPending() {
         snap.ack_rx_seq != 0U &&
         snap.ack_rx_seq != g_pending.ack_baseline) {
       g_ws_control_ack++;
-      Serial.printf("CTRL ack_from_air op=%s req_id=%lu ok=%u code=%lu\n",
-                    opText(g_pending.op),
-                    (unsigned long)g_pending.req_id,
-                    snap.ack_ok ? 1U : 0U,
-                    (unsigned long)snap.ack_code);
+      if (kAutoWsLogsEnabled) {
+        Serial.printf("CTRL ack_from_air op=%s req_id=%lu ok=%u code=%lu\n",
+                      opText(g_pending.op),
+                      (unsigned long)g_pending.req_id,
+                      snap.ack_ok ? 1U : 0U,
+                      (unsigned long)snap.ack_code);
+      }
       g_pending.ack_baseline = snap.ack_rx_seq;
       if (!snap.ack_ok) {
         finalizePending(false, snap.ack_code, rejectDetailText(g_pending.op, snap.ack_code));
@@ -506,10 +663,34 @@ void processPending() {
   }
 }
 
+void sendSnapshot(AsyncWebSocketClient* client) {
+  if (!client) return;
+  const uint32_t now_ms = millis();
+  const radio_link::Snapshot snap = radio_link::snapshot();
+  JsonDocument doc;
+  fillSnapshotDoc(doc, snap, now_ms);
+  logWsTrace(doc);
+  String text;
+  serializeJson(doc, text);
+  const bool ok = client->text(text);
+  g_last_ws_send_ms = now_ms;
+  if (!ok) g_ws_send_failures++;
+  updateTxStats(snap, now_ms);
+  g_ws_snapshots_sent++;
+  g_ws_live_updates_sent++;
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("WEB ws_snapshot client=%u ok=%u bytes=%u seq=%lu\n",
+                  client->id(),
+                  ok ? 1U : 0U,
+                  (unsigned)text.length(),
+                  (unsigned long)snap.seq);
+  }
+}
+
 void handleWsMessage(const char* text, size_t len) {
   JsonDocument doc;
   if (deserializeJson(doc, text, len)) {
-    Serial.println("WEB ws_parse_error");
+    if (kAutoWsLogsEnabled) Serial.println("WEB ws_parse_error");
     return;
   }
 
@@ -520,10 +701,12 @@ void handleWsMessage(const char* text, size_t len) {
     g_ws_control_rx++;
     const char* category = doc["category"] | "";
     const char* action = doc["action"] | "";
-    Serial.printf("CTRL rx_from_ws req_id=%lu category=%s action=%s\n",
-                  (unsigned long)req_id,
-                  category,
-                  action);
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("CTRL rx_from_ws req_id=%lu category=%s action=%s\n",
+                    (unsigned long)req_id,
+                    category,
+                    action);
+    }
 
     if (strcmp(category, "recording") == 0) {
       PendingCommand next = {};
@@ -594,10 +777,12 @@ void handleWsMessage(const char* text, size_t len) {
     err["ok"] = false;
     err["code"] = 4U;
     err["detail"] = "unsupported_control";
-    Serial.printf("CTRL unsupported_control req_id=%lu category=%s action=%s\n",
-                  (unsigned long)req_id,
-                  category,
-                  action);
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("CTRL unsupported_control req_id=%lu category=%s action=%s\n",
+                    (unsigned long)req_id,
+                    category,
+                    action);
+    }
     sendJson(err);
     return;
   }
@@ -608,9 +793,11 @@ void handleWsMessage(const char* text, size_t len) {
   err["ok"] = false;
   err["code"] = 4U;
   err["detail"] = "unsupported";
-  Serial.printf("WEB ws_unsupported_message req_id=%lu type=%s\n",
-                (unsigned long)req_id,
-                type);
+  if (kAutoWsLogsEnabled) {
+    Serial.printf("WEB ws_unsupported_message req_id=%lu type=%s\n",
+                  (unsigned long)req_id,
+                  type);
+  }
   sendJson(err);
 }
 
@@ -624,11 +811,14 @@ void onWsEvent(AsyncWebSocket* server,
   if (type == WS_EVT_CONNECT) {
     g_ws_connects++;
     g_last_ws_connect_ms = millis();
-    Serial.printf("WEB ws_open client=%u ip=%s total=%u\n",
-                  client ? client->id() : 0U,
-                  client ? client->remoteIP().toString().c_str() : "-",
-                  (unsigned)g_ws.count());
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("WEB ws_open client=%u ip=%s total=%u\n",
+                    client ? client->id() : 0U,
+                    client ? client->remoteIP().toString().c_str() : "-",
+                    (unsigned)g_ws.count());
+    }
     sendHello(client);
+    sendSnapshot(client);
     sendFiles();
     sendStorage();
     (void)radio_link::sendGetStorageStatus();
@@ -637,16 +827,20 @@ void onWsEvent(AsyncWebSocket* server,
   }
   if (type == WS_EVT_DISCONNECT) {
     g_ws_disconnects++;
-    Serial.printf("WEB ws_close client=%u total=%u\n",
-                  client ? client->id() : 0U,
-                  (unsigned)g_ws.count());
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("WEB ws_close client=%u total=%u\n",
+                    client ? client->id() : 0U,
+                    (unsigned)g_ws.count());
+    }
     return;
   }
   if (type == WS_EVT_ERROR) {
     g_ws_send_failures++;
-    Serial.printf("WEB ws_error client=%u total=%u\n",
-                  client ? client->id() : 0U,
-                  (unsigned)g_ws.count());
+    if (kAutoWsLogsEnabled) {
+      Serial.printf("WEB ws_error client=%u total=%u\n",
+                    client ? client->id() : 0U,
+                    (unsigned)g_ws.count());
+    }
     return;
   }
   if (type != WS_EVT_DATA || !arg || !data || len == 0U) return;
@@ -706,6 +900,24 @@ void loop() {
 
 uint32_t clientCount() { return g_ws.count(); }
 
+void setSyntheticLiveMode(bool enabled) {
+  g_synthetic_live_mode = enabled;
+  if (enabled) {
+    g_synthetic_live_seq = 0U;
+  }
+}
+
+bool syntheticLiveMode() { return g_synthetic_live_mode; }
+
+void printSyntheticLiveStatus(Stream& out) {
+  out.printf("SYNTHLIVE enabled=%u seq=%lu period_ms=%lu base_lat=%ld base_lon=%ld\r\n",
+             g_synthetic_live_mode ? 1U : 0U,
+             (unsigned long)g_synthetic_live_seq,
+             (unsigned long)kSyntheticSourcePeriodMs,
+             (long)kSyntheticBaseLat1e7,
+             (long)kSyntheticBaseLon1e7);
+}
+
 Stats stats() {
   Stats out = {};
   out.clients = clientCount();
@@ -757,6 +969,11 @@ void resetCounters() {
   g_last_ws_connect_ms = 0U;
   g_last_ws_send_ms = 0U;
   g_last_ws_live_log_ms = 0U;
+  g_last_ws_backpressure_log_ms = 0U;
+  g_ws_sum_count = 0U;
+  g_ws_sum_last_seq = 0U;
+  g_ws_sum_last_age_ms = 0U;
+  g_synthetic_live_seq = 0U;
   g_last_files_revision_sent = 0U;
   g_last_storage_revision_sent = 0U;
   g_last_storage_poll_ms = 0U;

@@ -173,7 +173,6 @@ enum MsgType : uint16_t {
   TELEM_FUSION_SETTINGS = 4,
   TELEM_LOG_STATUS = 5,
   TELEM_CONTROL_STATUS = 6,
-  TELEM_UNIFIED_DOWNLINK = 7,
   TELEM_REPLAY_STATUS = 8,
   TELEM_LOG_FILE_LIST = 9,
   TELEM_STORAGE_STATUS = 10,
@@ -368,63 +367,6 @@ inline void setGpsCalendarTime(TelemetryFullStateV2& state, const GpsCalendarTim
   state.gps_sec = gps_time.second;
 }
 
-static constexpr uint8_t kUnifiedDownlinkFlagHasGps = 1U << 0;
-static constexpr uint8_t kUnifiedDownlinkFlagHasStatus = 1U << 1;
-static constexpr uint8_t kUnifiedDownlinkFlagHasExtended = 1U << 2;
-static constexpr uint8_t kUnifiedDownlinkFlagHasControl = kUnifiedDownlinkFlagHasStatus;
-
-struct DownlinkFastStateV1 {
-  float roll_deg;
-  float pitch_deg;
-  float yaw_deg;
-  float mag_heading_deg;
-  uint32_t last_imu_ms;
-  float baro_temp_c;
-  float baro_press_hpa;
-  float baro_alt_m;
-  float baro_vsi_mps;
-  uint32_t last_baro_ms;
-  uint16_t flags;
-};
-
-struct DownlinkGpsStateV1 {
-  uint32_t iTOW_ms;
-  uint8_t fixType;
-  uint8_t numSV;
-  int32_t lat_1e7;
-  int32_t lon_1e7;
-  int32_t hMSL_mm;
-  int32_t gSpeed_mms;
-  int32_t headMot_1e5deg;
-  uint32_t hAcc_mm;
-  uint32_t sAcc_mms;
-  uint32_t gps_parse_errors;
-  uint32_t last_gps_ms;
-};
-
-struct UnifiedDownlinkBaseV1 {
-  uint8_t section_flags;
-  uint8_t reserved0;
-  uint16_t reserved1;
-  uint32_t source_seq;
-  DownlinkFastStateV1 fast;
-};
-
-struct DownlinkExtendedStateV2 {
-  float fusion_gain;
-  float fusion_accel_rej;
-  float fusion_mag_rej;
-  uint16_t fusion_recovery_period;
-  uint16_t raw_present_mask;
-  uint16_t gps_year;
-  uint8_t gps_month;
-  uint8_t gps_day;
-  uint8_t gps_hour;
-  uint8_t gps_min;
-  uint8_t gps_sec;
-  uint8_t reserved0;
-};
-
 struct DownlinkStatusV1 {
   uint8_t log_flags;
   uint8_t time_state;
@@ -452,6 +394,16 @@ struct FusionSettingsV1 {
   float magneticRejection;
   uint16_t recoveryTriggerPeriod;
   uint16_t reserved;
+};
+
+static constexpr uint32_t kDesiredControlMagic = 0x43545231UL;
+static constexpr uint32_t kDesiredControlFlagHasFusion = 1UL << 0;
+
+struct DesiredControlStateV1 {
+  uint32_t magic;
+  uint32_t control_gen;
+  uint32_t flags;
+  FusionSettingsV1 fusion;
 };
 
 struct CaptureSettingsV1 {
@@ -855,11 +807,8 @@ static_assert(sizeof(ReplayControlPayloadV1) == 144U, "ReplayControlPayloadV1 mu
 static_assert(sizeof(ReplayControlRecord160) == kReplayControlRecordBytes, "ReplayControlRecord160 must be 160 bytes");
 static_assert(sizeof(LogMetadataPayloadV1) == kLogMetadataPayloadBytes, "LogMetadataPayloadV1 must be 160 bytes");
 static_assert(sizeof(BinaryLogRecordV2) == 180U, "BinaryLogRecordV2 must match logger record size");
-static_assert(sizeof(DownlinkFastStateV1) == 42U, "DownlinkFastStateV1 must be 42 bytes");
-static_assert(sizeof(UnifiedDownlinkBaseV1) == 50U, "UnifiedDownlinkBaseV1 must be 50 bytes");
-static_assert(sizeof(DownlinkGpsStateV1) == 42U, "DownlinkGpsStateV1 must be 42 bytes");
-static_assert(sizeof(DownlinkExtendedStateV2) == 24U, "DownlinkExtendedStateV2 must be 24 bytes");
 static_assert(sizeof(DownlinkStatusV1) == 24U, "DownlinkStatusV1 must be 24 bytes");
+static_assert(sizeof(DesiredControlStateV1) == 28U, "DesiredControlStateV1 must be 28 bytes");
 static_assert(sizeof(LogFileInfoV1) == 104U, "LogFileInfoV1 must be 104 bytes");
 static_assert(sizeof(LogFileListChunkPayloadV1) == 216U, "LogFileListChunkPayloadV1 must be 216 bytes");
 static_assert(sizeof(StorageStatusPayloadV1) == 152U, "StorageStatusPayloadV1 must be 152 bytes");

@@ -61,9 +61,9 @@ void setDefaults(AppConfig& c) {
   memset(&c, 0, sizeof(c));
   strncpy(c.ap_ssid, "Telemetry", sizeof(c.ap_ssid) - 1);
   strncpy(c.ap_pass, "telemetry", sizeof(c.ap_pass) - 1);
-  c.source_rate_hz = 10;
+  c.source_rate_hz = 400;
   c.ui_rate_hz = 30;
-  c.log_rate_hz = 10;
+  c.log_rate_hz = 400;
   c.log_mode = 1;
   c.radio_state_only = 0;
   c.radio_lr_mode = 1;

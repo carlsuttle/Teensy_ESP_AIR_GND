@@ -40,6 +40,22 @@ constexpr uint16_t kPendingStateDepth = 128U;
 PendingState g_pending_states[kPendingStateDepth] = {};
 uint16_t g_pending_head = 0U;
 uint16_t g_pending_tail = 0U;
+uint32_t g_state_diag_valid_count = 0U;
+uint32_t g_state_diag_last_rx_ms = 0U;
+uint32_t g_state_diag_prev_rx_ms = 0U;
+uint32_t g_state_diag_last_dt_ms = 0U;
+uint32_t g_state_diag_last_seq = 0U;
+uint32_t g_state_diag_last_t_us = 0U;
+uint32_t g_state_diag_last_batch_first_seq = 0U;
+uint32_t g_state_diag_last_batch_last_seq = 0U;
+uint16_t g_state_diag_last_batch_records = 0U;
+uint16_t g_state_diag_last_batch_payload_len = 0U;
+bool g_state_diag_last_replay_output = false;
+bool g_state_diag_stall_warned = false;
+bool g_state_diag_stale_warned = false;
+uint32_t g_state_diag_last_summary_ms = 0U;
+uint32_t g_state_diag_prev_summary_valid = 0U;
+uint32_t g_state_diag_prev_summary_txn = 0U;
 
 void setAckLocked(uint16_t command, bool ok, uint32_t code) {
   g_has_ack = true;
@@ -101,9 +117,17 @@ void servicePoll() {
   const uint32_t poll_started_ms = millis();
   uint32_t state_records_drained = 0U;
   uint32_t raw_records_drained = 0U;
+  uint32_t batch_first_seq = 0U;
+  uint32_t batch_last_seq = 0U;
+  uint16_t batch_records = 0U;
+  uint16_t batch_payload_len = 0U;
+  bool batch_last_replay_output = false;
 
   spi_bridge::poll();
   const bool standalone_bench = config_store::get().standalone_bench != 0U;
+  const auto spi_before = spi_bridge::stats();
+  batch_records = spi_before.last_state_record_count;
+  batch_payload_len = spi_before.last_state_payload_len;
   uint8_t record[sizeof(telem::TelemetryStateRecord)] = {};
   while (spi_bridge::popStateRecord(record, sizeof(record))) {
     telem::TelemetryStateRecord tmp = {};
@@ -116,6 +140,22 @@ void servicePoll() {
       telem::decodeReplaySourceStamp(tmp, seq, t_us);
       have_replay_stamp = (seq != 0U) || (t_us != 0U);
     }
+
+    if (state_records_drained == 0U) {
+      batch_first_seq = seq;
+    }
+    batch_last_seq = seq;
+    batch_last_replay_output = replay_output;
+    g_state_diag_valid_count++;
+    g_state_diag_prev_rx_ms = g_state_diag_last_rx_ms;
+    g_state_diag_last_rx_ms = poll_started_ms;
+    g_state_diag_last_dt_ms =
+        g_state_diag_prev_rx_ms ? (uint32_t)(poll_started_ms - g_state_diag_prev_rx_ms) : 0U;
+    g_state_diag_last_seq = seq;
+    g_state_diag_last_t_us = t_us;
+    g_state_diag_last_replay_output = replay_output;
+    g_state_diag_stall_warned = false;
+    g_state_diag_stale_warned = false;
 
     portENTER_CRITICAL(&g_mux);
     g_state = tmp;
@@ -158,6 +198,65 @@ void servicePoll() {
   g_stats.state_records_drained += state_records_drained;
   g_stats.raw_records_drained += raw_records_drained;
   portEXIT_CRITICAL(&g_mux);
+
+  if (state_records_drained != 0U) {
+    g_state_diag_last_batch_first_seq = batch_first_seq;
+    g_state_diag_last_batch_last_seq = batch_last_seq;
+    g_state_diag_last_batch_records = batch_records ? batch_records : (uint16_t)state_records_drained;
+    g_state_diag_last_batch_payload_len =
+        batch_payload_len ? batch_payload_len : (uint16_t)(state_records_drained * sizeof(telem::TelemetryStateRecord));
+    g_state_diag_last_replay_output = batch_last_replay_output;
+  }
+
+  const uint32_t now = millis();
+  if (g_state_diag_last_rx_ms != 0U) {
+    const uint32_t age_ms = (uint32_t)(now - g_state_diag_last_rx_ms);
+    if (!g_state_diag_stall_warned && age_ms > 100U) {
+      Serial.printf("AIRRXSTALL seq=%lu age_ms=%lu valid=%lu batch_records=%u batch_len=%u replay=%u\n",
+                    (unsigned long)g_state_diag_last_seq,
+                    (unsigned long)age_ms,
+                    (unsigned long)g_state_diag_valid_count,
+                    (unsigned)g_state_diag_last_batch_records,
+                    (unsigned)g_state_diag_last_batch_payload_len,
+                    g_state_diag_last_replay_output ? 1U : 0U);
+      g_state_diag_stall_warned = true;
+    }
+    if (!g_state_diag_stale_warned && age_ms > 300U) {
+      Serial.printf("AIRRXSTALE seq=%lu age_ms=%lu valid=%lu batch_records=%u batch_len=%u replay=%u\n",
+                    (unsigned long)g_state_diag_last_seq,
+                    (unsigned long)age_ms,
+                    (unsigned long)g_state_diag_valid_count,
+                    (unsigned)g_state_diag_last_batch_records,
+                    (unsigned)g_state_diag_last_batch_payload_len,
+                    g_state_diag_last_replay_output ? 1U : 0U);
+      g_state_diag_stale_warned = true;
+    }
+  }
+
+  if (g_state_diag_last_summary_ms == 0U || (uint32_t)(now - g_state_diag_last_summary_ms) >= 1000U) {
+    const auto spi_now = spi_bridge::stats();
+    const uint32_t age_ms = g_state_diag_last_rx_ms ? (uint32_t)(now - g_state_diag_last_rx_ms) : 0U;
+    const uint32_t recps = g_state_diag_valid_count - g_state_diag_prev_summary_valid;
+    const uint32_t txps = spi_now.state_transactions_received - g_state_diag_prev_summary_txn;
+    // Serial.printf(
+        // (unsigned long)g_state_diag_last_seq,
+        // (unsigned long)g_state_diag_last_t_us,
+        // (unsigned long)g_state_diag_last_dt_ms,
+        // (unsigned long)age_ms,
+        // (unsigned long)g_state_diag_valid_count,
+        // (unsigned)g_state_diag_last_batch_records,
+        // (unsigned)g_state_diag_last_batch_payload_len,
+        // (unsigned long)g_state_diag_last_batch_first_seq,
+        // (unsigned long)g_state_diag_last_batch_last_seq,
+        // g_state_diag_last_replay_output ? 1U : 0U,
+        // (unsigned long)recps,
+        // (unsigned long)txps,
+        // (unsigned long)spi_now.state_records_received,
+        // (unsigned long)spi_now.state_transactions_received);
+    g_state_diag_last_summary_ms = now;
+    g_state_diag_prev_summary_valid = g_state_diag_valid_count;
+    g_state_diag_prev_summary_txn = spi_now.state_transactions_received;
+  }
 }
 
 void serviceTask(void* param) {
@@ -175,6 +274,22 @@ void begin(const AppConfig& cfg) {
   g_tx_seq = 1U;
   g_local_state_seq = 0U;
   g_local_ack_seq = 0U;
+  g_state_diag_valid_count = 0U;
+  g_state_diag_last_rx_ms = 0U;
+  g_state_diag_prev_rx_ms = 0U;
+  g_state_diag_last_dt_ms = 0U;
+  g_state_diag_last_seq = 0U;
+  g_state_diag_last_t_us = 0U;
+  g_state_diag_last_batch_first_seq = 0U;
+  g_state_diag_last_batch_last_seq = 0U;
+  g_state_diag_last_batch_records = 0U;
+  g_state_diag_last_batch_payload_len = 0U;
+  g_state_diag_last_replay_output = false;
+  g_state_diag_stall_warned = false;
+  g_state_diag_stale_warned = false;
+  g_state_diag_last_summary_ms = 0U;
+  g_state_diag_prev_summary_valid = 0U;
+  g_state_diag_prev_summary_txn = 0U;
   portENTER_CRITICAL(&g_mux);
   g_state = {};
   g_has_state = false;
@@ -210,6 +325,22 @@ void poll() {
 
 void resync(bool drain_input) {
   (void)drain_input;
+  g_state_diag_valid_count = 0U;
+  g_state_diag_last_rx_ms = 0U;
+  g_state_diag_prev_rx_ms = 0U;
+  g_state_diag_last_dt_ms = 0U;
+  g_state_diag_last_seq = 0U;
+  g_state_diag_last_t_us = 0U;
+  g_state_diag_last_batch_first_seq = 0U;
+  g_state_diag_last_batch_last_seq = 0U;
+  g_state_diag_last_batch_records = 0U;
+  g_state_diag_last_batch_payload_len = 0U;
+  g_state_diag_last_replay_output = false;
+  g_state_diag_stall_warned = false;
+  g_state_diag_stale_warned = false;
+  g_state_diag_last_summary_ms = 0U;
+  g_state_diag_prev_summary_valid = 0U;
+  g_state_diag_prev_summary_txn = 0U;
   portENTER_CRITICAL(&g_mux);
   clearPendingStateQueueLocked();
   portEXIT_CRITICAL(&g_mux);

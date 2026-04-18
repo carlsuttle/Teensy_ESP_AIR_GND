@@ -114,6 +114,8 @@ uint32_t g_last_status_refresh_ms = 0U;
 uint32_t g_last_probe_attempt_ms = 0U;
 uint32_t g_last_idle_media_check_ms = 0U;
 bool g_idle_media_checks_enabled = true;
+bool g_log_dir_known = false;
+bool g_log_dir_fault_reported = false;
 uint16_t g_bench_ring_head = 0U;
 uint16_t g_bench_ring_tail = 0U;
 struct PendingLogMetadata {
@@ -155,7 +157,7 @@ bool loadSessionMeta(SessionMetaRecord& meta) {
 
 bool saveSessionMeta(const SessionMetaRecord& meta) {
   if (!sd_backend::mounted()) return false;
-  if (!sd_api::exists(LOG_DIR)) (void)sd_api::mkdir(LOG_DIR);
+  if (!sd_api::exists(LOG_DIR) && !sd_api::mkdir(LOG_DIR)) return false;
   File f = sd_api::open(kSessionMetaPath, sd_api::OpenMode::write);
   if (!f) return false;
   f.seek(0);
@@ -232,6 +234,29 @@ void refreshBackendStatus(bool force = false) {
   } else {
     g_recorder.free_bytes = telem::kLogBytesUnknown;
   }
+}
+
+bool ensureLogDirReady() {
+  if (!sd_backend::mounted() || !g_recorder.backend_ready || !g_recorder.media_present) {
+    g_log_dir_known = false;
+    return false;
+  }
+  if (g_log_dir_known) return true;
+  if (sd_api::exists(LOG_DIR)) {
+    g_log_dir_known = true;
+    g_log_dir_fault_reported = false;
+    return true;
+  }
+  if (sd_api::mkdir(LOG_DIR)) {
+    g_log_dir_known = true;
+    g_log_dir_fault_reported = false;
+    return true;
+  }
+  if (!g_log_dir_fault_reported) {
+    Serial.println("AIRLOG fault logs_dir_missing create_failed");
+    g_log_dir_fault_reported = true;
+  }
+  return false;
 }
 
 String activeRecordPrefix() {
@@ -853,14 +878,11 @@ bool openCurrentLog() {
   if (g_file) return true;
   refreshBackendStatus(true);
   if (!g_recorder.backend_ready || !g_recorder.media_present) return false;
+  if (!ensureLogDirReady()) return false;
 
   const uint32_t t0 = millis();
   g_current_name = makeLogName(g_recorder.session_id);
   g_file = sd_api::open(g_current_name, sd_api::OpenMode::write);
-  if (!g_file) {
-    (void)sd_api::mkdir(LOG_DIR);
-    g_file = sd_api::open(g_current_name, sd_api::OpenMode::write);
-  }
   portENTER_CRITICAL(&g_stats_mux);
   recordDuration(millis() - t0, g_stats.fs_open_last_ms, g_stats.fs_open_max_ms);
   portEXIT_CRITICAL(&g_stats_mux);
@@ -1592,6 +1614,7 @@ bool collectManagedFileInfos(telem::LogFileInfoV1*& out_files, uint16_t& out_cou
   out_files = nullptr;
   out_count = 0U;
 
+  if (!ensureLogDirReady()) return false;
   File dir = sd_api::open(LOG_DIR);
   if (!dir || !dir.isDirectory()) return false;
 

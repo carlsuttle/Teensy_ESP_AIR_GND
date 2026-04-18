@@ -32,7 +32,9 @@ constexpr uint32_t kFusionSettingsMagic = 0x46555331UL;  // "FUS1"
 constexpr uint16_t kFusionSettingsVersion = 1U;
 constexpr int kCaptureSettingsAddr = 320;
 constexpr uint32_t kCaptureSettingsMagic = 0x43505331UL;  // "CPS1"
-constexpr uint16_t kCaptureSettingsVersion = 1U;
+constexpr uint16_t kCaptureSettingsVersion = 2U;
+constexpr uint16_t kDefaultExportDecimation = 1U;
+constexpr uint16_t kFixedSpiTransactionRateHz = 50U;
 FusionAhrsSettings g_settings = {
     .convention = FusionConventionNed,
     .gain = kDefaultFusionGain,
@@ -54,11 +56,22 @@ struct PersistedFusionSettings {
   uint32_t checksum;
 };
 
-struct PersistedCaptureSettings {
+struct PersistedCaptureSettingsV1 {
   uint32_t magic;
   uint16_t version;
   uint16_t size;
   uint16_t sourceRateHz;
+  uint16_t reserved;
+  uint32_t checksum;
+};
+
+struct PersistedCaptureSettings {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t size;
+  uint16_t gyroOdrHz;
+  uint16_t accelOdrHz;
+  uint16_t exportDecimation;
   uint16_t reserved;
   uint32_t checksum;
 };
@@ -122,6 +135,10 @@ uint32_t fusionSettingsChecksum(const PersistedFusionSettings& cfg) {
   return crc32(reinterpret_cast<const uint8_t*>(&cfg), offsetof(PersistedFusionSettings, checksum));
 }
 
+uint32_t captureSettingsChecksum(const PersistedCaptureSettingsV1& cfg) {
+  return crc32(reinterpret_cast<const uint8_t*>(&cfg), offsetof(PersistedCaptureSettingsV1, checksum));
+}
+
 uint32_t captureSettingsChecksum(const PersistedCaptureSettings& cfg) {
   return crc32(reinterpret_cast<const uint8_t*>(&cfg), offsetof(PersistedCaptureSettings, checksum));
 }
@@ -142,7 +159,36 @@ void initDefaultCaptureSettings(PersistedCaptureSettings& cfg) {
   cfg.magic = kCaptureSettingsMagic;
   cfg.version = kCaptureSettingsVersion;
   cfg.size = sizeof(PersistedCaptureSettings);
-  cfg.sourceRateHz = kDefaultSourceRateHz;
+  cfg.gyroOdrHz = kDefaultSourceRateHz;
+  cfg.accelOdrHz = kDefaultSourceRateHz;
+  cfg.exportDecimation = kDefaultExportDecimation;
+}
+
+void getDefaultCaptureSettingsInternal(CaptureSettings& cfg) {
+  cfg.gyroOdrHz = kDefaultSourceRateHz;
+  cfg.accelOdrHz = kDefaultSourceRateHz;
+  cfg.exportDecimation = kDefaultExportDecimation;
+}
+
+bool isValidExportDecimation(uint16_t gyro_odr_hz, uint16_t export_decimation) {
+  if (gyro_odr_hz == 0U || export_decimation == 0U) return false;
+  if ((gyro_odr_hz % export_decimation) != 0U) return false;
+  const uint16_t export_rate_hz = (uint16_t)(gyro_odr_hz / export_decimation);
+  if (export_rate_hz < kFixedSpiTransactionRateHz) return false;
+  return (export_rate_hz % kFixedSpiTransactionRateHz) == 0U;
+}
+
+uint16_t computeStateExportRateHz() {
+  const uint16_t gyro_odr_hz = configuredGyroOdrHz();
+  const uint16_t export_decimation = exportDecimation();
+  if (!isValidExportDecimation(gyro_odr_hz, export_decimation)) return 0U;
+  return (uint16_t)(gyro_odr_hz / export_decimation);
+}
+
+uint16_t computeRecordsPerSpiTransaction() {
+  const uint16_t export_rate_hz = computeStateExportRateHz();
+  if (export_rate_hz == 0U) return 0U;
+  return (uint16_t)(export_rate_hz / kFixedSpiTransactionRateHz);
 }
 
 void applyFusionSettings(float gain, float accelRejection, float magRejection, uint16_t recoveryPeriod) {
@@ -195,6 +241,9 @@ uint32_t g_frameDropCount = 0U;
 uint32_t g_rawReplayDropCount = 0U;
 uint16_t g_sourceRateHz = kDefaultSourceRateHz;
 uint32_t g_sourcePeriodUs = 1000000UL / kDefaultSourceRateHz;
+uint16_t g_captureGyroOdrHz = kDefaultSourceRateHz;
+uint16_t g_captureAccelOdrHz = kDefaultSourceRateHz;
+uint16_t g_exportDecimation = kDefaultExportDecimation;
 
 struct SourceRateConfig {
   uint16_t hz;
@@ -425,27 +474,17 @@ bool readImuFrame(ImuFrame& out) {
   const uint32_t start_us = micros();
   const uint32_t sample_t_us = start_us;
   float gyro[3];
-  if (g_accelPeriodUs <= g_sourcePeriodUs) {
-    float sensor[6];
-    if (!readRawAccelGyro(sensor)) return false;
-    g_ax = sensor[0];
-    g_ay = sensor[1];
-    g_az = sensor[2];
-    g_lastAccelReadUs = sample_t_us;
-    gyro[0] = sensor[3];
-    gyro[1] = sensor[4];
-    gyro[2] = sensor[5];
-  } else {
-    if (!readRawGyro(gyro)) return false;
+  // Gyro cadence defines the fusion cadence. Accel is refreshed opportunistically
+  // and otherwise the estimator uses the latest available body acceleration.
+  if (!readRawGyro(gyro)) return false;
 
-    if ((g_lastAccelReadUs == 0U) || ((uint32_t)(sample_t_us - g_lastAccelReadUs) >= g_accelPeriodUs)) {
-      float accel[3];
-      if (readRawAccel(accel)) {
-        g_ax = accel[0];
-        g_ay = accel[1];
-        g_az = accel[2];
-        g_lastAccelReadUs = sample_t_us;
-      }
+  if ((g_lastAccelReadUs == 0U) || ((uint32_t)(sample_t_us - g_lastAccelReadUs) >= g_accelPeriodUs)) {
+    float accel[3];
+    if (readRawAccel(accel)) {
+      g_ax = accel[0];
+      g_ay = accel[1];
+      g_az = accel[2];
+      g_lastAccelReadUs = sample_t_us;
     }
   }
 
@@ -952,38 +991,84 @@ bool savePersistedFusionSettings() {
 
 bool getCaptureSettings(CaptureSettings& cfg) {
   if (!g_ready) return false;
-  cfg.sourceRateHz = g_sourceRateHz;
+  cfg.gyroOdrHz = g_captureGyroOdrHz;
+  cfg.accelOdrHz = g_captureAccelOdrHz;
+  cfg.exportDecimation = g_exportDecimation;
   return true;
 }
 
 bool setCaptureSettings(const CaptureSettings& cfg, uint16_t* applied_hz) {
   if (!g_ready) return false;
-  return setSourceRateHz(cfg.sourceRateHz, applied_hz);
+  if (!findSourceRateConfig(cfg.gyroOdrHz) || !findSourceRateConfig(cfg.accelOdrHz)) return false;
+  if (!isValidExportDecimation(cfg.gyroOdrHz, cfg.exportDecimation)) return false;
+
+  const SourceRateConfig* gyro_rate_cfg = findSourceRateConfig(cfg.gyroOdrHz);
+  const SourceRateConfig* accel_rate_cfg = findSourceRateConfig(cfg.accelOdrHz);
+  if (!gyro_rate_cfg || !accel_rate_cfg) return false;
+
+  ImuConfig imu_cfg{};
+  if (!getImuConfig(imu_cfg)) return false;
+  imu_cfg.accOdr = accel_rate_cfg->accOdr;
+  imu_cfg.gyrOdr = gyro_rate_cfg->gyrOdr;
+  imu_cfg.accBwp = accel_rate_cfg->accBwp;
+  imu_cfg.accFilterPerf = accel_rate_cfg->accFilterPerf;
+  imu_cfg.gyrBwp = gyro_rate_cfg->gyrBwp;
+  imu_cfg.gyrNoisePerf = gyro_rate_cfg->gyrNoisePerf;
+  imu_cfg.gyrFilterPerf = gyro_rate_cfg->gyrFilterPerf;
+  if (!setImuConfig(imu_cfg)) return false;
+
+  g_captureGyroOdrHz = cfg.gyroOdrHz;
+  g_captureAccelOdrHz = cfg.accelOdrHz;
+  g_exportDecimation = cfg.exportDecimation;
+  if (applied_hz) *applied_hz = g_sourceRateHz;
+  return true;
 }
 
 bool loadPersistedCaptureSettings() {
   if (!g_ready) return false;
   PersistedCaptureSettings cfg{};
   EEPROM.get(kCaptureSettingsAddr, cfg);
-  if (cfg.magic != kCaptureSettingsMagic ||
-      cfg.version != kCaptureSettingsVersion ||
-      cfg.size != sizeof(PersistedCaptureSettings) ||
-      cfg.checksum != captureSettingsChecksum(cfg)) {
+  CaptureSettings runtime{};
+  if (cfg.magic == kCaptureSettingsMagic &&
+      cfg.version == kCaptureSettingsVersion &&
+      cfg.size == sizeof(PersistedCaptureSettings) &&
+      cfg.checksum == captureSettingsChecksum(cfg)) {
+    runtime.gyroOdrHz = cfg.gyroOdrHz;
+    runtime.accelOdrHz = cfg.accelOdrHz;
+    runtime.exportDecimation = cfg.exportDecimation;
+    return setCaptureSettings(runtime, nullptr);
+  }
+
+  PersistedCaptureSettingsV1 legacy{};
+  EEPROM.get(kCaptureSettingsAddr, legacy);
+  if (legacy.magic != kCaptureSettingsMagic ||
+      legacy.version != 1U ||
+      legacy.size != sizeof(PersistedCaptureSettingsV1) ||
+      legacy.checksum != captureSettingsChecksum(legacy)) {
     return false;
   }
-  CaptureSettings runtime{};
-  runtime.sourceRateHz = cfg.sourceRateHz;
+  runtime.gyroOdrHz = legacy.sourceRateHz;
+  runtime.accelOdrHz = legacy.sourceRateHz;
+  runtime.exportDecimation = kDefaultExportDecimation;
   return setCaptureSettings(runtime, nullptr);
 }
 
 bool savePersistedCaptureSettings() {
   if (!g_ready) return false;
+  if (!findSourceRateConfig(g_captureGyroOdrHz) || !findSourceRateConfig(g_captureAccelOdrHz)) return false;
+  if (!isValidExportDecimation(g_captureGyroOdrHz, g_exportDecimation)) return false;
   PersistedCaptureSettings cfg{};
   initDefaultCaptureSettings(cfg);
-  cfg.sourceRateHz = g_sourceRateHz;
+  cfg.gyroOdrHz = g_captureGyroOdrHz;
+  cfg.accelOdrHz = g_captureAccelOdrHz;
+  cfg.exportDecimation = g_exportDecimation;
   cfg.checksum = captureSettingsChecksum(cfg);
   EEPROM.put(kCaptureSettingsAddr, cfg);
   return true;
+}
+
+void getDefaultCaptureSettings(CaptureSettings& cfg) {
+  getDefaultCaptureSettingsInternal(cfg);
 }
 
 bool getImuConfig(ImuConfig& cfg) {
@@ -1004,6 +1089,8 @@ bool setImuConfig(const ImuConfig& cfg) {
   g_sampleRate = (uint32_t)(g_imu.gyroscopeSampleRate() + 0.5f);
   if (g_sampleRate == 0U) g_sampleRate = 100U;
   const uint32_t accelRate = (uint32_t)(g_imu.accelerationSampleRate() + 0.5f);
+  g_captureGyroOdrHz = (uint16_t)((g_sampleRate > 65535U) ? 65535U : g_sampleRate);
+  g_captureAccelOdrHz = (uint16_t)((accelRate > 65535U) ? 65535U : accelRate);
   g_accelPeriodUs = (accelRate > 0U) ? (1000000UL / accelRate) : kDefaultAccelPeriodUs;
   applyRuntimeSourceRate((uint16_t)g_sampleRate);
   FusionOffsetInitialise(&g_offset, g_sampleRate);
@@ -1013,20 +1100,13 @@ bool setImuConfig(const ImuConfig& cfg) {
 
 bool setSourceRateHz(uint16_t requested_hz, uint16_t* applied_hz) {
   if (!g_ready) return false;
-  const SourceRateConfig& rate_cfg = chooseSourceRateConfig(requested_hz);
-  ImuConfig cfg{};
-  if (!getImuConfig(cfg)) return false;
-  cfg.accOdr = rate_cfg.accOdr;
-  cfg.gyrOdr = rate_cfg.gyrOdr;
-  cfg.accBwp = rate_cfg.accBwp;
-  cfg.accFilterPerf = rate_cfg.accFilterPerf;
-  cfg.gyrBwp = rate_cfg.gyrBwp;
-  cfg.gyrNoisePerf = rate_cfg.gyrNoisePerf;
-  cfg.gyrFilterPerf = rate_cfg.gyrFilterPerf;
-  if (!setImuConfig(cfg)) return false;
-  resetSourcePerfStatsInternal();
-  if (applied_hz) *applied_hz = g_sourceRateHz;
-  return true;
+  CaptureSettings cfg{};
+  if (!getCaptureSettings(cfg)) getDefaultCaptureSettingsInternal(cfg);
+  cfg.gyroOdrHz = chooseSourceRateConfig(requested_hz).hz;
+  cfg.accelOdrHz = cfg.gyroOdrHz;
+  const bool ok = setCaptureSettings(cfg, applied_hz);
+  if (ok) resetSourcePerfStatsInternal();
+  return ok;
 }
 
 bool isSupportedSourceRateHz(uint16_t hz) {
@@ -1056,6 +1136,31 @@ uint32_t sourceReadCount() {
 
 uint32_t sourceUpdateCount() {
   return g_sourceUpdateCount;
+}
+
+uint16_t configuredGyroOdrHz() {
+  return g_captureGyroOdrHz;
+}
+
+uint16_t configuredAccelOdrHz() {
+  return g_captureAccelOdrHz;
+}
+
+uint16_t exportDecimation() {
+  return g_exportDecimation;
+}
+
+uint16_t stateExportRateHz() {
+  return computeStateExportRateHz();
+}
+
+uint32_t stateExportPeriodUs() {
+  const uint16_t export_rate_hz = computeStateExportRateHz();
+  return (export_rate_hz > 0U) ? (1000000UL / (uint32_t)export_rate_hz) : (1000000UL / (uint32_t)kFixedSpiTransactionRateHz);
+}
+
+uint16_t recordsPerSpiTransaction() {
+  return computeRecordsPerSpiTransaction();
 }
 
 void getSourcePerfSnapshot(SourcePerfSnapshot& out) {

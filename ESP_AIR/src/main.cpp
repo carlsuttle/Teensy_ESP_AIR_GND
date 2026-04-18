@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <ctype.h>
 #include <esp_wifi.h>
+#include <math.h>
 #include <sys/time.h>
 #include <time.h>
 #include <string.h>
@@ -24,13 +25,15 @@
 
 namespace {
 
+#ifndef AIR_SYNTHETIC_LIVE_SOURCE_DEFAULT
+#define AIR_SYNTHETIC_LIVE_SOURCE_DEFAULT 1
+#endif
+
 uint32_t g_last_stat_ms = 0;
 char g_console_line[256];
 uint8_t g_console_idx = 0;
 bool g_stats_streaming = false;
-bool g_wait_getfusion_ack = false;
 bool g_wait_stream_rate_ack = false;
-uint32_t g_last_printed_ack_seq = 0;
 uint32_t g_last_stream_rate_tx_ms = 0;
 uint16_t g_last_stream_rate_ui_hz = 0;
 uint16_t g_last_stream_rate_log_hz = 0;
@@ -132,6 +135,16 @@ uint32_t g_last_source_seq_seen = 0U;
 uint32_t g_last_source_progress_ms = 0U;
 uint32_t g_last_radio_progress_ms = 0U;
 uint32_t g_last_radio_recovery_ms = 0U;
+uint32_t g_last_tx_skip_diag_ms = 0U;
+bool g_synthetic_live_mode = AIR_SYNTHETIC_LIVE_SOURCE_DEFAULT != 0;
+uint32_t g_synthetic_live_seq = 0U;
+uint32_t g_synthetic_live_base_seq = 0U;
+uint32_t g_synthetic_live_last_publish_ms = 0U;
+constexpr uint32_t kSyntheticLivePublishMs = 33U;
+constexpr int32_t kSyntheticBaseLat1e7 = 372282000;
+constexpr int32_t kSyntheticBaseLon1e7 = -1218882700;
+constexpr int32_t kSyntheticLatStep1e7 = 23;
+constexpr int32_t kSyntheticLonStep1e7 = 29;
 constexpr bool kEnableAirFileLogging = true;
 constexpr size_t kStateTxReserveSlots = 4U;
 constexpr uint32_t kRadioProgressTimeoutMs = 6000U;
@@ -194,7 +207,11 @@ uint32_t nextConsoleControlRequestId();
 control_plane::Result submitConsoleRequest(control_plane::Request request);
 bool getActiveFusionSettings(telem::CmdSetFusionSettingsV1& cmd);
 bool applyReplayRunControls(uint8_t average_factor, uint16_t* applied_capture_hz = nullptr);
-
+void setSyntheticLiveMode(bool enabled);
+void printSyntheticLiveStatus();
+bool serviceSyntheticLiveSource();
+float triangleWaveDegrees(uint32_t now_ms, uint32_t period_ms, float amplitude, uint32_t phase_ms = 0U);
+int32_t triangleWaveE7(uint32_t now_ms, uint32_t period_ms, int32_t amplitude_e7, uint32_t phase_ms = 0U);
 bool serialNoiseEnabled() {
   return !g_quiet_serial;
 }
@@ -205,6 +222,101 @@ String shortLogName(const String& path) {
 
 String nextSdRwSoakName() {
   return String("/logs/rwsoak_") + String(millis()) + ".bin";
+}
+
+float triangleWaveDegrees(uint32_t now_ms, uint32_t period_ms, float amplitude, uint32_t phase_ms) {
+  if (period_ms == 0U) return 0.0f;
+  const uint32_t phase = (now_ms + phase_ms) % period_ms;
+  const float norm = (float)phase / (float)period_ms;
+  const float tri = norm < 0.5f ? (-1.0f + 4.0f * norm) : (3.0f - 4.0f * norm);
+  return tri * amplitude;
+}
+
+int32_t triangleWaveE7(uint32_t now_ms, uint32_t period_ms, int32_t amplitude_e7, uint32_t phase_ms) {
+  return (int32_t)lroundf(triangleWaveDegrees(now_ms, period_ms, (float)amplitude_e7, phase_ms));
+}
+
+void setSyntheticLiveMode(bool enabled) {
+  g_synthetic_live_mode = enabled;
+  g_synthetic_live_last_publish_ms = 0U;
+  if (enabled) {
+    const auto snap = teensy_link::snapshot();
+    g_synthetic_live_seq = snap.seq;
+    g_synthetic_live_base_seq = snap.seq;
+  }
+}
+
+void printSyntheticLiveStatus() {
+  Serial.printf("SYNTHLIVE enabled=%u seq=%lu period_ms=%lu base_lat=%ld base_lon=%ld\r\n",
+                g_synthetic_live_mode ? 1U : 0U,
+                (unsigned long)g_synthetic_live_seq,
+                (unsigned long)kSyntheticLivePublishMs,
+                (long)kSyntheticBaseLat1e7,
+                (long)kSyntheticBaseLon1e7);
+}
+
+bool serviceSyntheticLiveSource() {
+  const uint32_t now_ms = millis();
+  if (g_synthetic_live_last_publish_ms != 0U &&
+      (uint32_t)(now_ms - g_synthetic_live_last_publish_ms) < kSyntheticLivePublishMs) {
+    return false;
+  }
+  g_synthetic_live_last_publish_ms = now_ms;
+
+  telem::TelemetryStateRecord state = {};
+  const uint32_t seq = ++g_synthetic_live_seq;
+  const uint32_t synth_step = seq - g_synthetic_live_base_seq;
+  const float roll_deg = triangleWaveDegrees(now_ms, 4000U, 45.0f);
+  const float pitch_deg = triangleWaveDegrees(now_ms, 7000U, 10.0f, 1200U);
+  const float yaw_deg = (float)((now_ms % 12000U) * (360.0 / 12000.0));
+  const float altitude_m = 120.0f + triangleWaveDegrees(now_ms, 9000U, 25.0f, 800U);
+  const float vsi_mps = triangleWaveDegrees(now_ms, 3000U, 4.0f, 300U);
+
+  state.roll_deg = roll_deg;
+  state.pitch_deg = pitch_deg;
+  state.yaw_deg = yaw_deg;
+  state.mag_heading_deg = yaw_deg;
+  state.iTOW_ms = now_ms;
+  state.fixType = 3U;
+  state.numSV = 12U;
+  state.lat_1e7 = kSyntheticBaseLat1e7 + (int32_t)(synth_step * (uint32_t)kSyntheticLatStep1e7);
+  state.lon_1e7 = kSyntheticBaseLon1e7 - (int32_t)(synth_step * (uint32_t)kSyntheticLonStep1e7);
+  state.hMSL_mm = (int32_t)lroundf(altitude_m * 1000.0f);
+  state.gSpeed_mms = 18000;
+  state.headMot_1e5deg = (int32_t)lroundf(yaw_deg * 100000.0f);
+  state.hAcc_mm = 1200U;
+  state.sAcc_mms = 600U;
+  state.last_gps_ms = now_ms;
+  state.last_imu_ms = now_ms;
+  state.last_baro_ms = now_ms;
+  state.baro_alt_m = altitude_m;
+  state.baro_vsi_mps = vsi_mps;
+  state.fusion_gain = 0.50f;
+  state.fusion_accel_rej = 10.0f;
+  state.fusion_mag_rej = 10.0f;
+  state.fusion_recovery_period = 400U;
+  state.flags = telem::kStateFlagGpsFix3d;
+  state.raw_present_mask = (uint16_t)(telem::kSensorPresentImu | telem::kSensorPresentGps | telem::kSensorPresentBaro);
+#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
+  state.gps_year = 2026U;
+  state.gps_month = 4U;
+  state.gps_day = 18U;
+  state.gps_hour = 12U;
+  state.gps_min = (uint8_t)((now_ms / 60000U) % 60U);
+  state.gps_sec = (uint8_t)((now_ms / 1000U) % 60U);
+#endif
+
+  const uint32_t t_us = micros();
+  if (serialNoiseEnabled()) {
+    Serial.printf("AIRSYN state_seq=%lu roll=%.2f pitch=%.2f yaw=%.2f lat=%ld lon=%ld\r\n",
+                  (unsigned long)seq,
+                  (double)roll_deg,
+                  (double)pitch_deg,
+                  (double)yaw_deg,
+                  (long)state.lat_1e7,
+                  (long)state.lon_1e7);
+  }
+  return radio_link::publishSyntheticState(state, seq, t_us);
 }
 
 bool readExactFile(sd_api::File& file, uint8_t* dst, size_t wanted) {
@@ -285,9 +397,18 @@ void ensureConfiguredStreamRate() {
   const AppConfig& cfg = config_store::get();
   const uint16_t target_stream_hz = cfg.source_rate_hz;
   const uint16_t target_log_hz = cfg.log_rate_hz;
+  const uint32_t now = millis();
+  const bool captureChanged = target_stream_hz != g_last_capture_rate_hz;
+  if (captureChanged && (g_last_capture_rate_tx_ms == 0U || (uint32_t)(now - g_last_capture_rate_tx_ms) >= 1000U)) {
+    telem::CmdSetCaptureSettingsV1 capture = {};
+    capture.source_rate_hz = target_stream_hz;
+    if (teensy_link::sendSetCaptureSettings(capture)) {
+      g_last_capture_rate_hz = capture.source_rate_hz;
+      g_last_capture_rate_tx_ms = now;
+    }
+  }
   const bool targetChanged =
       (target_stream_hz != g_last_stream_rate_ui_hz) || (target_log_hz != g_last_stream_rate_log_hz);
-  const uint32_t now = millis();
   if (!targetChanged && !g_wait_stream_rate_ack) return;
   if (!targetChanged && (uint32_t)(now - g_last_stream_rate_tx_ms) < 1000U) return;
 
@@ -425,86 +546,52 @@ bool applyReplayRunControls(uint8_t average_factor, uint16_t* applied_capture_hz
 
 void printConsoleHelp() {
   Serial.println("AIR COMMANDS:");
-  Serial.println("  help / h      - show command list");
-  Serial.println("  getfusion     - send CMD_GET_FUSION_SETTINGS to Teensy");
-  Serial.println("  kickteensy    - resend current stream-rate command to Teensy");
-  Serial.println("  resendrate    - same as kickteensy");
-  Serial.println("  sdprobe       - probe SD API/backend and print current state");
-  Serial.println("  sdmount       - mount the SD card backend");
-  Serial.println("  sdeject       - eject the SD card backend when idle");
-  Serial.println("  sdstate       - print SD mount and backend state");
-  Serial.println("  timestat      - print GPS-derived UTC wall-clock state");
-  Serial.println("  timeselftest  - run embedded time-state validation cases");
-  Serial.println("  sdwrite       - write one small managed test log through the SD API");
-  Serial.println("  sdrename a b  - rename one managed file through the SD API");
-  Serial.println("  sddelete <f>  - delete one managed file through the SD API");
-  Serial.println("  base1m        - run 60-second radio/Teensy-link baseline with no SD capture");
-  Serial.println("  basestop      - stop active baseline run");
-  Serial.println("  basestat      - print baseline status");
-  Serial.println("  logstart      - start real AIR SD logging session");
-  Serial.println("  logstartid <n> - start real AIR SD logging with an explicit session id");
-  Serial.println("  logstop       - stop real AIR SD logging session");
-  Serial.println("  logstat       - print real AIR SD logging status");
-  Serial.println("  latestlog     - print latest .tlog on SD");
-  Serial.println("  largestlog    - print largest .tlog on SD");
-  Serial.println("  latestlogsession <n> - print latest .tlog for a given session id");
-  Serial.println("  logfiles [name|size|date] [asc|desc] - print sorted managed file list");
-  Serial.println("  logprefix [prefix] - show or set the auto-record file prefix");
-  Serial.println("  csvfile <name.tlog> - convert a single binary log to CSV");
-  Serial.println("  verifylog     - copy latest .tlog to *_copy.tlog and verify byte-exact match");
-  Serial.println("  expandlogs    - expand every .tlog on SD into a sibling .csv file");
-  Serial.println("  comparelogs a b - compare two .tlog files, ignoring fusion outputs");
-  Serial.println("  comparetimed a b [skip] - compare two .tlog files by nearest timestamp");
-  Serial.println("  logkinds <name> - count state/control/input record kinds in a .tlog");
-  Serial.println("  logfusion <name> - print fusion settings seen in a replay/log file");
-  Serial.println("  logflags <name> - print fusion flag/error counts seen in a replay/log file");
-  Serial.println("  sdrwsoak <seconds> [file] - mixed sequential SD read/write soak with both files held open");
-  Serial.println("  sdrwsoakstat - print current mixed read/write soak state");
-  Serial.println("  sdrwsoakstop - stop active mixed read/write soak");
-  Serial.println("  sdrwlogsoak <seconds> [file] - mixed SD read with production log_store write path");
-  Serial.println("  sdrwlogsoakstat - print current mixed SD read/log write soak state");
-  Serial.println("  sdrwlogsoakstop - stop active mixed SD read/log write soak");
-  Serial.println("  carrysig [count] - send synthetic replay records and verify exact carry-through on AIR");
-  Serial.println("  carrysigcsv [ms] [window] - burst synthetic replay records and print CSV rows by returned seq");
-  Serial.println("  tapi ...      - stable Teensy API proof surface (help/status/getfusion/setcap/setstream/setfusion/carry/carrycsv/replaybench/selftest)");
-  Serial.println("  replaycapture - replay latest .tlog into Teensy while logging returned state");
-  Serial.println("  replaycapfile <name> - replay a specific .tlog into Teensy while logging returned state");
-  Serial.println("  replayfile <name> - replay a specific .tlog into Teensy without rerecording");
-  Serial.println("  replaylargest - replay the largest .tlog into Teensy without rerecording");
-  Serial.println("  replaycapstat - print replay-capture progress");
-  Serial.println("  replayavg <n> - select one replay sample out of each N-source-record window");
-  Serial.println("  replayavgstat - print current replay averaging factor");
-  Serial.println("  replaycmp <n> - replay latest .tlog twice, with N then N+1 averaging");
-  Serial.println("  replaycmpfile <n> <name> - same compare run for a specific .tlog");
-  Serial.println("  setcap <hz>   - set Teensy live capture/source rate over SPI/DMA");
-  Serial.println("  savecap       - save current Teensy capture settings to EEPROM");
-  Serial.println("  bench on/off/status - control standalone SPI/DMA bench mode");
-  Serial.println("  benchauto [ms] - log all supported capture rates automatically");
-  Serial.println("  setpin <gpio> - drive a GPIO high for 5 seconds, then return it low");
-  Serial.println("  tx1           - send current state once to GND");
-  Serial.println("  linkclear     - clear AIR radio-link state and stop ESP-NOW");
-  Serial.println("  linkopen      - reopen AIR radio-link only");
-  Serial.println("  wifidrop      - clear discovered peer state");
-  Serial.println("  wifioffon     - power-cycle Wi-Fi only");
-  Serial.println("  relink        - restart AIR radio-link");
-  Serial.println("  resetnet      - restart AIR Wi-Fi/ESP-NOW side");
-  Serial.println("  setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
-  Serial.println("  airstate      - print latest Teensy state seen by AIR");
-  Serial.println("  quiet on/off/status - stop or resume unsolicited serial chatter");
-  Serial.println("  stats         - start 1Hz STAT stream");
-  Serial.println("  x             - stop active stream/mode");
+  Serial.println("  help / h        - show command list");
+  Serial.println("  runtime config/control:");
+  Serial.println("    getfusion     - request current Teensy fusion settings");
+  Serial.println("    setcap <hz>   - set Teensy live capture/source rate over SPI/DMA");
+  Serial.println("    savecap       - save current Teensy capture settings to EEPROM");
+  Serial.println("    setfusion g a m r - send CMD_SET_FUSION_SETTINGS");
+  Serial.println("    tapi ...      - stable Teensy API proof surface");
+  Serial.println("  SD/logging/replay:");
+  Serial.println("    sdprobe | sdmount | sdeject | sdstate | sdwrite | sdrename a b | sddelete <f>");
+  Serial.println("    timestat | timeselftest | base1m | basestop | basestat | logstart | logstartid <n> | logstop | logstat");
+  Serial.println("    latestlog | largestlog | latestlogsession <n> | logfiles [name|size|date] [asc|desc] | logprefix [prefix]");
+  Serial.println("    csvfile <name.tlog> | verifylog | expandlogs | comparelogs a b | comparetimed a b [skip]");
+  Serial.println("    logkinds <name> | logfusion <name> | logflags <name>");
+  Serial.println("    replaycapture | replaycapfile <name> | replayfile <name> | replaylargest | replaycapstat");
+  Serial.println("    replayavg <n> | replayavgstat | replaycmp <n> | replaycmpfile <n> <name>");
+  Serial.println("    sdrwsoak <seconds> [file] | sdrwsoakstat | sdrwsoakstop");
+  Serial.println("    sdrwlogsoak <seconds> [file] | sdrwlogsoakstat | sdrwlogsoakstop");
+  Serial.println("  subsystem tests:");
+  Serial.println("    carrysig [count] | carrysigcsv [ms] [window]");
+  Serial.println("    bench on/off/status | benchauto [ms] | setpin <gpio>");
+  Serial.println("    synthlive on/off/status - diagnostic AIR-generated canonical live telemetry");
+  Serial.println("    relink | resetnet");
+  Serial.println("  observability:");
+  Serial.println("    airstate      - print latest Teensy state seen by AIR");
+  Serial.println("    quiet on/off/status - stop or resume unsolicited serial chatter");
+  Serial.println("    stats         - start 1Hz STAT stream");
+  Serial.println("    x             - stop active stream/mode");
 }
 
 void printStats(const teensy_link::Snapshot& snap) {
   const auto link = radio_link::stats();
+  const auto recorder = log_store::recorderStatus();
   const auto cap = sd_capture_test::stats();
   const auto spi = spi_bridge::stats();
+  const bool link_radio_ready = radio_link::radioReady();
+  const bool link_peer = radio_link::hasPeer();
+  const bool rec_busy = log_store::busy();
+  const bool storage_fault = recorder.feature_enabled && (!recorder.backend_ready || !recorder.media_present);
   Serial.printf(
       "STAT unit=AIR seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
       "rx_bytes=%lu ok=%lu crc=%lu cobs=%lu len=%lu unk=%lu drop=%lu poll_ms=%lu poll_gap_max=%lu poll_runs=%lu state_drain=%lu raw_drain=%lu "
-      "link_tx=%lu link_rx=%lu link_drop=%lu link_state_tx=%lu link_unified_tx=%lu src_seen=%lu src_seen_seq=%lu src_seen_t_us=%lu src_seen_rx_ms=%lu "
+      "link_tx=%lu link_rx=%lu link_drop=%lu link_state_tx=%lu src_seen=%lu src_seen_seq=%lu src_seen_t_us=%lu src_seen_rx_ms=%lu "
       "pub_try=%lu pub_ok=%lu pub_skip_ns=%lu pub_skip_np=%lu pub_skip_rate=%lu pub_skip_old=%lu link_last_seq=%lu link_last_t_us=%lu link_last_tx_ms=%lu pub_try_ms=%lu pub_age_ms=%lu "
-      "spi_txn=%lu spi_fail=%lu spi_state=%lu spi_last_ms=%lu spi_replay=%lu spi_crc=%lu spi_type=%lu spi_rxof=%lu spi_txof=%lu spi_hdr=%08lX/%u/%u/%u sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
+      "nonlive_drop=%lu "
+      "link_radio_ready=%u link_peer=%u rec_enabled=%u rec_active=%u rec_busy=%u sd_ready=%u sd_media=%u storage_fault=%u "
+      "spi_txn=%lu spi_fail=%lu spi_wait_us=%lu spi_period_us=%lu spi_state=%lu spi_last_ms=%lu spi_replay=%lu spi_crc=%lu spi_type=%lu spi_rxof=%lu spi_txof=%lu spi_hdr=%08lX/%u/%u/%u sdcap=%u sdcap_drop=%lu sdcap_qmax=%lu\n",
       (unsigned long)snap.seq,
       (unsigned long)snap.t_us,
       snap.has_state ? 1U : 0U,
@@ -528,7 +615,6 @@ void printStats(const teensy_link::Snapshot& snap) {
       (unsigned long)link.rx_packets,
       (unsigned long)link.tx_drop,
       (unsigned long)link.tx_state_packets,
-      (unsigned long)link.tx_unified_packets,
       (unsigned long)link.source_snapshots_seen,
       (unsigned long)link.latest_source_seq_seen,
       (unsigned long)link.latest_source_t_us_seen,
@@ -544,8 +630,19 @@ void printStats(const teensy_link::Snapshot& snap) {
       (unsigned long)link.last_tx_ms,
       (unsigned long)link.last_publish_attempt_ms,
       (unsigned long)link.last_publish_age_ms,
+      (unsigned long)link.tx_nonlive_drop,
+      link_radio_ready ? 1U : 0U,
+      link_peer ? 1U : 0U,
+      recorder.feature_enabled ? 1U : 0U,
+      recorder.active ? 1U : 0U,
+      rec_busy ? 1U : 0U,
+      recorder.backend_ready ? 1U : 0U,
+      recorder.media_present ? 1U : 0U,
+      storage_fault ? 1U : 0U,
       (unsigned long)spi.transactions_completed,
       (unsigned long)spi.transaction_failures,
+      (unsigned long)spi.ready_wait_avg_us,
+      (unsigned long)spi.transaction_period_avg_us,
       (unsigned long)spi.state_records_received,
       (unsigned long)spi.last_state_rx_ms,
       (unsigned long)spi.replay_records_sent,
@@ -2437,67 +2534,18 @@ void handleConsoleCommands() {
         }
       } else if (strcmp(g_console_line, "benchauto") == 0) {
         (void)beginBenchSweep(15000U);
-      } else if (strcmp(g_console_line, "kickteensy") == 0 || strcmp(g_console_line, "kickstream") == 0 ||
-                 strcmp(g_console_line, "resendrate") == 0) {
-        const AppConfig& cfg = config_store::get();
-        const bool ok = sendConfiguredStreamRateNow();
-        Serial.printf("KICKTEENSY tx_ok=%u ws_hz=%u log_hz=%u\n",
-                      ok ? 1U : 0U,
-                      (unsigned)cfg.source_rate_hz,
-                      (unsigned)cfg.log_rate_hz);
-      } else if (strcmp(g_console_line, "tx1") == 0 || strcmp(g_console_line, "sendstate") == 0) {
-        if (isStandaloneBench()) {
-          Serial.println("TX1 tx_ok=0 reason=bench_mode");
-          continue;
-        }
-        const auto snap = teensy_link::snapshot();
-        if (!snap.has_state) {
-          Serial.println("TX1 tx_ok=0 reason=no_state");
-        } else {
-          const bool ok = radio_link::publishStressState(snap.state, snap.seq, snap.t_us);
-          Serial.printf("TX1 tx_ok=%u seq=%lu t_us=%lu\n",
-                        ok ? 1U : 0U,
-                        (unsigned long)snap.seq,
-                        (unsigned long)snap.t_us);
-        }
+      } else if (strcmp(g_console_line, "synthlive on") == 0) {
+        setSyntheticLiveMode(true);
+        Serial.println("SYNTHLIVE enabled=1");
+      } else if (strcmp(g_console_line, "synthlive off") == 0) {
+        setSyntheticLiveMode(false);
+        Serial.println("SYNTHLIVE enabled=0");
+      } else if (strcmp(g_console_line, "synthlive status") == 0 ||
+                 strcmp(g_console_line, "synthlive") == 0) {
+        printSyntheticLiveStatus();
       } else if (strcmp(g_console_line, "airstate") == 0) {
         const auto snap = teensy_link::snapshot();
         printLatestStateSummary(snap);
-      } else if (strcmp(g_console_line, "linkclear") == 0) {
-        if (isStandaloneBench()) {
-          Serial.println("LINKCLEAR skipped reason=bench_mode");
-          continue;
-        }
-        radio_link::resetNetworkState();
-        resetWifiStatusFlags();
-        Serial.println("LINKCLEAR done state=cleared link=stopped");
-      } else if (strcmp(g_console_line, "linkopen") == 0) {
-        if (isStandaloneBench()) {
-          Serial.println("LINKOPEN skipped reason=bench_mode");
-          continue;
-        }
-        const AppConfig& cfg = config_store::get();
-        radio_link::reconfigure(cfg);
-        Serial.printf("LINKOPEN peer=%s channel=%u\n",
-                      radio_link::peerMac().c_str(),
-                      (unsigned)telem::kRadioChannel);
-      } else if (strcmp(g_console_line, "wifidrop") == 0) {
-        if (isStandaloneBench()) {
-          Serial.println("WIFIDROP skipped reason=bench_mode");
-          continue;
-        }
-        const AppConfig& cfg = config_store::get();
-        radio_link::resetNetworkState();
-        resetWifiStatusFlags();
-        radio_link::reconfigure(cfg);
-        Serial.println("WIFIDROP peer_state_cleared");
-      } else if (strcmp(g_console_line, "wifioffon") == 0) {
-        if (isStandaloneBench()) {
-          Serial.println("WIFIOFFON skipped reason=bench_mode");
-          continue;
-        }
-        restartWifiStation();
-        Serial.println("WIFIOFFON radio_power_cycle");
       } else if (strcmp(g_console_line, "relink") == 0) {
         if (isStandaloneBench()) {
           Serial.println("RELINK skipped reason=bench_mode");
@@ -2742,7 +2790,13 @@ void setup() {
   if (serialNoiseEnabled()) Serial.println("ESP_AIR boot");
 
   config_store::begin();
-  const AppConfig& cfg = config_store::get();
+  AppConfig cfg = config_store::get();
+  if (cfg.standalone_bench == 0U && (cfg.source_rate_hz != 400U || cfg.log_rate_hz != 400U)) {
+    cfg.source_rate_hz = 400U;
+    cfg.log_rate_hz = 400U;
+    config_store::update(cfg);
+    cfg = config_store::get();
+  }
   if (serialNoiseEnabled()) {
     Serial.printf("TEENSY LINK cfg(legacy_uart_fields) port=%u rx=%u tx=%u baud=%lu\n",
                   (unsigned)cfg.uart_port,
@@ -2823,35 +2877,24 @@ void loop() {
   updateTeensyReadiness(snap);
   time_service::ingestState(snap.state, snap.has_state, millis());
 
-  if (g_wait_getfusion_ack && snap.has_ack && snap.ack_command == 101U &&
-      snap.ack_rx_seq != g_last_printed_ack_seq) {
-    g_last_printed_ack_seq = snap.ack_rx_seq;
-    g_wait_getfusion_ack = false;
-    if (snap.has_state) {
-      Serial.printf("GETFUSION ACK ok=%u code=%lu gain=%.3f accRej=%.2f magRej=%.2f rec=%u\n",
-                    snap.ack_ok ? 1U : 0U,
-                    (unsigned long)snap.ack_code,
-                    (double)snap.state.fusion_gain,
-                    (double)snap.state.fusion_accel_rej,
-                    (double)snap.state.fusion_mag_rej,
-                    (unsigned)snap.state.fusion_recovery_period);
-    } else {
-      Serial.printf("GETFUSION ACK ok=%u code=%lu (no state yet)\n",
-                    snap.ack_ok ? 1U : 0U,
-                    (unsigned long)snap.ack_code);
-    }
-  }
-
-  if (snap.has_ack && snap.ack_command == 102U && snap.ack_rx_seq != g_last_printed_ack_seq) {
-    g_last_printed_ack_seq = snap.ack_rx_seq;
+  if (snap.has_ack && snap.ack_command == 102U) {
     g_wait_stream_rate_ack = !snap.ack_ok;
   }
 
   if (isStandaloneBench()) {
+    if (serialNoiseEnabled() &&
+        (g_last_tx_skip_diag_ms == 0U || (uint32_t)(millis() - g_last_tx_skip_diag_ms) >= 1000U)) {
+      Serial.println("TXSKIP standalone_bench cfg.standalone_bench=1");
+      g_last_tx_skip_diag_ms = millis();
+    }
     ensureConfiguredCaptureRate();
   } else {
     ensureConfiguredStreamRate();
-    radio_link::publish(snap);
+    if (g_synthetic_live_mode) {
+      (void)serviceSyntheticLiveSource();
+    } else {
+      radio_link::publish(snap);
+    }
   }
   maybeRecoverRadioLink(snap);
 

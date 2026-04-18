@@ -658,14 +658,19 @@ function disconnectSocket(manual) {
   setControlsEnabled(false);
 }
 
+function wsEndpointUrl() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/ws`;
+}
+
 function connect(forced) {
   disconnectSocket(false);
   manualDisconnect = false;
   reconnectGeneration += 1;
   const generation = reconnectGeneration;
   setPill(socketBadgeEl, forced ? 'Socket reconnecting' : 'Socket connecting');
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const socket = new WebSocket(`${proto}//${location.host}/ws`);
+  const socketUrl = wsEndpointUrl();
+  const socket = new WebSocket(socketUrl);
   ws = socket;
 
   socket.onopen = () => {
@@ -726,6 +731,7 @@ function connect(forced) {
     if (ws !== socket || generation !== reconnectGeneration) return;
     setPill(socketBadgeEl, 'Socket error', 'bad');
     appendEvent('socket error');
+    console.error(`WebSocket connect failed: ${socketUrl}`);
   };
 }
 

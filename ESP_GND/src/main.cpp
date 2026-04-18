@@ -23,14 +23,13 @@ bool g_link_streaming = false;
 bool g_air_ready = false;
 bool g_air_wait_announced = false;
 uint16_t g_last_configured_source_rate_hz = 0U;
-uint8_t g_last_configured_radio_state_only = 0U;
 uint8_t g_last_configured_radio_lr_mode = 0U;
-uint32_t g_last_air_ack_seq = 0U;
 bool g_pending_stream_rate_apply = true;
 bool g_pending_radio_mode_apply = true;
 constexpr uint32_t kAirConfigRetryMs = 1000U;
 constexpr uint16_t kNormalDownlinkRateHz = 30U;
 constexpr uint16_t kNormalUiRateHz = 30U;
+constexpr bool kAutoConsoleLogsEnabled = false;
 
 IPAddress g_ap_ip = kApLocalIp;
 uint8_t g_ap_channel = telem::kRadioChannel;
@@ -56,7 +55,7 @@ void printNetworkSummary(const char* prefix) {
 bool configureSoftApAddress() {
   if (WiFi.softAPIP() == kApLocalIp) return true;
   if (WiFi.softAPConfig(kApLocalIp, kApGateway, kApSubnet)) return true;
-  Serial.println("NET softap_ip_config_failed");
+  if (kAutoConsoleLogsEnabled) Serial.println("NET softap_ip_config_failed");
   return false;
 }
 
@@ -64,19 +63,23 @@ bool startSoftAp(const AppConfig& cfg) {
   configureSoftApAddress();
   const bool ok = WiFi.softAP(cfg.ap_ssid, cfg.ap_pass, telem::kRadioChannel, 0, kApMaxConnections);
   if (!ok) {
-    Serial.printf("NET softap_start_failed ssid=%s channel=%u\n",
-                  cfg.ap_ssid,
-                  (unsigned)telem::kRadioChannel);
+    if (kAutoConsoleLogsEnabled) {
+      Serial.printf("NET softap_start_failed ssid=%s channel=%u\n",
+                    cfg.ap_ssid,
+                    (unsigned)telem::kRadioChannel);
+    }
     return false;
   }
   configureDhcpLeaseRange();
   g_ap_hidden = false;
   g_ap_ip = WiFi.softAPIP();
   g_ap_channel = (uint8_t)WiFi.channel();
-  Serial.printf("NET ap_started ssid=%s ip=%s channel=%u\n",
-                cfg.ap_ssid,
-                g_ap_ip.toString().c_str(),
-                (unsigned)g_ap_channel);
+  if (kAutoConsoleLogsEnabled) {
+    Serial.printf("NET ap_started ssid=%s ip=%s channel=%u\n",
+                  cfg.ap_ssid,
+                  g_ap_ip.toString().c_str(),
+                  (unsigned)g_ap_channel);
+  }
   return true;
 }
 
@@ -86,36 +89,41 @@ void configureNetwork(const AppConfig& cfg) {
   (void)esp_wifi_set_max_tx_power(78);
   WiFi.mode(WIFI_AP);
   if (!startSoftAp(cfg)) {
-    Serial.println("NET ap_start_failed");
+    if (kAutoConsoleLogsEnabled) Serial.println("NET ap_start_failed");
   }
-  Serial.printf("NET final mode=AP_RADIO ip=%s ssid=%s channel=%u ws=ws://%s/ws\n",
-                g_ap_ip.toString().c_str(),
-                cfg.ap_ssid,
-                (unsigned)g_ap_channel,
-                g_ap_ip.toString().c_str());
+  if (kAutoConsoleLogsEnabled) {
+    Serial.printf("NET final mode=AP_RADIO ip=%s ssid=%s channel=%u ws=ws://%s/ws\n",
+                  g_ap_ip.toString().c_str(),
+                  cfg.ap_ssid,
+                  (unsigned)g_ap_channel,
+                  g_ap_ip.toString().c_str());
+  }
 }
 
 void configureServices(const AppConfig& cfg) {
-  Serial.println("NET radio enabled");
+  if (kAutoConsoleLogsEnabled) Serial.println("NET radio enabled");
   radio_link::begin(cfg);
   g_last_configured_source_rate_hz = cfg.source_rate_hz;
-  g_last_configured_radio_state_only = cfg.radio_state_only;
   g_last_configured_radio_lr_mode = cfg.radio_lr_mode;
   scheduleAirConfigApply();
 }
 
 void printReadyBanner() {
-  Serial.printf("GND READY net=AP_RADIO ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
-                g_ap_ip.toString().c_str(),
-                (unsigned)g_ap_channel);
-  printNetworkSummary("GND NET");
-  Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
+  if (kAutoConsoleLogsEnabled) {
+    Serial.printf("GND READY net=AP_RADIO ip=%s channel=%u dhcp=192.168.4.50-192.168.4.100\n",
+                  g_ap_ip.toString().c_str(),
+                  (unsigned)g_ap_channel);
+    printNetworkSummary("GND NET");
+    Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
+  }
   g_air_wait_announced = true;
 }
 
 void startWebServices() {
   ws_server::begin();
-  Serial.printf("WEB server_started mode=AP ip=%s port=80\n", g_ap_ip.toString().c_str());
+  if (kAutoConsoleLogsEnabled) {
+    Serial.printf("WEB server_started mode=AP ip=%s port=80\n", g_ap_ip.toString().c_str());
+  }
 }
 
 void printNetworkStatus() {
@@ -141,25 +149,27 @@ void logApState() {
   const uint8_t station_count = WiFi.softAPgetStationNum();
   if (station_count == g_last_station_count) return;
   g_last_station_count = station_count;
-  Serial.printf("AP ssid=%s ip=%s clients=%u\n",
-                config_store::get().ap_ssid,
-                WiFi.softAPIP().toString().c_str(),
-                (unsigned)station_count);
+  if (kAutoConsoleLogsEnabled) {
+    Serial.printf("AP ssid=%s ip=%s clients=%u\n",
+                  config_store::get().ap_ssid,
+                  WiFi.softAPIP().toString().c_str(),
+                  (unsigned)station_count);
+  }
 }
 
 void printConsoleHelp() {
   Serial.println("GND COMMANDS:");
-  Serial.println("  help / h  - show command list");
-  Serial.println("  kickair   - resend current stream-rate command to AIR");
-  Serial.println("  resetair  - send AIR network reset command");
+  Serial.println("  help / h    - show command list");
+  Serial.println("  resetair    - send AIR network reset command");
   Serial.println("  replaystart - send replay-start command to AIR");
   Serial.println("  replaystop  - send replay-stop command to AIR");
   Serial.println("  replaystat  - request and print AIR replay status");
-  Serial.println("  relink    - restart GND radio link state");
-  Serial.println("  netstat   - print startup network mode and IP");
-  Serial.println("  seelink   - start 1Hz AIR link metadata stream");
-  Serial.println("  stats     - start 1Hz status stream");
-  Serial.println("  x         - stop status stream");
+  Serial.println("  relink      - restart GND radio link state");
+  Serial.println("  netstat     - print startup network mode and IP");
+  Serial.println("  synthlive on/off/status - diagnostic websocket-side synthetic telemetry");
+  Serial.println("  seelink     - start 1Hz AIR link metadata stream");
+  Serial.println("  stats       - start 1Hz status stream");
+  Serial.println("  x           - stop status stream");
 }
 
 bool sendConfiguredStreamRateToAir() {
@@ -172,7 +182,7 @@ bool sendConfiguredStreamRateToAir() {
 
 bool sendConfiguredRadioModeToAir() {
   telem::CmdSetRadioModeV1 cmd = {};
-  cmd.state_only = config_store::get().radio_state_only ? 1U : 0U;
+  cmd.state_only = 0U;
   cmd.control_rate_hz = 2U;
   cmd.radio_lr_mode = config_store::get().radio_lr_mode ? 1U : 0U;
   cmd.telem_rate_hz = kNormalDownlinkRateHz;
@@ -184,10 +194,6 @@ void syncConfiguredAirTargets() {
   if (cfg.source_rate_hz != g_last_configured_source_rate_hz) {
     g_last_configured_source_rate_hz = cfg.source_rate_hz;
     scheduleAirStreamRateApply();
-  }
-  if (cfg.radio_state_only != g_last_configured_radio_state_only) {
-    g_last_configured_radio_state_only = cfg.radio_state_only;
-    scheduleAirRadioModeApply();
   }
   if (cfg.radio_lr_mode != g_last_configured_radio_lr_mode) {
     g_last_configured_radio_lr_mode = cfg.radio_lr_mode;
@@ -203,21 +209,6 @@ void handleConsoleCommands() {
       line.trim();
       if (line.equalsIgnoreCase("help") || line.equalsIgnoreCase("h")) {
         printConsoleHelp();
-      } else if (line.equalsIgnoreCase("kickair")) {
-        const AppConfig& cfg = config_store::get();
-        scheduleAirConfigApply();
-        const bool mode_ok = sendConfiguredRadioModeToAir();
-        const bool rate_ok = sendConfiguredStreamRateToAir();
-        Serial.printf("KICKAIR mode_ok=%u rate_ok=%u target=%s capture_hz=%u log_hz=%u downlink_hz=%u ui_hz=%u state_only=%u lr=%u\n",
-                      mode_ok ? 1U : 0U,
-                      rate_ok ? 1U : 0U,
-                      radio_link::targetSenderMac().c_str(),
-                      (unsigned)cfg.source_rate_hz,
-                      (unsigned)cfg.log_rate_hz,
-                      (unsigned)kNormalDownlinkRateHz,
-                      (unsigned)kNormalUiRateHz,
-                      (unsigned)cfg.radio_state_only,
-                      (unsigned)cfg.radio_lr_mode);
       } else if (line.equalsIgnoreCase("resetair")) {
         const bool ok = radio_link::sendResetNetwork();
         Serial.printf("RESETAIR tx_ok=%u target=%s\n",
@@ -255,6 +246,14 @@ void handleConsoleCommands() {
         radio_link::restart(cfg);
         scheduleAirConfigApply();
         Serial.printf("RELINK target=%s\n", radio_link::targetSenderMac().c_str());
+      } else if (line.equalsIgnoreCase("synthlive on")) {
+        ws_server::setSyntheticLiveMode(true);
+        Serial.println("SYNTHLIVE enabled=1");
+      } else if (line.equalsIgnoreCase("synthlive off")) {
+        ws_server::setSyntheticLiveMode(false);
+        Serial.println("SYNTHLIVE enabled=0");
+      } else if (line.equalsIgnoreCase("synthlive status") || line.equalsIgnoreCase("synthlive")) {
+        ws_server::printSyntheticLiveStatus(Serial);
       } else if (line.equalsIgnoreCase("netstat")) {
         printNetworkStatus();
       } else if (line.equalsIgnoreCase("stats")) {
@@ -281,7 +280,7 @@ void handleConsoleCommands() {
 void configureDhcpLeaseRange() {
   esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
   if (!ap_netif) {
-    Serial.println("AP netif handle missing");
+    if (kAutoConsoleLogsEnabled) Serial.println("AP netif handle missing");
     return;
   }
 
@@ -291,7 +290,7 @@ void configureDhcpLeaseRange() {
   IP4_ADDR(&lease.end_ip, 192, 168, 4, 100);
 
   if (esp_netif_dhcps_stop(ap_netif) != ESP_OK) {
-    Serial.println("DHCP server stop failed");
+    if (kAutoConsoleLogsEnabled) Serial.println("DHCP server stop failed");
     return;
   }
   if (esp_netif_dhcps_option(ap_netif,
@@ -299,45 +298,36 @@ void configureDhcpLeaseRange() {
                              ESP_NETIF_REQUESTED_IP_ADDRESS,
                              &lease,
                              sizeof(lease)) != ESP_OK) {
-    Serial.println("DHCP lease range set failed");
+    if (kAutoConsoleLogsEnabled) Serial.println("DHCP lease range set failed");
   }
   if (esp_netif_dhcps_start(ap_netif) != ESP_OK) {
-    Serial.println("DHCP server restart failed");
+    if (kAutoConsoleLogsEnabled) Serial.println("DHCP server restart failed");
     return;
   }
-  Serial.println("DHCP lease range 192.168.4.50-192.168.4.100");
+  if (kAutoConsoleLogsEnabled) Serial.println("DHCP lease range 192.168.4.50-192.168.4.100");
 }
 
 void updateAirReadiness() {
   const auto snap = radio_link::snapshot();
   const uint32_t now = millis();
   const bool fresh = snap.stats.last_rx_ms != 0U && (uint32_t)(now - snap.stats.last_rx_ms) <= 3000U;
-  if (snap.has_ack && snap.ack_rx_seq != g_last_air_ack_seq) {
-    g_last_air_ack_seq = snap.ack_rx_seq;
-    if (snap.ack_ok) {
-      if (snap.ack_command == telem::CMD_SET_STREAM_RATE) {
-        g_pending_stream_rate_apply = false;
-      } else if (snap.ack_command == telem::CMD_SET_RADIO_MODE) {
-        g_pending_radio_mode_apply = false;
-      }
-      if (!g_pending_radio_mode_apply && !g_pending_stream_rate_apply) {
-        g_last_air_config_tx_ms = 0U;
-      }
-    }
-  }
 
   if (fresh) {
     if (!g_air_ready) {
-      Serial.printf("GND READY air_link sender=%s seq=%lu t_us=%lu\n",
-                    radio_link::lastSenderMac().c_str(),
-                    (unsigned long)snap.seq,
-                    (unsigned long)snap.t_us);
+      if (kAutoConsoleLogsEnabled) {
+        Serial.printf("GND READY air_link sender=%s seq=%lu t_us=%lu\n",
+                      radio_link::lastSenderMac().c_str(),
+                      (unsigned long)snap.seq,
+                      (unsigned long)snap.t_us);
+      }
       g_air_ready = true;
       g_air_wait_announced = false;
     }
   } else {
     if (!g_air_wait_announced) {
-      Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
+      if (kAutoConsoleLogsEnabled) {
+        Serial.printf("GND WARN air_packets_stale target=%s\n", radio_link::targetSenderMac().c_str());
+      }
       g_air_wait_announced = true;
     }
     g_air_ready = false;
@@ -350,10 +340,14 @@ void updateAirReadiness() {
   bool sent = false;
   if (g_pending_radio_mode_apply) {
     sent = sendConfiguredRadioModeToAir();
+    if (sent) g_pending_radio_mode_apply = false;
   } else if (g_pending_stream_rate_apply) {
     sent = sendConfiguredStreamRateToAir();
+    if (sent) g_pending_stream_rate_apply = false;
   }
-  if (sent) g_last_air_config_tx_ms = now;
+  if (sent) {
+    g_last_air_config_tx_ms = (!g_pending_radio_mode_apply && !g_pending_stream_rate_apply) ? 0U : now;
+  }
 }
 
 void printStats() {
@@ -361,7 +355,7 @@ void printStats() {
   const auto ws = ws_server::stats();
   Serial.printf(
       "STAT unit=GND seq=%lu t_us=%lu has=%u ack=%u cmd=%u ack_ok=%u code=%lu "
-      "rx_bytes=%lu ok=%lu state_rx=%lu state_full=%lu state_uni=%lu state_gap=%lu state_rewind=%lu sink_seq=%lu sink_t_us=%lu sink_rx_ms=%lu "
+      "rx_bytes=%lu ok=%lu state_rx=%lu state_gap=%lu state_rewind=%lu sink_seq=%lu sink_t_us=%lu sink_rx_ms=%lu "
       "crc=%u cobs=%u len=%lu unk=%lu drop=%lu link_tx=%u link_rx=%lu link_drop=%u "
       "rtt=%lu ws_clients=%lu ws_seq=%lu ws_state_seq=%lu ws_src_t_us=%lu ws_rx_ms=%lu ui_tx_ms=%lu ui_lat=%lu\n",
       (unsigned long)snap.seq,
@@ -374,8 +368,6 @@ void printStats() {
       (unsigned long)snap.stats.rx_bytes,
       (unsigned long)snap.stats.frames_ok,
       (unsigned long)snap.stats.state_packets,
-      (unsigned long)snap.stats.full_state_packets,
-      (unsigned long)snap.stats.unified_state_packets,
       (unsigned long)snap.stats.state_seq_gap,
       (unsigned long)snap.stats.state_seq_rewind,
       (unsigned long)snap.stats.last_state_seq,
@@ -428,24 +420,30 @@ void printLinkMeta() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP_GND boot");
+  if (kAutoConsoleLogsEnabled) Serial.println("ESP_GND boot");
 
   config_store::begin();
 #if GND_FORCE_FACTORY_RESET_ON_BOOT
-  Serial.println("GND CONFIG forcing factory reset from compile-time defaults");
+  if (kAutoConsoleLogsEnabled) Serial.println("GND CONFIG forcing factory reset from compile-time defaults");
   config_store::factoryReset();
 #endif
-  const AppConfig& cfg = config_store::get();
+  AppConfig cfg = config_store::get();
+  if (cfg.source_rate_hz != 400U || cfg.log_rate_hz != 400U) {
+    cfg.source_rate_hz = 400U;
+    cfg.log_rate_hz = 400U;
+    config_store::update(cfg);
+    cfg = config_store::get();
+  }
   configureNetwork(cfg);
 
-  if (!LittleFS.begin(true)) {
+  if (!LittleFS.begin(true) && kAutoConsoleLogsEnabled) {
     Serial.println("LittleFS mount failed");
   }
 
   configureServices(cfg);
   printReadyBanner();
   startWebServices();
-  printConsoleHelp();
+  if (kAutoConsoleLogsEnabled) printConsoleHelp();
 }
 
 void loop() {

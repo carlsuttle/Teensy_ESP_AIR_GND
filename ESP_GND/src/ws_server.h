@@ -8,6 +8,9 @@ void begin();
 void loop();
 uint32_t clientCount();
 void resetCounters();
+void setSyntheticLiveMode(bool enabled);
+bool syntheticLiveMode();
+void printSyntheticLiveStatus(Stream& out);
 
 struct Stats {
   uint32_t clients = 0;

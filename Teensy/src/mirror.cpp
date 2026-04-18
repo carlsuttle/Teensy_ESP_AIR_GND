@@ -137,7 +137,9 @@ void handleReplayControl(const telem::ReplayControlRecord& replay) {
       telem::CmdSetCaptureSettingsV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
       imu_fusion::CaptureSettings cfg = {};
-      cfg.sourceRateHz = cmd.source_rate_hz;
+      cfg.gyroOdrHz = cmd.source_rate_hz;
+      cfg.accelOdrHz = cmd.source_rate_hz;
+      cfg.exportDecimation = 1U;
       (void)imu_fusion::setCaptureSettings(cfg, nullptr);
       return;
     }

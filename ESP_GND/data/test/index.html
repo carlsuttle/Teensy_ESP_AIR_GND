@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Telemetry Test</title>
+</head>
+<body>
+<pre id="out">connecting...</pre>
+<script>
+(function() {
+  const out = document.getElementById('out');
+  const ws = new WebSocket('ws://' + location.host + '/ws');
+
+  function pickValue(obj, keys, fallback) {
+    for (const key of keys) {
+      if (obj && obj[key] !== undefined && obj[key] !== null) return obj[key];
+    }
+    return fallback;
+  }
+
+  ws.onopen = () => {
+    out.textContent = 'connected';
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.type !== 'snapshot') return;
+
+      const s = msg.state || msg;
+      const wsSeq = pickValue(msg, ['ws_seq'], 'na');
+      const stateSeq = pickValue(s, ['state_seq', 'seq'], 'na');
+
+      const roll = pickValue(s, ['roll', 'roll_deg', 'air_roll_deg'], 'na');
+      const pitch = pickValue(s, ['pitch', 'pitch_deg', 'air_pitch_deg'], 'na');
+      const yaw = pickValue(s, ['yaw', 'yaw_deg', 'air_yaw_deg'], 'na');
+      const latRaw = pickValue(s, ['lat', 'lat_1e7'], 'na');
+      const lonRaw = pickValue(s, ['lon', 'lon_1e7'], 'na');
+      const lat = typeof latRaw === 'number' && Math.abs(latRaw) > 180 ? (latRaw / 1e7) : latRaw;
+      const lon = typeof lonRaw === 'number' && Math.abs(lonRaw) > 180 ? (lonRaw / 1e7) : lonRaw;
+
+      const line =
+        'RXTRACE ws_seq=' + wsSeq +
+        ' state_seq=' + stateSeq +
+        ' roll=' + roll +
+        ' pitch=' + pitch +
+        ' yaw=' + yaw +
+        ' lat=' + lat +
+        ' lon=' + lon;
+      out.textContent = line;
+      console.log(line);
+    } catch (e) {
+      out.textContent = 'parse error: ' + e;
+    }
+  };
+
+  ws.onclose = () => {
+    out.textContent = 'disconnected';
+  };
+
+  ws.onerror = () => {
+    out.textContent = 'error';
+  };
+})();
+</script>
+</body>
+</html>

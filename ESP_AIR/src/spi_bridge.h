@@ -7,6 +7,12 @@ namespace spi_bridge {
 struct Stats {
   uint32_t transactions_completed = 0U;
   uint32_t transaction_failures = 0U;
+  uint32_t transaction_period_last_us = 0U;
+  uint32_t transaction_period_avg_us = 0U;
+  uint32_t transaction_period_samples = 0U;
+  uint32_t ready_wait_last_us = 0U;
+  uint32_t ready_wait_avg_us = 0U;
+  uint32_t state_transactions_received = 0U;
   uint32_t state_records_received = 0U;
   uint32_t raw_records_received = 0U;
   uint32_t replay_records_sent = 0U;
@@ -15,6 +21,8 @@ struct Stats {
   uint32_t rx_overflows = 0U;
   uint32_t tx_overflows = 0U;
   uint32_t last_state_rx_ms = 0U;
+  uint16_t last_state_payload_len = 0U;
+  uint16_t last_state_record_count = 0U;
   uint32_t last_magic = 0U;
   uint16_t last_version = 0U;
   uint16_t last_type = 0U;

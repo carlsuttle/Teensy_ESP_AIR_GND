@@ -26,6 +26,7 @@ constexpr uint8_t kRemoteFileChunkWordCount =
     (uint8_t)((kRemoteFileChunkCapacity + 31U) / 32U);
 constexpr uint32_t kRemoteFilesRefreshTimeoutMs = 15000U;
 constexpr uint32_t kRemoteFilesRefreshDebounceMs = 750U;
+constexpr bool kAutoRadioLogsEnabled = false;
 
 struct RxFrame {
   uint8_t mac[6] = {};
@@ -42,11 +43,13 @@ volatile uint32_t g_send_ok_events = 0U;
 volatile uint32_t g_send_fail_events = 0U;
 
 Snapshot g_snapshot;
+telem::DesiredControlStateV1 g_desired_control = {};
 uint8_t g_air_mac[6] = {};
 uint8_t g_last_sender_mac[6] = {};
 bool g_has_air_mac = false;
 bool g_has_last_sender_mac = false;
 bool g_espnow_ready = false;
+bool g_network_ready_for_radio = false;
 bool g_radio_lr_mode = true;
 uint8_t g_consecutive_send_failures = 0U;
 uint32_t g_tx_seq = 0U;
@@ -80,9 +83,13 @@ telem::StorageStatusPayloadV1 g_remote_storage = {};
 bool g_remote_storage_known = false;
 uint32_t g_remote_storage_revision = 0U;
 uint32_t g_remote_storage_last_update_ms = 0U;
+bool learnPeer(const uint8_t* mac);
 
-bool stateOnlyModeEnabled() {
-  return config_store::get().radio_state_only != 0U;
+bool looksLikeFramedPacket(const uint8_t* data, int data_len) {
+  if (!data || data_len < (int)sizeof(telem::FrameHeader)) return false;
+  telem::FrameHeader hdr = {};
+  memcpy(&hdr, data, sizeof(hdr));
+  return hdr.magic == telem::kMagic && hdr.version == telem::kVersion;
 }
 
 void resetRemoteFiles(uint16_t total_files = 0U, uint16_t chunk_count = 0U, uint16_t page_offset = 0U, uint16_t page_limit = 32U) {
@@ -121,6 +128,16 @@ bool applyRadioProtocol() {
   // can still see and join the telemetry network.
   const uint8_t ap_protocol = (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   return esp_wifi_set_protocol(WIFI_IF_AP, ap_protocol) == ESP_OK;
+}
+
+const char* wifiModeText(wifi_mode_t mode) {
+  switch (mode) {
+    case WIFI_MODE_NULL: return "null";
+    case WIFI_MODE_STA: return "sta";
+    case WIFI_MODE_AP: return "ap";
+    case WIFI_MODE_APSTA: return "apsta";
+    default: return "unknown";
+  }
 }
 
 bool isBroadcastMac(const uint8_t* mac) {
@@ -188,6 +205,10 @@ void clearPeerState() {
   g_remote_storage_known = false;
   g_remote_storage_revision = 0U;
   g_remote_storage_last_update_ms = 0U;
+  g_desired_control = {};
+  g_snapshot.desired_control_gen = 0U;
+  g_snapshot.applied_control_gen = 0U;
+  g_snapshot.control_code = 0U;
 }
 
 void resetStateSequenceTracking(bool preserveCurrentState) {
@@ -333,7 +354,7 @@ bool initEspNow() {
   if (g_espnow_ready) return true;
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("RADIO espnow_init_failed");
+    if (kAutoRadioLogsEnabled) Serial.println("RADIO espnow_init_failed");
     return false;
   }
   if (esp_now_register_recv_cb(onDataRecv) != ESP_OK) {
@@ -412,6 +433,23 @@ bool sendHelloTo(const uint8_t* mac) {
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len) {
   if (!g_has_air_mac) return false;
   return sendFrameTo(g_air_mac, type, payload, payload_len);
+}
+
+bool sendDesiredControl() {
+  if (!g_has_air_mac) return false;
+  if (!initEspNow()) return false;
+  g_desired_control.magic = telem::kDesiredControlMagic;
+  const esp_err_t err =
+      esp_now_send(g_air_mac, reinterpret_cast<const uint8_t*>(&g_desired_control), sizeof(g_desired_control));
+  if (err != ESP_OK) {
+    if (!isBroadcastMac(g_air_mac)) {
+      g_consecutive_send_failures++;
+      if (g_consecutive_send_failures >= kSendFailThreshold) clearPeerState();
+    }
+    if (err == ESP_ERR_ESPNOW_NOT_INIT) g_espnow_ready = false;
+    return false;
+  }
+  return true;
 }
 
 void maybeSendHello() {
@@ -528,128 +566,6 @@ void applyLiveStatusPayload(const telem::DownlinkStatusV1& status) {
   g_snapshot.has_log_status = true;
 }
 
-void applyUnifiedDownlink(const telem::FrameHeader& hdr, const uint8_t* payload) {
-  if (hdr.payload_len < sizeof(telem::UnifiedDownlinkBaseV1)) {
-    g_snapshot.stats.len_err++;
-    return;
-  }
-
-  telem::UnifiedDownlinkBaseV1 base = {};
-  memcpy(&base, payload, sizeof(base));
-
-  size_t offset = sizeof(base);
-  telem::DownlinkGpsStateV1 gps = {};
-#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
-  telem::DownlinkExtendedStateV2 ext = {};
-#endif
-  telem::DownlinkStatusV1 status = {};
-
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasGps) != 0U) {
-    if (offset + sizeof(gps) > hdr.payload_len) {
-      g_snapshot.stats.len_err++;
-      return;
-    }
-    memcpy(&gps, payload + offset, sizeof(gps));
-    offset += sizeof(gps);
-  }
-
-#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasExtended) != 0U) {
-    if (offset + sizeof(ext) > hdr.payload_len) {
-      g_snapshot.stats.len_err++;
-      return;
-    }
-    memcpy(&ext, payload + offset, sizeof(ext));
-    offset += sizeof(ext);
-  }
-#endif
-
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasStatus) != 0U) {
-    if (offset + sizeof(status) > hdr.payload_len) {
-      g_snapshot.stats.len_err++;
-      return;
-    }
-    memcpy(&status, payload + offset, sizeof(status));
-    offset += sizeof(status);
-  }
-
-  if (offset != hdr.payload_len) {
-    g_snapshot.stats.len_err++;
-    return;
-  }
-
-  const uint32_t state_seq = base.source_seq;
-  if (g_has_last_state_seq) {
-    if (state_seq > g_last_state_seq) {
-      g_snapshot.stats.state_seq_gap += (state_seq - g_last_state_seq - 1U);
-      g_last_state_seq = state_seq;
-    } else {
-      g_snapshot.stats.state_seq_rewind++;
-    }
-  } else {
-    g_last_state_seq = state_seq;
-    g_has_last_state_seq = true;
-  }
-
-  g_snapshot.state.roll_deg = base.fast.roll_deg;
-  g_snapshot.state.pitch_deg = base.fast.pitch_deg;
-  g_snapshot.state.yaw_deg = base.fast.yaw_deg;
-  g_snapshot.state.mag_heading_deg = base.fast.mag_heading_deg;
-  g_snapshot.state.last_imu_ms = base.fast.last_imu_ms;
-  g_snapshot.state.baro_temp_c = base.fast.baro_temp_c;
-  g_snapshot.state.baro_press_hpa = base.fast.baro_press_hpa;
-  g_snapshot.state.baro_alt_m = base.fast.baro_alt_m;
-  g_snapshot.state.baro_vsi_mps = base.fast.baro_vsi_mps;
-  g_snapshot.state.last_baro_ms = base.fast.last_baro_ms;
-  g_snapshot.state.flags = base.fast.flags;
-
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasGps) != 0U) {
-    g_snapshot.state.iTOW_ms = gps.iTOW_ms;
-    g_snapshot.state.fixType = gps.fixType;
-    g_snapshot.state.numSV = gps.numSV;
-    g_snapshot.state.lat_1e7 = gps.lat_1e7;
-    g_snapshot.state.lon_1e7 = gps.lon_1e7;
-    g_snapshot.state.hMSL_mm = gps.hMSL_mm;
-    g_snapshot.state.gSpeed_mms = gps.gSpeed_mms;
-    g_snapshot.state.headMot_1e5deg = gps.headMot_1e5deg;
-    g_snapshot.state.hAcc_mm = gps.hAcc_mm;
-    g_snapshot.state.sAcc_mms = gps.sAcc_mms;
-    g_snapshot.state.gps_parse_errors = gps.gps_parse_errors;
-    g_snapshot.state.last_gps_ms = gps.last_gps_ms;
-  }
-
-#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasExtended) != 0U) {
-    g_snapshot.state.fusion_gain = ext.fusion_gain;
-    g_snapshot.state.fusion_accel_rej = ext.fusion_accel_rej;
-    g_snapshot.state.fusion_mag_rej = ext.fusion_mag_rej;
-    g_snapshot.state.fusion_recovery_period = ext.fusion_recovery_period;
-    g_snapshot.state.raw_present_mask = ext.raw_present_mask;
-    g_snapshot.state.gps_year = ext.gps_year;
-    g_snapshot.state.gps_month = ext.gps_month;
-    g_snapshot.state.gps_day = ext.gps_day;
-    g_snapshot.state.gps_hour = ext.gps_hour;
-    g_snapshot.state.gps_min = ext.gps_min;
-    g_snapshot.state.gps_sec = ext.gps_sec;
-  }
-#endif
-
-  if ((base.section_flags & telem::kUnifiedDownlinkFlagHasStatus) != 0U) {
-    applyLiveStatusPayload(status);
-  }
-
-  g_snapshot.has_state = true;
-  g_snapshot.seq = state_seq;
-  g_snapshot.t_us = hdr.t_us;
-  g_snapshot.stats.frames_ok++;
-  g_snapshot.stats.state_packets++;
-  g_snapshot.stats.unified_state_packets++;
-  g_snapshot.stats.last_rx_ms = millis();
-  g_snapshot.stats.last_state_apply_ms = g_snapshot.stats.last_rx_ms;
-  g_snapshot.stats.last_state_seq = state_seq;
-  g_snapshot.stats.last_state_source_t_us = hdr.t_us;
-}
-
 void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
   switch ((telem::MsgType)hdr.msg_type) {
     case telem::TELEM_FULL_STATE:
@@ -674,14 +590,17 @@ void applyFrame(const telem::FrameHeader& hdr, const uint8_t* payload) {
       g_snapshot.t_us = hdr.t_us;
       g_snapshot.stats.frames_ok++;
       g_snapshot.stats.state_packets++;
-      g_snapshot.stats.full_state_packets++;
       g_snapshot.stats.last_rx_ms = millis();
       g_snapshot.stats.last_state_apply_ms = g_snapshot.stats.last_rx_ms;
       g_snapshot.stats.last_state_seq = hdr.seq;
       g_snapshot.stats.last_state_source_t_us = hdr.t_us;
-      break;
-    case telem::TELEM_UNIFIED_DOWNLINK:
-      applyUnifiedDownlink(hdr, payload);
+      Serial.printf("GNDTRACE state_seq=%lu roll=%.2f pitch=%.2f yaw=%.2f lat=%ld lon=%ld\r\n",
+                    (unsigned long)hdr.seq,
+                    (double)g_snapshot.state.roll_deg,
+                    (double)g_snapshot.state.pitch_deg,
+                    (double)g_snapshot.state.yaw_deg,
+                    (long)g_snapshot.state.lat_1e7,
+                    (long)g_snapshot.state.lon_1e7);
       break;
     case telem::TELEM_FUSION_SETTINGS:
       if (hdr.payload_len != sizeof(telem::FusionSettingsV1)) {
@@ -888,24 +807,30 @@ void setNetworkReady(const char* reason) {
   if (g_network_ready_for_radio) return;
   wifi_mode_t mode = WIFI_MODE_NULL;
   const esp_err_t mode_err = esp_wifi_get_mode(&mode);
-  Serial.println("RADIO nr_step enter");
+  if (kAutoRadioLogsEnabled) Serial.println("RADIO nr_step enter");
   if (mode_err == ESP_OK) {
-    Serial.printf("RADIO nr_step wifi_mode=%s reason=%s local_ip=%s sta_ip=%s ap_ip=%s\n",
-                  wifiModeText(mode),
-                  reason ? reason : "net_ready",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.softAPIP().toString().c_str());
+    if (kAutoRadioLogsEnabled) {
+      Serial.printf("RADIO nr_step wifi_mode=%s reason=%s local_ip=%s sta_ip=%s ap_ip=%s\n",
+                    wifiModeText(mode),
+                    reason ? reason : "net_ready",
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.softAPIP().toString().c_str());
+    }
   } else {
-    Serial.printf("RADIO nr_step wifi_mode=ERR err=%d reason=%s local_ip=%s sta_ip=%s ap_ip=%s\n",
-                  (int)mode_err,
-                  reason ? reason : "net_ready",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.softAPIP().toString().c_str());
+    if (kAutoRadioLogsEnabled) {
+      Serial.printf("RADIO nr_step wifi_mode=ERR err=%d reason=%s local_ip=%s sta_ip=%s ap_ip=%s\n",
+                    (int)mode_err,
+                    reason ? reason : "net_ready",
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.localIP().toString().c_str(),
+                    WiFi.softAPIP().toString().c_str());
+    }
   }
   g_network_ready_for_radio = true;
-  Serial.printf("NET radio_init starting reason=%s\n", reason ? reason : "net_ready");
+  if (kAutoRadioLogsEnabled) {
+    Serial.printf("NET radio_init starting reason=%s\n", reason ? reason : "net_ready");
+  }
   (void)initEspNow();
 }
 
@@ -913,9 +838,7 @@ void reconfigure(const AppConfig& cfg) {
   g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   (void)applyRadioProtocol();
   if (!initEspNow()) return;
-  if (cfg.radio_state_only) {
-    resetRadioRttTracking();
-  }
+  resetRadioRttTracking();
   (void)ensurePeer(kBroadcastMac);
   if (g_has_air_mac) {
     (void)ensurePeer(g_air_mac);
@@ -940,13 +863,26 @@ void poll() {
   maybeSendRadioPing();
 }
 
-Snapshot snapshot() { return g_snapshot; }
+Snapshot snapshot() {
+  return g_snapshot;
+}
 
 void resetStats() { resetStatsInternal(); }
 
 bool sendSetFusionSettings(const telem::CmdSetFusionSettingsV1& cmd) {
-  return sendFrame(telem::CMD_SET_FUSION_SETTINGS, &cmd, sizeof(cmd));
+  g_desired_control.magic = telem::kDesiredControlMagic;
+  g_desired_control.control_gen++;
+  if (g_desired_control.control_gen == 0U) g_desired_control.control_gen = 1U;
+  g_desired_control.flags = telem::kDesiredControlFlagHasFusion;
+  g_desired_control.fusion.gain = cmd.gain;
+  g_desired_control.fusion.accelerationRejection = cmd.accelerationRejection;
+  g_desired_control.fusion.magneticRejection = cmd.magneticRejection;
+  g_desired_control.fusion.recoveryTriggerPeriod = cmd.recoveryTriggerPeriod;
+  g_snapshot.desired_control_gen = g_desired_control.control_gen;
+  return sendDesiredControl();
 }
+
+uint32_t desiredControlGen() { return g_desired_control.control_gen; }
 
 bool sendGetFusionSettings() { return sendFrame(telem::CMD_GET_FUSION_SETTINGS, nullptr, 0U); }
 

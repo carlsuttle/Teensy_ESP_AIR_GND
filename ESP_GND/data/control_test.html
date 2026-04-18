@@ -528,8 +528,8 @@
       reconnectGeneration += 1;
       const generation = reconnectGeneration;
       setBadge(socketBadgeEl, forced ? 'Socket reconnecting' : 'Socket connecting');
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const socket = new WebSocket(`${proto}//${location.host}/ws`);
+      const socketUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+      const socket = new WebSocket(socketUrl);
       ws = socket;
 
       socket.onopen = () => {
@@ -587,6 +587,7 @@
         if (ws !== socket || generation !== reconnectGeneration) return;
         setBadge(socketBadgeEl, 'Socket error', 'bad');
         appendEvent('socket error');
+        console.error(`WebSocket connect failed: ${socketUrl}`);
       };
     }
 

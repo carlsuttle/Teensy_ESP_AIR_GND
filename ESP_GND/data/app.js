@@ -34,10 +34,24 @@ let latestSnapshot = null;
 let latestFiles = null;
 let latestStorage = null;
 let pendingControl = null;
-let latestAckText = "-";
 let reqId = 1;
 let pfdLastW = 0;
 let pfdLastH = 0;
+let dbgMsgCount = 0;
+let dbgApplyCount = 0;
+let dbgRenderCount = 0;
+let dbgMsgHz = 0;
+let dbgApplyHz = 0;
+let dbgRenderHz = 0;
+let dbgLastMsgMs = 0;
+let dbgLastApplyMs = 0;
+let dbgLastRenderMs = 0;
+let dbgLastMsgSeq = null;
+let dbgLastMsgAgeMs = null;
+let dbgLastDisplaySeq = null;
+let dbgLastDisplayRoll = null;
+let dbgLastDisplayPitch = null;
+let dbgLastDisplayAlt = null;
 
 const eventLines = [];
 const previewSnapshot = {
@@ -99,18 +113,39 @@ function fmtBytes(v) {
   return `${Math.round(n)} B`;
 }
 
-function dqiBand(score) {
-  if (score === null || score === undefined || Number.isNaN(score)) return "unknown";
-  if (score >= 90) return "excellent";
-  if (score >= 75) return "good";
-  if (score >= 55) return "fair";
-  if (score >= 35) return "poor";
-  return "critical";
+function normalizeSnapshot(snapshot) {
+  if (!snapshot) return snapshot;
+  const normalized = { ...snapshot };
+  const airValid = !!normalized.air_valid;
+  const airOnline = !!normalized.air_online;
+  if (airValid) {
+    normalized.roll_deg = normalized.air_roll_deg ?? normalized.roll_deg;
+    normalized.pitch_deg = normalized.air_pitch_deg ?? normalized.pitch_deg;
+    normalized.yaw_deg = normalized.air_yaw_deg ?? normalized.yaw_deg;
+    normalized.mag_heading_deg = normalized.air_yaw_deg ?? normalized.mag_heading_deg;
+    normalized.baro_alt_m = normalized.air_altitude_m ?? normalized.baro_alt_m;
+    normalized.baro_vsi_mps = normalized.air_climb_mps ?? normalized.baro_vsi_mps;
+  }
+  if (airValid && airOnline) {
+    normalized.fresh = true;
+    normalized.age_ms = normalized.air_age_ms ?? normalized.age_ms;
+  }
+  return normalized;
 }
 
-function dqiBadgeClass(score) {
-  return `dqi-badge dqi-${dqiBand(score)}`;
-}
+setInterval(() => {
+  dbgMsgHz = dbgMsgCount;
+  dbgApplyHz = dbgApplyCount;
+  dbgRenderHz = dbgRenderCount;
+  console.log(`WSRX hz=${dbgMsgHz} seq=${dash(dbgLastMsgSeq)} age_ms=${dash(dbgLastMsgAgeMs)}`);
+  console.log(
+    `UIAPPLY hz=${dbgApplyHz} render_hz=${dbgRenderHz} seq=${dash(dbgLastDisplaySeq)} ` +
+    `roll=${fmt(dbgLastDisplayRoll, 2)} pitch=${fmt(dbgLastDisplayPitch, 2)} alt=${fmt(dbgLastDisplayAlt, 2)}`
+  );
+  dbgMsgCount = 0;
+  dbgApplyCount = 0;
+  dbgRenderCount = 0;
+}, 1000);
 
 function sourceMode(snapshot) {
   if (!snapshot) return "idle";
@@ -129,22 +164,17 @@ function gpsDateTimeText(snapshot) {
   return `${snapshot.gps_year}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
 }
 
-function downlinkScore(snapshot) {
-  if (!snapshot) return null;
-  let score = snapshot.fresh ? 100 : 55;
-  score -= Math.min(25, Number(snapshot.drop || 0));
-  score -= Math.min(15, Number(snapshot.state_gap || 0));
-  score -= Math.min(20, Math.floor(Number(snapshot.age_ms || 0) / 120));
-  return Math.max(0, Math.min(100, Math.round(score)));
+function liveUpdateHz(deltaMs) {
+  if (!deltaMs || deltaMs <= 0) return null;
+  return 1000 / deltaMs;
 }
 
-function uplinkScore(snapshot) {
-  if (!snapshot) return null;
-  let score = snapshot.fresh ? 100 : 60;
-  score -= Math.min(35, Math.floor(Number(snapshot.radio_rtt_ms || 0) / 8));
-  score -= Math.min(10, Number(snapshot.len_err || 0));
-  score -= Math.min(10, Number(snapshot.unknown_msg || 0));
-  return Math.max(0, Math.min(100, Math.round(score)));
+function linkState(snapshot) {
+  if (!snapshot) return "waiting";
+  if (snapshot.fresh) return "valid";
+  const ageMs = Number(snapshot.age_ms ?? 0xFFFFFFFF);
+  if (Number.isFinite(ageMs) && ageMs < 0xFFFFFFFF) return "stale";
+  return "invalid";
 }
 
 function setFusionLight(el, on) {
@@ -546,12 +576,21 @@ function renderPfdPanel(snapshot) {
 }
 
 function renderHeader(snapshot, deltaMs) {
-  const fpsText = snapshot && deltaMs && deltaMs > 0 ? fmt(1000 / deltaMs, 1) : "-";
-  const pingText = snapshot ? fmtMs(snapshot.radio_rtt_ms) : "-";
-  const dqiValueTxt = snapshot ? String(downlinkScore(snapshot)).padStart(2, "0") : "--";
-  const uplinkDqiValueTxt = snapshot ? String(uplinkScore(snapshot)).padStart(2, "0") : "--";
+  const now = Date.now();
+  const msgAgeMs = dbgLastMsgMs ? (now - dbgLastMsgMs) : null;
+  const updateHz = liveUpdateHz(deltaMs);
+  const seq = snapshot ? dash(snapshot.seq) : "-";
+  const ageMs = snapshot ? dash(snapshot.age_ms) : "-";
+  const mode = sourceMode(snapshot);
+  const link = linkState(snapshot);
   statsEl.innerHTML =
-    `<span class="stats-line"><span>fps: ${fpsText}</span><span>ping: ${pingText}</span><span class="${dqiBadgeClass(snapshot ? downlinkScore(snapshot) : null)}">D:${dqiValueTxt}</span><span class="${dqiBadgeClass(snapshot ? uplinkScore(snapshot) : null)}">U:${uplinkDqiValueTxt}</span></span>`;
+    `<span class="stats-line"><span>link: ${link}</span><span>update: ${updateHz === null ? "-" : fmt(updateHz, 1)} Hz</span><span>age: ${ageMs}</span><span>seq: ${seq}</span><span>mode: ${mode}</span></span>` +
+    `<span class="stats-line"><span>ws:${dbgMsgHz}/s</span><span>apply:${dbgApplyHz}/s</span><span>render:${dbgRenderHz}/s</span><span>msg_age:${msgAgeMs === null ? "-" : Math.round(msgAgeMs)}</span></span>`;
+}
+
+function activeTabName() {
+  const activeButton = document.querySelector(".tabs button.active");
+  return activeButton ? activeButton.dataset.tab : "pfd";
 }
 
 function renderGpsPanel(snapshot) {
@@ -575,6 +614,7 @@ function renderAttPanel(snapshot) {
 `roll: ${fmt(snapshot.roll_deg, 2)} deg
 pitch: ${fmt(snapshot.pitch_deg, 2)} deg
 yaw: ${fmt(snapshot.yaw_deg, 2)} deg
+air_online: ${snapshot.air_online ? "yes" : "no"}
 
 fusion.gain: ${fmt(snapshot.fusion_gain, 3)}
 fusion.accelRej: ${fmt(snapshot.fusion_accel_rej, 1)} deg
@@ -596,21 +636,21 @@ temp: ${fmt(snapshot.baro_temp_c, 2)} C`;
 
 function renderLinkPanel(snapshot) {
   if (!snapshot) {
-    linkEl.textContent = "transport: ESP-NOW\nradio_mode: unified\nweb_fps: -\nping: - ms";
+    linkEl.textContent = "link: waiting\nupdate_hz: -\nage_ms: -\nseq: -\nsource_mode: -\nactivity: -";
     return;
   }
+  const updateHz = lastMessageMs ? liveUpdateHz(Date.now() - lastMessageMs) : null;
+  const mode = sourceMode(snapshot);
+  const activity = snapshot.replay_active || snapshot.replay_paused || snapshot.replay_file_open
+    ? "replay"
+    : (snapshot.recording_active ? "recording" : "live");
   linkEl.textContent =
-`transport: ESP-NOW
-source_mode: ${sourceMode(snapshot)}
-schema: ${dash(snapshot.schema_id)} v${dash(snapshot.schema_version)}
+`link: ${linkState(snapshot)}
+update_hz: ${updateHz === null ? "-" : fmt(updateHz, 1)}
 age_ms: ${dash(snapshot.age_ms)}
-radio_rtt: ${fmtMs(snapshot.radio_rtt_ms)}
-web_fps: ${lastMessageMs ? fmt(1000 / Math.max(1, Date.now() - lastMessageMs), 1) : "-"}
-state_gap: ${dash(snapshot.state_gap)}
-state_rewind: ${dash(snapshot.state_rewind)}
-drop: ${dash(snapshot.drop)}
-len_err: ${dash(snapshot.len_err)}
-unknown_msg: ${dash(snapshot.unknown_msg)}
+seq: ${dash(snapshot.seq)}
+source_mode: ${mode}
+activity: ${activity}
 recording_active: ${snapshot.recording_active ? "on" : "off"}
 replay_active: ${snapshot.replay_active ? "on" : "off"}
 gps_datetime: ${gpsDateTimeText(snapshot)}`;
@@ -624,7 +664,6 @@ function renderLogsPanel(snapshot) {
 busy: ${busyTxt}
 session_id: ${snapshot ? dash(snapshot.recording_session_id) : "-"}
 bytes_written: ${snapshot ? fmtBytes(snapshot.recording_bytes_written) : "-"}
-last_ack: ${latestAckText}
 pending_control: ${dash(pendingControl)}
 storage_known: ${latestStorage ? (latestStorage.known ? "yes" : "no") : "-"}
 storage_ready: ${latestStorage ? (latestStorage.backend_ready ? "yes" : "no") : "-"}
@@ -649,6 +688,14 @@ function updateStatus(snapshot) {
 }
 
 function renderAll(snapshot, deltaMs) {
+  dbgRenderCount += 1;
+  dbgLastRenderMs = Date.now();
+  if (snapshot) {
+    dbgLastDisplaySeq = snapshot.seq ?? null;
+    dbgLastDisplayRoll = snapshot.roll_deg ?? null;
+    dbgLastDisplayPitch = snapshot.pitch_deg ?? null;
+    dbgLastDisplayAlt = snapshot.baro_alt_m ?? null;
+  }
   updateStatus(snapshot);
   renderHeader(snapshot, deltaMs);
   if (!snapshot) {
@@ -661,14 +708,26 @@ function renderAll(snapshot, deltaMs) {
     recEl.className = "rec off";
     recEl.textContent = "REC OFF";
   }
-  renderGpsPanel(snapshot);
-  renderAttPanel(snapshot);
-  renderBaroPanel(snapshot);
-  renderLinkPanel(snapshot);
-  renderLogsPanel(snapshot);
-  updateFusionUi(snapshot);
-  renderPfdPanel(pfdRenderSnapshot());
-  filesJsonEl.textContent = JSON.stringify((latestFiles && latestFiles.files) ? latestFiles.files : [], null, 2);
+  switch (activeTabName()) {
+    case "position":
+      renderGpsPanel(snapshot);
+      renderBaroPanel(snapshot);
+      break;
+    case "att":
+      renderAttPanel(snapshot);
+      updateFusionUi(snapshot);
+      break;
+    case "link":
+      renderLinkPanel(snapshot);
+      break;
+    case "logs":
+      renderLogsPanel(snapshot);
+      break;
+    case "pfd":
+    default:
+      renderPfdPanel(pfdRenderSnapshot());
+      break;
+  }
 }
 
 function sendControl(payload) {
@@ -677,6 +736,11 @@ function sendControl(payload) {
   appendEvent(`tx ${pendingControl}`);
   ws.send(JSON.stringify(payload));
   renderLogsPanel(latestSnapshot);
+}
+
+function wsEndpointUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/ws`;
 }
 
 function connect(force) {
@@ -691,8 +755,8 @@ function connect(force) {
     ws = null;
   }
   statusEl.textContent = force ? "Reconnecting" : "Connecting";
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(`${proto}//${location.host}/ws`);
+  const socketUrl = wsEndpointUrl();
+  const socket = new WebSocket(socketUrl);
   ws = socket;
   socket.onopen = () => {
     if (localGen !== generation || ws !== socket) return;
@@ -711,8 +775,14 @@ function connect(force) {
       const now = Date.now();
       const deltaMs = lastMessageMs ? (now - lastMessageMs) : null;
       lastMessageMs = now;
-      latestSnapshot = msg;
-      renderAll(msg, deltaMs);
+      dbgMsgCount += 1;
+      dbgLastMsgMs = now;
+      latestSnapshot = normalizeSnapshot(msg);
+      dbgLastMsgSeq = latestSnapshot?.seq ?? null;
+      dbgLastMsgAgeMs = latestSnapshot?.age_ms ?? null;
+      dbgApplyCount += 1;
+      dbgLastApplyMs = now;
+      renderAll(latestSnapshot, deltaMs);
       return;
     }
     if (msg.type === "files") {
@@ -728,8 +798,7 @@ function connect(force) {
     }
     if (msg.type === "ack") {
       pendingControl = null;
-      latestAckText = `req=${dash(msg.req_id)} ${dash(msg.op)} ok=${msg.ok ? 1 : 0} code=${dash(msg.code)} ${dash(msg.detail)}`;
-      appendEvent(`ack ${latestAckText}`);
+      appendEvent(`ack req=${dash(msg.req_id)} ${dash(msg.op)} ok=${msg.ok ? 1 : 0} code=${dash(msg.code)} ${dash(msg.detail)}`);
       renderLogsPanel(latestSnapshot);
     }
   };
@@ -747,6 +816,7 @@ function connect(force) {
   socket.onerror = () => {
     if (localGen !== generation || ws !== socket) return;
     appendEvent("socket error");
+    console.error(`WebSocket connect failed: ${socketUrl}`);
   };
 }
 

@@ -120,7 +120,8 @@ export const Telemetry = (() => {
 
   function connect() {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    ws = new WebSocket(`ws://${location.host}/ws`);
+    const socketUrl = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
+    ws = new WebSocket(socketUrl);
     setStatus("reconnecting");
 
     ws.onopen = () => {
@@ -155,6 +156,7 @@ export const Telemetry = (() => {
       scheduleReconnect();
     };
     ws.onerror = () => {
+      console.error(`WebSocket connect failed: ${socketUrl}`);
       try { ws.close(); } catch (_) {}
     };
   }

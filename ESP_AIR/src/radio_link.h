@@ -12,8 +12,8 @@ struct Stats {
   uint32_t tx_packets = 0;
   uint32_t tx_bytes = 0;
   uint32_t tx_drop = 0;
+  uint32_t tx_nonlive_drop = 0;
   uint32_t tx_state_packets = 0;
-  uint32_t tx_unified_packets = 0;
   uint32_t source_snapshots_seen = 0;
   uint32_t latest_source_seq_seen = 0;
   uint32_t latest_source_t_us_seen = 0;
@@ -35,6 +35,9 @@ struct Stats {
   uint32_t rx_bad_len = 0;
   uint32_t rx_bad_magic = 0;
   uint32_t rx_unknown = 0;
+  uint32_t rx_admin_packets = 0;
+  uint32_t tx_admin_packets = 0;
+  uint32_t tx_status_packets = 0;
   uint32_t last_rx_ms = 0;
 };
 
@@ -44,6 +47,7 @@ void poll();
 void noteSourceSnapshot(uint32_t seq, uint32_t t_us, uint32_t last_rx_ms);
 void publish(const teensy_link::Snapshot& snap);
 bool publishState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us);
+bool publishSyntheticState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us);
 bool publishStressState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us);
 Stats stats();
 size_t txQueueFree();

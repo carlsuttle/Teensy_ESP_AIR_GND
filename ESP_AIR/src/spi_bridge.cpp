@@ -17,7 +17,7 @@ constexpr uint16_t kProtocolVersion = 1U;
 constexpr uint16_t kTransactionBytes = 8192U;
 constexpr uint16_t kRingDepth = 128U;
 constexpr uint32_t kDefaultSpiClockHz = 20000000UL;
-constexpr uint32_t kDefaultTransactionRateHz = 100U;
+constexpr uint32_t kDefaultTransactionRateHz = 50U;
 constexpr uint32_t kReadyWaitTimeoutUs = 5000U;
 constexpr uint32_t kReadySettleDelayUs = 2U;
 constexpr gpio_num_t kSpiSck = GPIO_NUM_5;
@@ -184,6 +184,7 @@ class Bridge {
   volatile bool run_active_ = true;
   volatile uint32_t last_ready_isr_us_ = 0U;
   uint32_t next_transaction_due_us_ = 0U;
+  uint32_t last_transaction_completed_us_ = 0U;
   uint16_t remote_replay_rx_free_ = 0xFFFFU;
   uint8_t* tx_buffer_ = nullptr;
   uint8_t* rx_buffer_ = nullptr;
@@ -204,6 +205,7 @@ void Bridge::begin() {
   transaction_rate_hz_ = kDefaultTransactionRateHz;
   run_active_ = true;
   next_transaction_due_us_ = nowUs();
+  last_transaction_completed_us_ = 0U;
   remote_replay_rx_free_ = 0xFFFFU;
   pending_replay_count_ = 0U;
 
@@ -343,6 +345,9 @@ void Bridge::parseRxFrame() {
       stats_.rx_type_errors++;
       return;
     }
+    stats_.state_transactions_received++;
+    stats_.last_state_payload_len = header->payload_len;
+    stats_.last_state_record_count = (uint16_t)(header->payload_len / kStateRecordBytes);
     for (uint16_t offset = 0U; offset < header->payload_len; offset = (uint16_t)(offset + kStateRecordBytes)) {
       if (!state_rx_ring_.push(payload + offset)) {
         stats_.rx_overflows++;
@@ -377,9 +382,13 @@ void Bridge::parseRxFrame() {
 bool Bridge::performTransaction() {
   if (!device_ || !tx_buffer_ || !rx_buffer_) return false;
   buildTxFrame();
+  const uint32_t wait_started_us = nowUs();
   if (!waitForReadyHigh(kReadyWaitTimeoutUs)) {
+    stats_.ready_wait_last_us = (uint32_t)(nowUs() - wait_started_us);
     return false;
   }
+  const uint32_t ready_wait_us = (uint32_t)(nowUs() - wait_started_us);
+  stats_.ready_wait_last_us = ready_wait_us;
   delayMicroseconds(kReadySettleDelayUs);
 
   memset(rx_buffer_, 0, kTransactionBytes);
@@ -399,6 +408,23 @@ bool Bridge::performTransaction() {
   }
 
   stats_.transactions_completed++;
+  const uint32_t completed_us = nowUs();
+  if (last_transaction_completed_us_ != 0U) {
+    const uint32_t period_us = (uint32_t)(completed_us - last_transaction_completed_us_);
+    stats_.transaction_period_last_us = period_us;
+    const uint32_t samples = stats_.transaction_period_samples + 1U;
+    stats_.transaction_period_avg_us =
+        (stats_.transaction_period_avg_us == 0U)
+            ? period_us
+            : (uint32_t)(((uint64_t)stats_.transaction_period_avg_us * stats_.transaction_period_samples + period_us) / samples);
+    stats_.transaction_period_samples = samples;
+  }
+  stats_.ready_wait_avg_us =
+      (stats_.transactions_completed == 1U)
+          ? ready_wait_us
+          : (uint32_t)(((uint64_t)stats_.ready_wait_avg_us * (stats_.transactions_completed - 1U) + ready_wait_us) /
+                       stats_.transactions_completed);
+  last_transaction_completed_us_ = completed_us;
   parseRxFrame();
   if (pending_replay_count_ != 0U) {
     stats_.replay_records_sent += pending_replay_count_;
@@ -409,11 +435,14 @@ bool Bridge::performTransaction() {
 
 void Bridge::taskLoop() {
   uint32_t transactions_since_yield = 0U;
+  const uint32_t interval_us = computeIntervalUs(transaction_rate_hz_);
   for (;;) {
     const uint32_t now = nowUs();
     if ((int32_t)(now - next_transaction_due_us_) >= 0) {
+      do {
+        next_transaction_due_us_ += interval_us;
+      } while ((int32_t)(nowUs() - next_transaction_due_us_) >= 0);
       if (performTransaction()) {
-        next_transaction_due_us_ = nowUs() + computeIntervalUs(transaction_rate_hz_);
         transactions_since_yield++;
         if (transactions_since_yield >= 16U) {
           transactions_since_yield = 0U;

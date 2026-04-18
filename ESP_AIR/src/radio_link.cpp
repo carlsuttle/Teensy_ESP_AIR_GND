@@ -23,12 +23,8 @@ constexpr uint8_t kUnitGnd = 2U;
 constexpr uint8_t kBroadcastMac[6] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
 constexpr size_t kRxQueueCapacity = 8U;
 constexpr uint32_t kHelloIntervalMs = 500U;
-constexpr uint32_t kPeerStaleMs = 2000U;
-constexpr uint32_t kRssiSampleIntervalMs = 5000U;
-constexpr uint16_t kUnifiedDownlinkRateHz = 30U;
-constexpr uint16_t kUnifiedGpsRateHz = 10U;
+constexpr uint16_t kCanonicalDownlinkRateHz = 30U;
 constexpr uint8_t kDefaultRadioControlRateHz = 2U;
-constexpr uint8_t kSendFailThreshold = 24U;
 constexpr size_t kTxQueueCapacity = 24U;
 constexpr uint32_t kSendRetryBackoffMs = 2U;
 constexpr uint32_t kSendCompleteTimeoutMs = 200U;
@@ -72,7 +68,6 @@ bool g_has_gnd_mac = false;
 bool g_has_last_sender_mac = false;
 bool g_espnow_ready = false;
 bool g_network_reset_requested = false;
-bool g_state_only_mode = false;
 bool g_recorder_enabled = false;
 bool g_verbose = true;
 bool g_log_requested = false;
@@ -80,31 +75,30 @@ bool g_log_backend_ready = false;
 bool g_log_media_present = false;
 bool g_rssi_valid = false;
 bool g_file_list_transfer_active = false;
+telem::DesiredControlStateV1 g_pending_desired_control = {};
+bool g_pending_desired_control_valid = false;
+uint32_t g_last_desired_control_gen = 0U;
+uint32_t g_applied_control_gen = 0U;
+uint32_t g_applied_control_code = 0U;
+telem::FusionSettingsV1 g_applied_fusion = {};
 sd_file_api::FileListPage g_file_list_page = {};
 telem::StorageStatusPayloadV1 g_storage_status_payload = {};
-bool g_control_has_ack = false;
-bool g_control_ack_ok = false;
 bool g_radio_lr_mode = true;
 uint8_t g_consecutive_send_failures = 0U;
 uint8_t g_radio_control_rate_hz = kDefaultRadioControlRateHz;
 uint32_t g_last_hello_tx_ms = 0U;
 uint32_t g_last_telem_tx_ms = 0U;
-uint32_t g_last_gps_tx_ms = 0U;
-uint32_t g_last_control_tx_ms = 0U;
 uint32_t g_last_rssi_sample_ms = 0U;
 uint32_t g_last_state_seq = 0U;
 uint32_t g_last_state_log_seq = 0U;
 uint32_t g_last_state_log_ms = 0U;
-uint32_t g_last_ack_seq = 0U;
 uint32_t g_tx_seq = 0U;
 uint32_t g_session_id = 0U;
 uint32_t g_log_session_id = 0U;
 uint32_t g_log_last_change_ms = 0U;
 uint16_t g_log_last_command = 0U;
-uint16_t g_control_ack_command = 0U;
-uint16_t g_radio_telem_rate_hz = kUnifiedDownlinkRateHz;
+uint16_t g_radio_telem_rate_hz = kCanonicalDownlinkRateHz;
 int16_t g_gnd_ap_rssi_dbm = 0;
-uint32_t g_control_ack_code = 0U;
 uint8_t g_tx_head = 0U;
 uint8_t g_tx_tail = 0U;
 bool g_tx_in_flight = false;
@@ -118,19 +112,41 @@ volatile uint16_t g_send_ok_last_msg_type = 0U;
 volatile uint32_t g_send_fail_last_elapsed_ms = 0U;
 volatile uint32_t g_send_fail_last_seq = 0U;
 volatile uint16_t g_send_fail_last_msg_type = 0U;
-
-bool stateOnlyModeEnabled() {
-  return g_state_only_mode;
-}
+uint32_t g_last_tx_diag_ms = 0U;
+const char* g_last_tx_diag_reason = nullptr;
 
 bool isTelemetryMsgType(telem::MsgType type) {
-  return type == telem::TELEM_FULL_STATE || type == telem::TELEM_UNIFIED_DOWNLINK;
+  return type == telem::TELEM_FULL_STATE;
+}
+
+bool isAdminMsgType(telem::MsgType type) {
+  switch (type) {
+    case telem::ACK:
+    case telem::NACK:
+    case telem::TELEM_REPLAY_STATUS:
+    case telem::TELEM_STORAGE_STATUS:
+    case telem::TELEM_LOG_FILE_LIST:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isRuntimeSchemaCommand(telem::MsgType type) {
+  switch (type) {
+    case telem::CMD_SET_FUSION_SETTINGS:
+    case telem::CMD_GET_FUSION_SETTINGS:
+    case telem::CMD_SET_STREAM_RATE:
+    case telem::CMD_SET_RADIO_MODE:
+      return true;
+    default:
+      return false;
+  }
 }
 
 const char* msgTypeText(uint16_t msg_type) {
   switch ((telem::MsgType)msg_type) {
     case telem::TELEM_FULL_STATE: return "state";
-    case telem::TELEM_UNIFIED_DOWNLINK: return "unified";
     case telem::LINK_HELLO: return "hello";
     case telem::ACK: return "ack";
     case telem::NACK: return "nack";
@@ -173,12 +189,67 @@ String macToString(const uint8_t* mac) {
 
 bool initEspNow();
 void clearPeerState();
+bool learnPeer(const uint8_t* mac);
 bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us);
+bool sendSyntheticFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us);
+bool captureDesiredControlState(const uint8_t* data, int data_len);
+void processDesiredControl();
 void sendReplayStatusFrame();
 void sendLogFileListFrames(uint16_t offset = 0U, uint16_t limit = 32U);
 void sendStorageStatusFrame();
 void drainAsyncEvents();
 void pumpTx();
+size_t txQueueCountLocked();
+void txQueueBreakdown(size_t& live_slot, size_t& ack_count, size_t& other_count);
+void noteTxDropByType(uint16_t msg_type, uint32_t count = 1U);
+void stageLatestTelemetryFrame(const uint8_t* mac,
+                               const uint8_t* data,
+                               size_t len,
+                               uint32_t seq,
+                               uint16_t msg_type);
+void resolveSyntheticTargetMac(uint8_t* out_mac);
+
+void logTxDiag(const char* reason,
+               uint32_t seq = 0U,
+               esp_err_t err = ESP_OK,
+               bool include_err = false) {
+  if (!g_verbose || !reason) return;
+  const uint32_t now = millis();
+  if (g_last_tx_diag_reason && strcmp(g_last_tx_diag_reason, reason) == 0 &&
+      g_last_tx_diag_ms != 0U && (uint32_t)(now - g_last_tx_diag_ms) < 1000U) {
+    return;
+  }
+  if (g_last_tx_diag_ms != 0U && (uint32_t)(now - g_last_tx_diag_ms) < 1000U &&
+      strcmp(reason, "TXOK") != 0 && strcmp(reason, "TXERR") != 0) {
+    return;
+  }
+
+  size_t telem_slot = 0U;
+  size_t ack_count = 0U;
+  size_t other_count = 0U;
+  txQueueBreakdown(telem_slot, ack_count, other_count);
+
+  Serial.printf("%s seq=%lu radio_ready=%u has_peer=%u tx_in_flight=%u tx_q=%u tx_telem_slot=%u tx_ack_q=%u tx_other_q=%u telem_hz=%u last_tx_ms=%lu tx_drop=%lu nonlive_drop=%lu",
+                reason,
+                (unsigned long)seq,
+                g_espnow_ready ? 1U : 0U,
+                g_has_gnd_mac ? 1U : 0U,
+                g_tx_in_flight ? 1U : 0U,
+                (unsigned)txQueueCountLocked(),
+                (unsigned)telem_slot,
+                (unsigned)ack_count,
+                (unsigned)other_count,
+                (unsigned)g_radio_telem_rate_hz,
+                (unsigned long)g_last_telem_tx_ms,
+                (unsigned long)g_stats.tx_drop,
+                (unsigned long)g_stats.tx_nonlive_drop);
+  if (include_err) {
+    Serial.printf(" err=%d", (int)err);
+  }
+  Serial.print("\n");
+  g_last_tx_diag_ms = now;
+  g_last_tx_diag_reason = reason;
+}
 
 struct FileListStreamContext {
   telem::LogFileListChunkPayloadV1 page = {};
@@ -242,8 +313,66 @@ size_t txQueueCountLocked() {
   return (size_t)(kTxQueueCapacity - g_tx_tail + g_tx_head);
 }
 
+void txQueueBreakdown(size_t& live_slot, size_t& ack_count, size_t& other_count) {
+  live_slot = 0U;
+  ack_count = 0U;
+  other_count = 0U;
+
+  portENTER_CRITICAL(&g_rx_mux);
+  live_slot = g_latest_telem.valid ? 1U : 0U;
+  uint8_t idx = g_tx_tail;
+  while (idx != g_tx_head) {
+    const TxFrame& frame = g_tx_queue[idx];
+    telem::FrameHeader hdr = {};
+    if (frame.len >= sizeof(hdr)) {
+      memcpy(&hdr, frame.data, sizeof(hdr));
+    }
+    if (hdr.msg_type == telem::ACK || hdr.msg_type == telem::NACK) {
+      ack_count++;
+    } else {
+      other_count++;
+    }
+    idx = (uint8_t)((idx + 1U) % kTxQueueCapacity);
+  }
+  portEXIT_CRITICAL(&g_rx_mux);
+}
+
 size_t txQueueFreeLocked() {
   return (kTxQueueCapacity - 1U) - txQueueCountLocked();
+}
+
+void noteTxDropByType(uint16_t msg_type, uint32_t count) {
+  (void)msg_type;
+  g_stats.tx_drop += count;
+  g_stats.tx_nonlive_drop += count;
+}
+
+void stageLatestTelemetryFrame(const uint8_t* mac,
+                               const uint8_t* data,
+                               size_t len,
+                               uint32_t seq,
+                               uint16_t msg_type) {
+  portENTER_CRITICAL(&g_rx_mux);
+  memcpy(g_latest_telem.mac, mac, sizeof(g_latest_telem.mac));
+  g_latest_telem.len = (uint16_t)len;
+  memcpy(g_latest_telem.data, data, len);
+  g_latest_telem.seq = seq;
+  g_latest_telem.msg_type = msg_type;
+  g_latest_telem.valid = true;
+  portEXIT_CRITICAL(&g_rx_mux);
+}
+
+void resolveSyntheticTargetMac(uint8_t* out_mac) {
+  if (!out_mac) return;
+  if (g_has_gnd_mac && !isZeroMac(g_gnd_mac)) {
+    memcpy(out_mac, g_gnd_mac, 6U);
+    return;
+  }
+  if (g_has_last_sender_mac && !isZeroMac(g_last_sender_mac)) {
+    memcpy(out_mac, g_last_sender_mac, 6U);
+    return;
+  }
+  memcpy(out_mac, kBroadcastMac, 6U);
 }
 
 bool enqueueTxFrame(const uint8_t* mac, const uint8_t* data, size_t len) {
@@ -305,18 +434,10 @@ void clearTxQueue() {
   g_tx_in_flight_msg_type = 0U;
 }
 
-uint32_t peerSilenceMs() {
-  return g_stats.last_rx_ms ? (uint32_t)(millis() - g_stats.last_rx_ms) : 0xFFFFFFFFUL;
-}
-
 void noteSendFailure(uint32_t count) {
   if (!g_has_gnd_mac || count == 0U) return;
   const uint32_t total = (uint32_t)g_consecutive_send_failures + count;
   g_consecutive_send_failures = (total > 0xFFU) ? 0xFFU : (uint8_t)total;
-  if (stateOnlyModeEnabled()) return;
-  if (g_consecutive_send_failures >= kSendFailThreshold && peerSilenceMs() >= kPeerStaleMs) {
-    clearPeerState();
-  }
 }
 
 void clearPeerState() {
@@ -325,14 +446,8 @@ void clearPeerState() {
   g_has_gnd_mac = false;
   g_has_last_sender_mac = false;
   g_consecutive_send_failures = 0U;
-  g_control_has_ack = false;
-  g_control_ack_command = 0U;
-  g_control_ack_code = 0U;
-  g_control_ack_ok = false;
   g_last_hello_tx_ms = 0U;
   g_last_telem_tx_ms = 0U;
-  g_last_gps_tx_ms = 0U;
-  g_last_control_tx_ms = 0U;
   clearTxQueue();
 }
 
@@ -351,6 +466,10 @@ bool ensurePeer(const uint8_t* mac) {
 
 void onDataRecv(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
   if (!mac_addr || !data || data_len <= 0 || data_len > (int)telem::kEspNowMaxDataLen) return;
+  if (captureDesiredControlState(data, data_len)) {
+    (void)learnPeer(mac_addr);
+    return;
+  }
 
   bool queued = false;
   portENTER_CRITICAL_ISR(&g_rx_mux);
@@ -445,7 +564,7 @@ void drainAsyncEvents() {
     g_consecutive_send_failures = 0U;
   }
   if (send_fail > 0U) {
-    g_stats.tx_drop += send_fail;
+    noteTxDropByType(g_send_fail_last_msg_type, send_fail);
     if (g_verbose) {
       Serial.printf("AIRTX cb_fail count=%lu seq=%lu elapsed_ms=%lu type=%s qfree=%u inflight=%u silence_ms=%lu\n",
                     (unsigned long)send_fail,
@@ -454,7 +573,7 @@ void drainAsyncEvents() {
                     msgTypeText(g_send_fail_last_msg_type),
                     (unsigned)txQueueFree(),
                     g_tx_in_flight ? 1U : 0U,
-                    (unsigned long)peerSilenceMs());
+                    g_stats.last_rx_ms ? (unsigned long)(millis() - g_stats.last_rx_ms) : 0xFFFFFFFFUL);
     }
     noteSendFailure(send_fail);
   }
@@ -476,7 +595,7 @@ void pumpTx() {
       g_tx_in_flight = false;
       g_tx_in_flight_started_ms = 0U;
       g_next_tx_attempt_ms = now + kSendRetryBackoffMs;
-      g_stats.tx_drop++;
+      noteTxDropByType(g_tx_in_flight_msg_type);
       noteSendFailure(1U);
     } else {
       return;
@@ -537,7 +656,7 @@ void pumpTx() {
     popTxFrame();
   }
   g_next_tx_attempt_ms = now + kSendRetryBackoffMs;
-  g_stats.tx_drop++;
+  noteTxDropByType(g_tx_in_flight_msg_type);
   if (g_verbose) {
     Serial.printf("AIRTX send_err err=%d seq=%lu type=%s qfree=%u qcount=%u inflight=%u\n",
                   (int)err,
@@ -604,7 +723,6 @@ bool sendFrameTo(const uint8_t* mac,
                  uint32_t t_us) {
   constexpr size_t kMaxPayloadLen = telem::kEspNowMaxDataLen - sizeof(telem::FrameHeader);
   if (payload_len > kMaxPayloadLen || isZeroMac(mac)) return false;
-  if (!initEspNow()) return false;
 
   uint8_t buf[telem::kEspNowMaxDataLen] = {};
   telem::FrameHeader hdr = {};
@@ -621,19 +739,16 @@ bool sendFrameTo(const uint8_t* mac,
 
   const size_t frame_len = sizeof(hdr) + payload_len;
   if (isTelemetryMsgType(type)) {
-    portENTER_CRITICAL(&g_rx_mux);
-    memcpy(g_latest_telem.mac, mac, sizeof(g_latest_telem.mac));
-    g_latest_telem.len = (uint16_t)frame_len;
-    memcpy(g_latest_telem.data, buf, frame_len);
-    g_latest_telem.seq = hdr.seq;
-    g_latest_telem.msg_type = hdr.msg_type;
-    g_latest_telem.valid = true;
-    portEXIT_CRITICAL(&g_rx_mux);
+    stageLatestTelemetryFrame(mac, buf, frame_len, hdr.seq, hdr.msg_type);
     pumpTx();
     return true;
   }
+  if (!initEspNow()) return false;
+  if (isAdminMsgType(type)) {
+    g_stats.tx_admin_packets++;
+  }
   if (!enqueueTxFrame(mac, buf, frame_len)) {
-    g_stats.tx_drop++;
+    noteTxDropByType((uint16_t)type);
     if (g_verbose) {
       Serial.printf("AIRTX enqueue_drop type=%u seq=%lu len=%u peer=%s\n",
                     (unsigned)type,
@@ -682,40 +797,96 @@ telem::LogStatusPayloadV1 currentLogStatus() {
 }
 
 void markLogStatusDirty() {
-  g_last_control_tx_ms = 0U;
+}
+
+uint16_t canonicalTelemRateHz(uint16_t requested_hz) {
+  return constrain(requested_hz == 0U ? kCanonicalDownlinkRateHz : requested_hz, 1U, 30U);
 }
 
 void sampleGroundRssi() {
-  const uint32_t now = millis();
-  if (!g_espnow_ready) return;
-  if (g_radio_lr_mode) return;
-  if (g_tx_in_flight) return;
-  if ((uint32_t)(now - g_last_rssi_sample_ms) < kRssiSampleIntervalMs) return;
+  // Disable periodic RSSI scans so legacy DQI-style activity cannot disturb the live lane.
+  g_rssi_valid = false;
+  g_last_rssi_sample_ms = 0U;
+}
 
-  const AppConfig& cfg = config_store::get();
-  int16_t found_rssi = -127;
-  bool found = false;
-  const int16_t networks = WiFi.scanNetworks(false, false, false, 80U, telem::kRadioChannel, cfg.ap_ssid, nullptr);
-  if (networks > 0) {
-    for (int16_t i = 0; i < networks; ++i) {
-      const String ssid = WiFi.SSID((uint8_t)i);
-      if (ssid != cfg.ap_ssid) continue;
-      uint8_t* bssid = WiFi.BSSID((uint8_t)i);
-      if (g_has_gnd_mac && bssid && memcmp(bssid, g_gnd_mac, sizeof(g_gnd_mac)) != 0) continue;
-      const int32_t rssi = WiFi.RSSI((uint8_t)i);
-      if (!found || rssi > found_rssi) {
-        found_rssi = (int16_t)rssi;
-        found = true;
-      }
+bool captureDesiredControlState(const uint8_t* data, int data_len) {
+  if (!data || data_len != (int)sizeof(telem::DesiredControlStateV1)) return false;
+  telem::DesiredControlStateV1 desired = {};
+  memcpy(&desired, data, sizeof(desired));
+  if (desired.magic != telem::kDesiredControlMagic) return false;
+
+  portENTER_CRITICAL(&g_rx_mux);
+  g_pending_desired_control = desired;
+  g_pending_desired_control_valid = true;
+  portEXIT_CRITICAL(&g_rx_mux);
+  return true;
+}
+
+void refreshAppliedFusion(bool force_get) {
+  telem::FusionSettingsV1 fusion = {};
+  bool have_fusion = false;
+  if (force_get) {
+    control_plane::Request request = {};
+    request.request_id = g_applied_control_gen;
+    request.source = control_plane::SourceInterface::Radio;
+    request.category = control_plane::RequestCategory::Fusion;
+    request.action = control_plane::RequestAction::FusionGet;
+    request.command_id = telem::CMD_GET_FUSION_SETTINGS;
+    control_plane::Result result = {};
+    if (control_plane::submit(request, result) && result.ok && result.has_fusion_settings) {
+      fusion = result.fusion_settings;
+      have_fusion = true;
     }
   }
-  WiFi.scanDelete();
-
-  g_last_rssi_sample_ms = now;
-  g_rssi_valid = found;
-  if (found) {
-    g_gnd_ap_rssi_dbm = found_rssi;
+  if (!have_fusion) {
+    const control_plane::StateSnapshot state = control_plane::stateSnapshot(millis());
+    if (state.has_fusion_settings) {
+      fusion = state.fusion_settings;
+      have_fusion = true;
+    }
   }
+  if (have_fusion) {
+    g_applied_fusion = fusion;
+  }
+}
+
+void processDesiredControl() {
+  telem::DesiredControlStateV1 desired = {};
+  bool have_desired = false;
+  portENTER_CRITICAL(&g_rx_mux);
+  if (g_pending_desired_control_valid) {
+    desired = g_pending_desired_control;
+    g_pending_desired_control_valid = false;
+    have_desired = true;
+  }
+  portEXIT_CRITICAL(&g_rx_mux);
+
+  if (!have_desired || desired.control_gen == 0U || desired.control_gen <= g_last_desired_control_gen) return;
+  g_last_desired_control_gen = desired.control_gen;
+
+  uint32_t control_code = (uint32_t)control_plane::ControlCode::InvalidArgument;
+  bool refresh_fusion = false;
+
+  if ((desired.flags & telem::kDesiredControlFlagHasFusion) != 0U) {
+    control_plane::Request request = {};
+    request.request_id = desired.control_gen;
+    request.source = control_plane::SourceInterface::Radio;
+    request.category = control_plane::RequestCategory::Fusion;
+    request.action = control_plane::RequestAction::FusionSet;
+    request.command_id = telem::CMD_SET_FUSION_SETTINGS;
+    request.fusion.gain = desired.fusion.gain;
+    request.fusion.accelerationRejection = desired.fusion.accelerationRejection;
+    request.fusion.magneticRejection = desired.fusion.magneticRejection;
+    request.fusion.recoveryTriggerPeriod = desired.fusion.recoveryTriggerPeriod;
+    control_plane::Result result = {};
+    const bool ok = control_plane::submit(request, result);
+    control_code = ok ? (uint32_t)control_plane::ControlCode::Ok : result.code;
+    refresh_fusion = ok;
+  }
+
+  g_applied_control_gen = desired.control_gen;
+  g_applied_control_code = control_code;
+  refreshAppliedFusion(refresh_fusion);
 }
 
 uint32_t rateIntervalMs(uint16_t hz) {
@@ -723,162 +894,7 @@ uint32_t rateIntervalMs(uint16_t hz) {
   return 1000UL / (uint32_t)hz;
 }
 
-void captureSnapshotAck(const teensy_link::Snapshot& snap) {
-  if (!snap.has_ack || snap.ack_rx_seq == g_last_ack_seq) return;
-  g_last_ack_seq = snap.ack_rx_seq;
-  g_control_has_ack = true;
-  g_control_ack_command = snap.ack_command;
-  g_control_ack_code = snap.ack_code;
-  g_control_ack_ok = snap.ack_ok;
-}
-
-void fillLiveStatus(telem::DownlinkStatusV1& status) {
-  status = {};
-  const telem::LogStatusPayloadV1 log_status = currentLogStatus();
-  status.log_flags = log_status.flags;
-  status.log_session_id = log_status.session_id;
-  status.log_bytes_written = log_status.bytes_written;
-  time_service::fillDownlinkStatus(status, millis());
-}
-
-void fillFastState(const telem::TelemetryStateRecord& state, telem::DownlinkFastStateV1& fast) {
-  fast.roll_deg = state.roll_deg;
-  fast.pitch_deg = state.pitch_deg;
-  fast.yaw_deg = state.yaw_deg;
-  fast.mag_heading_deg = state.mag_heading_deg;
-  fast.last_imu_ms = state.last_imu_ms;
-  fast.baro_temp_c = state.baro_temp_c;
-  fast.baro_press_hpa = state.baro_press_hpa;
-  fast.baro_alt_m = state.baro_alt_m;
-  fast.baro_vsi_mps = state.baro_vsi_mps;
-  fast.last_baro_ms = state.last_baro_ms;
-  fast.flags = state.flags;
-}
-
-void fillGpsState(const telem::TelemetryStateRecord& state, telem::DownlinkGpsStateV1& gps) {
-  gps.iTOW_ms = state.iTOW_ms;
-  gps.fixType = state.fixType;
-  gps.numSV = state.numSV;
-  gps.lat_1e7 = state.lat_1e7;
-  gps.lon_1e7 = state.lon_1e7;
-  gps.hMSL_mm = state.hMSL_mm;
-  gps.gSpeed_mms = state.gSpeed_mms;
-  gps.headMot_1e5deg = state.headMot_1e5deg;
-  gps.hAcc_mm = state.hAcc_mm;
-  gps.sAcc_mms = state.sAcc_mms;
-  gps.gps_parse_errors = state.gps_parse_errors;
-  gps.last_gps_ms = state.last_gps_ms;
-}
-
-void fillExtendedState(const telem::TelemetryStateRecord& state, telem::DownlinkExtendedStateV2& ext) {
-  ext.fusion_gain = state.fusion_gain;
-  ext.fusion_accel_rej = state.fusion_accel_rej;
-  ext.fusion_mag_rej = state.fusion_mag_rej;
-  ext.fusion_recovery_period = state.fusion_recovery_period;
-  ext.raw_present_mask = state.raw_present_mask;
-  const telem::GpsCalendarTime gps_time = telem::gpsCalendarTime(state);
-  ext.gps_year = gps_time.year;
-  ext.gps_month = gps_time.month;
-  ext.gps_day = gps_time.day;
-  ext.gps_hour = gps_time.hour;
-  ext.gps_min = gps_time.minute;
-  ext.gps_sec = gps_time.second;
-}
-
-bool maybeSendUnifiedDownlink(const teensy_link::Snapshot& snap) {
-  const uint32_t now = millis();
-  g_stats.publish_attempts++;
-  g_stats.last_publish_attempt_ms = now;
-  g_stats.last_publish_age_ms = snap.stats.last_rx_ms ? (uint32_t)(now - snap.stats.last_rx_ms) : 0U;
-
-  if (!snap.has_state) {
-    g_stats.publish_skip_no_state++;
-    return false;
-  }
-  if (!g_has_gnd_mac) {
-    g_stats.publish_skip_no_peer++;
-    return false;
-  }
-
-  const uint32_t telem_interval_ms = rateIntervalMs(g_radio_telem_rate_hz);
-  if (g_last_telem_tx_ms != 0U && (uint32_t)(now - g_last_telem_tx_ms) < telem_interval_ms) {
-    g_stats.publish_skip_rate++;
-    return false;
-  }
-
-  telem::UnifiedDownlinkBaseV1 base = {};
-  base.source_seq = snap.seq;
-  fillFastState(snap.state, base.fast);
-
-  uint8_t payload[telem::kEspNowMaxDataLen - sizeof(telem::FrameHeader)] = {};
-  size_t payload_len = sizeof(base);
-  bool included_gps = false;
-  bool included_extended = false;
-  bool included_status = false;
-  memcpy(payload, &base, sizeof(base));
-
-  const uint32_t gps_interval_ms = rateIntervalMs(kUnifiedGpsRateHz);
-  if (g_last_gps_tx_ms == 0U || (uint32_t)(now - g_last_gps_tx_ms) >= gps_interval_ms) {
-    telem::DownlinkGpsStateV1 gps = {};
-    fillGpsState(snap.state, gps);
-    memcpy(payload + payload_len, &gps, sizeof(gps));
-    payload_len += sizeof(gps);
-    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |= telem::kUnifiedDownlinkFlagHasGps;
-    included_gps = true;
-  }
-
-#if TELEM_ACTIVE_SCHEMA_ID == TELEM_SCHEMA_ID_RELEASE_0_03_CANDIDATE
-  {
-    telem::DownlinkExtendedStateV2 ext = {};
-    fillExtendedState(snap.state, ext);
-    memcpy(payload + payload_len, &ext, sizeof(ext));
-    payload_len += sizeof(ext);
-    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |=
-        telem::kUnifiedDownlinkFlagHasExtended;
-    included_extended = true;
-  }
-#endif
-
-  const uint32_t control_interval_ms = rateIntervalMs(g_radio_control_rate_hz);
-  if (g_last_control_tx_ms == 0U || (uint32_t)(now - g_last_control_tx_ms) >= control_interval_ms) {
-    telem::DownlinkStatusV1 status = {};
-    fillLiveStatus(status);
-    memcpy(payload + payload_len, &status, sizeof(status));
-    payload_len += sizeof(status);
-    reinterpret_cast<telem::UnifiedDownlinkBaseV1*>(payload)->section_flags |= telem::kUnifiedDownlinkFlagHasStatus;
-    included_status = true;
-  }
-
-  if (!sendFrame(telem::TELEM_UNIFIED_DOWNLINK, payload, payload_len, 0U, snap.t_us)) return false;
-  const uint32_t prev_seq = g_last_state_log_seq;
-  const uint32_t prev_ms = g_last_state_log_ms;
-  const uint32_t delta_seq = prev_seq ? (snap.seq - prev_seq) : 0U;
-  const uint32_t delta_ms = prev_ms ? (now - prev_ms) : 0U;
-  if (g_verbose) {
-    Serial.printf("AIRTX seq=%lu dseq=%lu dms=%lu tus=%lu mode=unified\n",
-                  (unsigned long)snap.seq,
-                  (unsigned long)delta_seq,
-                  (unsigned long)delta_ms,
-                  (unsigned long)snap.t_us);
-  }
-  g_last_state_log_seq = snap.seq;
-  g_last_state_log_ms = now;
-  g_last_state_seq = snap.seq;
-  g_last_telem_tx_ms = now;
-  g_stats.tx_unified_packets++;
-  g_stats.publish_ok++;
-  g_stats.last_source_seq = snap.seq;
-  g_stats.last_source_t_us = snap.t_us;
-  g_stats.last_tx_ms = now;
-  if (included_gps) g_last_gps_tx_ms = now;
-  (void)included_extended;
-  if (included_status) {
-    g_last_control_tx_ms = now;
-  }
-  return true;
-}
-
-bool maybeSendStateOnlyDownlink(const teensy_link::Snapshot& snap) {
+bool maybeSendCanonicalState(const teensy_link::Snapshot& snap) {
   const uint32_t now = millis();
   g_stats.publish_attempts++;
   g_stats.last_publish_attempt_ms = now;
@@ -904,6 +920,27 @@ bool maybeSendStateOnlyDownlink(const teensy_link::Snapshot& snap) {
     return false;
   }
 
+  size_t qcount = 0U;
+  size_t qfree = 0U;
+  uint8_t inflight = 0U;
+  uint8_t pending = 0U;
+  portENTER_CRITICAL(&g_rx_mux);
+  qcount = txQueueCountLocked();
+  qfree = txQueueFreeLocked();
+  inflight = g_tx_in_flight ? 1U : 0U;
+  pending = g_latest_telem.valid ? 1U : 0U;
+  portEXIT_CRITICAL(&g_rx_mux);
+  Serial.printf("AIRTXTRACE state_seq=%lu roll=%.2f pitch=%.2f yaw=%.2f lat=%ld lon=%ld qcount=%u qfree=%u inflight=%u pending=%u\r\n",
+                (unsigned long)snap.seq,
+                (double)snap.state.roll_deg,
+                (double)snap.state.pitch_deg,
+                (double)snap.state.yaw_deg,
+                (long)snap.state.lat_1e7,
+                (long)snap.state.lon_1e7,
+                (unsigned)qcount,
+                (unsigned)qfree,
+                (unsigned)inflight,
+                (unsigned)pending);
   const bool ok = sendFrame(telem::TELEM_FULL_STATE, &snap.state, sizeof(snap.state), snap.seq, snap.t_us);
   if (!ok) return false;
 
@@ -935,8 +972,15 @@ bool sendFrame(telem::MsgType type, const void* payload, size_t payload_len, uin
   return sendFrameTo(g_gnd_mac, type, payload, payload_len, seq, t_us);
 }
 
+bool sendSyntheticFrame(telem::MsgType type, const void* payload, size_t payload_len, uint32_t seq, uint32_t t_us) {
+  uint8_t target_mac[6] = {};
+  resolveSyntheticTargetMac(target_mac);
+  return sendFrameTo(target_mac, type, payload, payload_len, seq, t_us);
+}
+
 void sendReplayStatusFrame() {
   const telem::ReplayStatusPayloadV1 payload = replay_bridge::currentPayload();
+  g_stats.tx_status_packets++;
   (void)sendFrame(telem::TELEM_REPLAY_STATUS, &payload, sizeof(payload), 0U, micros());
 }
 
@@ -996,28 +1040,21 @@ const telem::StorageStatusPayloadV1& currentStorageStatusPayload() {
 
 void sendStorageStatusFrame() {
   const telem::StorageStatusPayloadV1& payload = currentStorageStatusPayload();
+  g_stats.tx_status_packets++;
   (void)sendFrame(telem::TELEM_STORAGE_STATUS, &payload, sizeof(payload), 0U, micros());
 }
 
 void sendCommandAck(uint16_t command, bool ok, uint32_t code, uint32_t seq, uint32_t t_us) {
+  if (isRuntimeSchemaCommand((telem::MsgType)command)) {
+    return;
+  }
+
   telem::AckPayloadV1 ack = {};
   ack.command = command;
   ack.ok = ok ? 1U : 0U;
   ack.code = code;
 
-  if (stateOnlyModeEnabled()) {
-    if (command != telem::CMD_SET_STREAM_RATE && command != telem::CMD_SET_RADIO_MODE) return;
-    (void)sendFrame(ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), seq, t_us);
-    return;
-  }
-
-  // Emit an immediate ACK/NACK frame so command completion does not depend on the
-  // next scheduled control-status downlink.
   (void)sendFrame(ok ? telem::ACK : telem::NACK, &ack, sizeof(ack), seq, t_us);
-  g_control_has_ack = true;
-  g_control_ack_command = command;
-  g_control_ack_code = code;
-  g_control_ack_ok = ok;
 }
 
 void sendControlPlaneDispositionAck(uint16_t command,
@@ -1047,6 +1084,7 @@ void handleHello(const uint8_t* mac, const telem::FrameHeader& hdr, const uint8_
 }
 
 void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
+  g_stats.rx_admin_packets++;
   bool handled = true;
   switch ((telem::MsgType)hdr.msg_type) {
     case telem::CMD_SET_FUSION_SETTINGS: {
@@ -1106,15 +1144,13 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       }
       telem::CmdSetRadioModeV1 cmd = {};
       memcpy(&cmd, payload, sizeof(cmd));
-      const bool new_state_only = cmd.state_only != 0U;
       const uint8_t new_control_rate_hz =
           constrain((uint8_t)(cmd.control_rate_hz == 0U ? kDefaultRadioControlRateHz : cmd.control_rate_hz), 1U, 10U);
-      const uint16_t new_telem_rate_hz =
-          new_state_only ? constrain((uint16_t)cmd.telem_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
+      const uint16_t new_telem_rate_hz = canonicalTelemRateHz(cmd.telem_rate_hz);
       const bool new_radio_lr_mode = cmd.radio_lr_mode != 0U;
-      const bool changed = new_state_only != g_state_only_mode || new_control_rate_hz != g_radio_control_rate_hz ||
-                           new_telem_rate_hz != g_radio_telem_rate_hz || new_radio_lr_mode != g_radio_lr_mode;
-      g_state_only_mode = new_state_only;
+      const bool changed =
+          new_control_rate_hz != g_radio_control_rate_hz || new_telem_rate_hz != g_radio_telem_rate_hz ||
+          new_radio_lr_mode != g_radio_lr_mode;
       g_radio_control_rate_hz = new_control_rate_hz;
       g_radio_telem_rate_hz = new_telem_rate_hz;
       g_radio_lr_mode = new_radio_lr_mode;
@@ -1122,8 +1158,6 @@ void handleCommand(const telem::FrameHeader& hdr, const uint8_t* payload) {
       if (changed) {
         g_last_hello_tx_ms = 0U;
         g_last_telem_tx_ms = 0U;
-        g_last_gps_tx_ms = 0U;
-        g_last_control_tx_ms = 0U;
         markLogStatusDirty();
       }
       sendCommandAck(hdr.msg_type, true, 0U, hdr.seq, micros());
@@ -1548,9 +1582,6 @@ void maybeSendHello() {
   bool sent = false;
   if (!g_has_gnd_mac) {
     sent = sendHelloTo(kBroadcastMac);
-  } else if (!stateOnlyModeEnabled() &&
-             (g_stats.last_rx_ms == 0U || (uint32_t)(now - g_stats.last_rx_ms) >= kPeerStaleMs)) {
-    sent = sendHelloTo(g_gnd_mac);
   }
   if (sent) g_last_hello_tx_ms = now;
 }
@@ -1562,32 +1593,37 @@ void begin(const AppConfig& cfg) {
   clearPeerState();
   g_espnow_ready = false;
   g_network_reset_requested = false;
-  g_state_only_mode = cfg.radio_state_only != 0U;
   g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_radio_control_rate_hz = kDefaultRadioControlRateHz;
-  g_radio_telem_rate_hz = g_state_only_mode ? constrain((uint16_t)cfg.log_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
-  g_control_has_ack = false;
-  g_control_ack_command = 0U;
-  g_control_ack_code = 0U;
-  g_control_ack_ok = false;
+  g_radio_telem_rate_hz = canonicalTelemRateHz(cfg.log_rate_hz);
   g_last_state_seq = 0U;
   g_last_state_log_seq = 0U;
   g_last_state_log_ms = 0U;
+  g_pending_desired_control = {};
+  g_pending_desired_control_valid = false;
+  g_last_desired_control_gen = 0U;
+  g_applied_control_gen = 0U;
+  g_applied_control_code = 0U;
+  g_applied_fusion = {};
   g_tx_in_flight_seq = 0U;
   g_tx_in_flight_msg_type = 0U;
-  g_last_ack_seq = 0U;
   g_tx_seq = 0U;
   g_session_id = esp_random();
   (void)initEspNow();
 }
 
 void reconfigure(const AppConfig& cfg) {
-  g_state_only_mode = cfg.radio_state_only != 0U;
   g_radio_lr_mode = cfg.radio_lr_mode != 0U;
   g_radio_control_rate_hz = kDefaultRadioControlRateHz;
-  g_radio_telem_rate_hz = g_state_only_mode ? constrain((uint16_t)cfg.log_rate_hz, 1U, 30U) : kUnifiedDownlinkRateHz;
+  g_radio_telem_rate_hz = canonicalTelemRateHz(cfg.log_rate_hz);
   g_last_state_log_seq = 0U;
   g_last_state_log_ms = 0U;
+  g_pending_desired_control = {};
+  g_pending_desired_control_valid = false;
+  g_last_desired_control_gen = 0U;
+  g_applied_control_gen = 0U;
+  g_applied_control_code = 0U;
+  g_applied_fusion = {};
   g_tx_in_flight_seq = 0U;
   g_tx_in_flight_msg_type = 0U;
   applyRadioProtocol();
@@ -1600,6 +1636,7 @@ void reconfigure(const AppConfig& cfg) {
 
 void poll() {
   drainAsyncEvents();
+  processDesiredControl();
 
   RxFrame frame = {};
   while (popRxFrame(frame)) {
@@ -1613,54 +1650,70 @@ void poll() {
 
 void publish(const teensy_link::Snapshot& snap) {
   noteSourceSnapshot(snap.seq, snap.t_us, snap.stats.last_rx_ms);
-  captureSnapshotAck(snap);
-  if (g_file_list_transfer_active) {
-    return;
-  }
-  if (replay_bridge::takeStatusDirty()) {
-    sendReplayStatusFrame();
-  }
-  if (stateOnlyModeEnabled()) {
-    (void)maybeSendStateOnlyDownlink(snap);
-    return;
-  }
-  (void)maybeSendUnifiedDownlink(snap);
+  (void)maybeSendCanonicalState(snap);
 }
 
 bool publishState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us) {
+  teensy_link::Snapshot snap = {};
+  snap.has_state = true;
+  snap.state = state;
+  snap.seq = seq;
+  snap.t_us = t_us;
+  return maybeSendCanonicalState(snap);
+}
+
+bool publishSyntheticState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us) {
   const uint32_t now = millis();
   g_stats.publish_attempts++;
   g_stats.last_publish_attempt_ms = now;
-  if (!isNewerSeq(seq, g_last_state_seq)) {
-    g_stats.publish_skip_not_new++;
-    return true;
+  g_stats.last_publish_age_ms = 0U;
+
+  size_t qcount = 0U;
+  size_t qfree = 0U;
+  uint8_t inflight = 0U;
+  uint8_t pending = 0U;
+  portENTER_CRITICAL(&g_rx_mux);
+  qcount = txQueueCountLocked();
+  qfree = txQueueFreeLocked();
+  inflight = g_tx_in_flight ? 1U : 0U;
+  pending = g_latest_telem.valid ? 1U : 0U;
+  portEXIT_CRITICAL(&g_rx_mux);
+  if (g_verbose) {
+    Serial.printf("AIRTXTRACE state_seq=%lu roll=%.2f pitch=%.2f yaw=%.2f lat=%ld lon=%ld qcount=%u qfree=%u inflight=%u pending=%u\r\n",
+                  (unsigned long)seq,
+                  (double)state.roll_deg,
+                  (double)state.pitch_deg,
+                  (double)state.yaw_deg,
+                  (long)state.lat_1e7,
+                  (long)state.lon_1e7,
+                  (unsigned)qcount,
+                  (unsigned)qfree,
+                  (unsigned)inflight,
+                  (unsigned)pending);
   }
-  if (!g_has_gnd_mac) {
-    g_stats.publish_skip_no_peer++;
-    return false;
-  }
-  const bool ok = sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
-  if (ok) {
-    g_last_state_seq = seq;
-    g_stats.tx_state_packets++;
-    g_stats.publish_ok++;
-    g_stats.last_source_seq = seq;
-    g_stats.last_source_t_us = t_us;
-    g_stats.last_tx_ms = now;
-  }
-  return ok;
+
+  const bool ok = sendSyntheticFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
+  if (!ok) return false;
+
+  g_last_state_log_seq = seq;
+  g_last_state_log_ms = now;
+  g_last_state_seq = seq;
+  g_last_telem_tx_ms = now;
+  g_stats.tx_state_packets++;
+  g_stats.publish_ok++;
+  g_stats.last_source_seq = seq;
+  g_stats.last_source_t_us = t_us;
+  g_stats.last_tx_ms = now;
+  return true;
 }
 
 bool publishStressState(const telem::TelemetryStateRecord& state, uint32_t seq, uint32_t t_us) {
-  const bool ok = g_has_gnd_mac && sendFrame(telem::TELEM_FULL_STATE, &state, sizeof(state), seq, t_us);
-  if (ok) {
-    g_stats.tx_state_packets++;
-    g_stats.publish_ok++;
-    g_stats.last_source_seq = seq;
-    g_stats.last_source_t_us = t_us;
-    g_stats.last_tx_ms = millis();
-  }
-  return ok;
+  teensy_link::Snapshot snap = {};
+  snap.has_state = true;
+  snap.state = state;
+  snap.seq = seq;
+  snap.t_us = t_us;
+  return maybeSendCanonicalState(snap);
 }
 
 Stats stats() { return g_stats; }
@@ -1682,7 +1735,7 @@ size_t txQueueFree() {
   return free_slots;
 }
 
-bool stateOnlyMode() { return g_state_only_mode; }
+bool stateOnlyMode() { return false; }
 
 bool longRangeMode() { return g_radio_lr_mode; }
 
@@ -1716,7 +1769,7 @@ void resetNetworkState() {
   shutdownEspNow();
   clearPeerState();
   g_stats.tx_state_packets = 0U;
-  g_stats.tx_unified_packets = 0U;
+  g_stats.tx_nonlive_drop = 0U;
   g_stats.source_snapshots_seen = 0U;
   g_stats.latest_source_seq_seen = 0U;
   g_stats.latest_source_t_us_seen = 0U;
@@ -1733,12 +1786,16 @@ void resetNetworkState() {
   g_stats.last_tx_ms = 0U;
   g_stats.last_publish_attempt_ms = 0U;
   g_stats.last_publish_age_ms = 0U;
+  g_stats.rx_admin_packets = 0U;
+  g_stats.tx_admin_packets = 0U;
+  g_stats.tx_status_packets = 0U;
+  g_pending_desired_control = {};
+  g_pending_desired_control_valid = false;
+  g_last_desired_control_gen = 0U;
+  g_applied_control_gen = 0U;
+  g_applied_control_code = 0U;
+  g_applied_fusion = {};
   g_last_state_seq = 0U;
-  g_last_ack_seq = 0U;
-  g_control_has_ack = false;
-  g_control_ack_command = 0U;
-  g_control_ack_code = 0U;
-  g_control_ack_ok = false;
   g_rssi_valid = false;
   g_last_rssi_sample_ms = 0U;
   g_stats.last_rx_ms = 0U;

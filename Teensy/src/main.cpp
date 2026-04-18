@@ -414,6 +414,7 @@ void printSetImuCfgUsage();
 void printSetSourceRateUsage();
 bool applySetImuCfg(const char* cmd);
 bool applySetSourceRate(const char* cmd);
+bool applySetExportDecimation(const char* cmd);
 void runTeensyLoopbackTest();
 
 void printFusionSettingsSummary(const char* source) {
@@ -718,12 +719,14 @@ void printCommandHelp() {
   Serial.println("  showsource - print active fusion/source-rate profile and loop perf");
   Serial.println("  resetloopperf - clear loop performance counters");
   Serial.println("  setsourcehz- set source-rate profile: 50|100|200|400|800|1600");
+  Serial.println("  setexportdecim - set state export decimation: export_decimation=<n>");
+  Serial.println("  saveratecfg - save gyro/accel/export settings to EEPROM");
+  Serial.println("  loadratecfg - reload gyro/accel/export settings from EEPROM");
+  Serial.println("  defaultratecfg - apply default gyro/accel/export settings");
   Serial.println("  benchgyro  - time raw gyro reads: benchgyro [iterations]");
   Serial.println("  showimudata- print corrected accel/gyro data");
   Serial.println("  showimuerror- FAST/BIAS IMU noise+bias stats");
   Serial.println("  testimurot - 2s still bias + rotate Y-axis test");
-  Serial.println("  espcomtest - poll Serial3 for ESPTEST_ACK handshake");
-  Serial.println("  spdtest    - stream benchmark line at 100 Hz");
   Serial.println("  showcrsfin - show CRSF RX frame stats");
   Serial.println("  gpsstate   - print current GPS state");
   Serial.println("  x          - exit active mode");
@@ -822,9 +825,14 @@ void printSourceRateConfig() {
   imu_fusion::getSourcePerfSnapshot(perf);
   imu_fusion::getSourceFlowSnapshot(flow);
   mirror::getReplayPerfSnapshot(replay_perf);
-  Serial.printf("SOURCE CFG rate=%uHz period_us=%lu ticks=%lu reads=%lu updates=%lu frame_drop=%lu raw_drop=%lu imu_acc_hz=%.2f imu_gyr_hz=%.2f supported=",
+  Serial.printf("SOURCE CFG gyro_odr_hz=%u accel_odr_hz=%u fusion_rate_hz=%u period_us=%lu export_decimation=%u state_export_rate_hz=%u spi_tx_rate_hz=50 records_per_spi_tx=%u ticks=%lu reads=%lu updates=%lu frame_drop=%lu raw_drop=%lu imu_acc_hz=%.2f imu_gyr_hz=%.2f supported=",
+                (unsigned)imu_fusion::configuredGyroOdrHz(),
+                (unsigned)imu_fusion::configuredAccelOdrHz(),
                 (unsigned)imu_fusion::sourceRateHz(),
                 (unsigned long)imu_fusion::sourcePeriodUs(),
+                (unsigned)imu_fusion::exportDecimation(),
+                (unsigned)imu_fusion::stateExportRateHz(),
+                (unsigned)imu_fusion::recordsPerSpiTransaction(),
                 (unsigned long)flow.scheduled_ticks,
                 (unsigned long)flow.successful_reads,
                 (unsigned long)flow.applied_updates,
@@ -925,6 +933,13 @@ void printSetSourceRateUsage() {
   Serial.println("  setsourcehz hz=<50|100|200|400|800|1600>");
 }
 
+void printSetExportDecimationUsage() {
+  Serial.println("setexportdecim usage:");
+  Serial.println("  setexportdecim <n>");
+  Serial.println("  setexportdecim export_decimation=<n>");
+  Serial.println("  valid when (gyro_odr_hz / export_decimation) is an integer multiple of 50");
+}
+
 void runGyroReadBenchmark(uint32_t iterations = 10000U) {
   if (iterations == 0U) iterations = 10000U;
 
@@ -1019,6 +1034,39 @@ bool applySetSourceRate(const char* cmd) {
   Serial.printf("setsourcehz applied requested=%u applied=%u\r\n",
                 (unsigned)requested,
                 (unsigned)applied);
+  return true;
+}
+
+bool applySetExportDecimation(const char* cmd) {
+  if (!cmd) return false;
+  const char* args = cmd + strlen("setexportdecim");
+  while (*args == ' ' || *args == '\t') ++args;
+  if (*args == '\0') return false;
+
+  uint32_t requested = 0U;
+  if (startsWith(args, "export_decimation=")) {
+    char* end = nullptr;
+    requested = (uint32_t)strtoul(args + strlen("export_decimation="), &end, 0);
+    if (!end || *end != '\0') return false;
+  } else {
+    char* end = nullptr;
+    requested = (uint32_t)strtoul(args, &end, 0);
+    if (!end || *end != '\0') return false;
+  }
+
+  if (requested == 0U || requested > 65535U) return false;
+  imu_fusion::CaptureSettings cfg{};
+  if (!imu_fusion::getCaptureSettings(cfg)) return false;
+  cfg.exportDecimation = (uint16_t)requested;
+  uint16_t applied = 0U;
+  if (!imu_fusion::setCaptureSettings(cfg, &applied)) return false;
+  resetLoopPerf();
+  mirror::resetReplayPerf();
+  Serial.printf("setexportdecim applied export_decimation=%u fusion_rate_hz=%u state_export_rate_hz=%u records_per_spi_tx=%u\r\n",
+                (unsigned)cfg.exportDecimation,
+                (unsigned)applied,
+                (unsigned)imu_fusion::stateExportRateHz(),
+                (unsigned)imu_fusion::recordsPerSpiTransaction());
   return true;
 }
 
@@ -1156,12 +1204,10 @@ void processCommand(const char* cmd) {
     if (g_mode == CommandMode::CalImu) Serial.println("CALIMU EXIT");
     if (g_mode == CommandMode::GetHdg) Serial.println("GETHDG EXIT");
     if (g_mode == CommandMode::ShowYawCmp) Serial.println("SHOWYAWCMP EXIT");
-    if (g_mode == CommandMode::SpdTest) Serial.println("SPDTEST EXIT");
     if (g_mode == CommandMode::ShowCrsfIn) Serial.println("SHOWCRSFIN EXIT");
     if (g_mode == CommandMode::ShowImuData) Serial.println("SHOWIMUDATA EXIT");
     if (g_mode == CommandMode::ShowImuError) Serial.println("SHOWIMUERROR EXIT");
     if (g_mode == CommandMode::TestImuRot) Serial.println("TESTIMUROT EXIT");
-    if (g_mode == CommandMode::EspComTest) Serial.println("ESPCOMTEST EXIT");
     setMode(CommandMode::Idle);
   } else if (strcmp(cmd, "calmag") == 0) {
     setMode(CommandMode::CalMag);
@@ -1190,8 +1236,6 @@ void processCommand(const char* cmd) {
     } else {
       Serial.println("magvec usage: magvec <north> <east> <down>");
     }
-  } else if (strcmp(cmd, "spdtest") == 0) {
-    setMode(CommandMode::SpdTest);
   } else if (strcmp(cmd, "showcrsfin") == 0) {
     setMode(CommandMode::ShowCrsfIn);
   } else if (strcmp(cmd, "showimucfg") == 0) {
@@ -1224,6 +1268,18 @@ void processCommand(const char* cmd) {
       return;
     }
     printImuConfig();
+  } else if (startsWith(cmd, "setexportdecim")) {
+    const bool hasArgs = (strlen(cmd) > strlen("setexportdecim"));
+    if (!hasArgs) {
+      printSetExportDecimationUsage();
+      return;
+    }
+    if (!applySetExportDecimation(cmd)) {
+      Serial.println("setexportdecim failed (invalid decimation or non-integer 50Hz batch result)");
+      printSetExportDecimationUsage();
+      return;
+    }
+    printImuConfig();
   } else if (startsWith(cmd, "setimucfg")) {
     const bool hasArgs = (strlen(cmd) > strlen("setimucfg"));
     if (!hasArgs) {
@@ -1237,6 +1293,37 @@ void processCommand(const char* cmd) {
     }
     Serial.println("setimucfg applied");
     printImuConfig();
+  } else if (strcmp(cmd, "saveratecfg") == 0) {
+    if (!imu_fusion::savePersistedCaptureSettings()) {
+      Serial.println("saveratecfg failed");
+      return;
+    }
+    Serial.println("saveratecfg ok");
+    printSourceRateConfig();
+  } else if (strcmp(cmd, "loadratecfg") == 0) {
+    if (!imu_fusion::loadPersistedCaptureSettings()) {
+      Serial.println("loadratecfg failed");
+      return;
+    }
+    resetLoopPerf();
+    mirror::resetReplayPerf();
+    Serial.println("loadratecfg ok");
+    printImuConfig();
+  } else if (strcmp(cmd, "defaultratecfg") == 0) {
+    imu_fusion::CaptureSettings cfg{};
+    imu_fusion::getDefaultCaptureSettings(cfg);
+    uint16_t applied = 0U;
+    if (!imu_fusion::setCaptureSettings(cfg, &applied)) {
+      Serial.println("defaultratecfg failed");
+      return;
+    }
+    resetLoopPerf();
+    mirror::resetReplayPerf();
+    Serial.printf("defaultratecfg applied fusion_rate_hz=%u state_export_rate_hz=%u records_per_spi_tx=%u\r\n",
+                  (unsigned)applied,
+                  (unsigned)imu_fusion::stateExportRateHz(),
+                  (unsigned)imu_fusion::recordsPerSpiTransaction());
+    printImuConfig();
   } else if (strcmp(cmd, "showimudata") == 0) {
     setMode(CommandMode::ShowImuData);
   } else if (strcmp(cmd, "showimuerror") == 0) {
@@ -1245,8 +1332,6 @@ void processCommand(const char* cmd) {
     printGpsStateSummary();
   } else if (strcmp(cmd, "testimurot") == 0) {
     setMode(CommandMode::TestImuRot);
-  } else if (strcmp(cmd, "espcomtest") == 0) {
-    setMode(CommandMode::EspComTest);
   } else {
     Serial.print("unknown cmd: ");
     Serial.println(cmd);
@@ -1887,9 +1972,9 @@ void setup() {
                 (unsigned long)GPS_BAUD, (unsigned)GPS_TX_PIN, (unsigned)GPS_RX_PIN);
   Serial.printf("i2c=wire sda=%u scl=%u hz=%lu\r\n",
                 (unsigned)I2C_SDA_PIN, (unsigned)I2C_SCL_PIN, (unsigned long)I2C_BUS_HZ);
-  Serial.printf("loops: imu=%uHz(source) mirror=%uHz summary=2Hz\r\n",
+  Serial.printf("loops: imu=%uHz(source) state_export=%uHz spi=50Hz summary=2Hz\r\n",
                 (unsigned)imu_fusion::sourceRateHz(),
-                (unsigned)mirror::streamRateHz());
+                (unsigned)imu_fusion::stateExportRateHz());
 
   Wire.setSDA(I2C_SDA_PIN);
   Wire.setSCL(I2C_SCL_PIN);
@@ -1911,6 +1996,13 @@ void setup() {
     (void)imu_fusion::loadPersistedCaptureSettings();
     const bool fusionLoaded = imu_fusion::loadPersistedFusionSettings();
     printFusionSettingsSummary(fusionLoaded ? "loaded" : "default");
+    Serial.printf("RATECFG boot gyro_odr_hz=%u accel_odr_hz=%u fusion_rate_hz=%u export_decimation=%u state_export_rate_hz=%u records_per_spi_tx=%u\r\n",
+                  (unsigned)imu_fusion::configuredGyroOdrHz(),
+                  (unsigned)imu_fusion::configuredAccelOdrHz(),
+                  (unsigned)imu_fusion::sourceRateHz(),
+                  (unsigned)imu_fusion::exportDecimation(),
+                  (unsigned)imu_fusion::stateExportRateHz(),
+                  (unsigned)imu_fusion::recordsPerSpiTransaction());
     printImuConfig();
   }
 
@@ -1939,6 +2031,7 @@ void loop() {
 
   section_start_us = micros();
   mirror::pollRx(g_state);
+  spi_bridge::poll();
   g_loop_perf.mirror_rx.record(micros() - section_start_us);
   const bool replayActive = mirror::replayActive();
   const bool imuDiagActive = (g_mode == CommandMode::ShowImuError) || (g_mode == CommandMode::TestImuRot);
@@ -1985,9 +2078,10 @@ void loop() {
       have_pending_raw_record = false;
     }
     g_loop_perf.raw_tx.record(micros() - section_start_us);
+    spi_bridge::poll();
   }
 
-  const uint32_t mirrorPeriodUs = mirror::streamPeriodUs();
+  const uint32_t mirrorPeriodUs = imu_fusion::stateExportPeriodUs();
   section_start_us = micros();
   if (!imuDiagActive && replayActive) {
     mirror::ReplayOutputMeta replay_meta = {};
@@ -2004,10 +2098,12 @@ void loop() {
       if (!imuDiagActive) {
         mirrorSendFastState(g_mirror_seq++, micros(), nullptr);
         mirror_ticks_sent++;
+        spi_bridge::poll();
       }
     }
   }
   g_loop_perf.mirror_tx.record(micros() - section_start_us);
+  spi_bridge::poll();
 
   section_start_us = micros();
   if (!g_quiet_serial && !imuDiagActive && g_stats_streaming && g_summary_timer_us >= SUMMARY_PERIOD_US) {
@@ -2025,6 +2121,7 @@ void loop() {
     g_logger.service(Serial, 8U);
   }
   g_loop_perf.logger.record(micros() - section_start_us);
+  spi_bridge::poll();
 
   g_loop_perf.raw_records_per_loop.record(raw_records_sent);
   g_loop_perf.replay_outputs_per_loop.record(replay_outputs_sent);

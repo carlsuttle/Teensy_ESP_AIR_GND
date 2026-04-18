@@ -30,6 +30,7 @@ constexpr bool kUniformTransportRecordBytes = kStateRecordBytes == kReplayInputR
 static_assert(kUniformTransportRecordBytes,
               "Teensy SPI bridge fast path currently requires equal active transport record sizes");
 constexpr uint16_t kTransportRecordBytes = kStateRecordBytes;
+constexpr uint16_t kStateRecordsPerTransaction = 8U;
 
 #pragma pack(push, 1)
 struct SpiMsgHeader {
@@ -308,7 +309,10 @@ void buildTxFrame() {
   // never see any type-1 state frames, which makes the radio/UI path look
   // connected but permanently stale.
   if (g_state_tx_ring.peekContiguous(src, contiguous) && contiguous != 0U) {
-    const uint16_t records_to_send = (contiguous < kMaxRecordsPerPayload) ? contiguous : kMaxRecordsPerPayload;
+    uint16_t records_to_send = (contiguous < kMaxRecordsPerPayload) ? contiguous : kMaxRecordsPerPayload;
+    if (records_to_send > kStateRecordsPerTransaction) {
+      records_to_send = kStateRecordsPerTransaction;
+    }
     const uint16_t payload_len = (uint16_t)(records_to_send * kTransportRecordBytes);
     memcpy(payload, src, payload_len);
     header->type = kMsgStateData;
